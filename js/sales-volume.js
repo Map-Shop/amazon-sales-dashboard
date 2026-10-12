@@ -354,7 +354,17 @@
       let orders = svOrdersData;
       if (selectedSKU)         orders = orders.filter(o => o.sku === selectedSKU);
       else if (brandSKUs)      orders = orders.filter(o => brandSKUs.has(o.sku));
-      if (selectedFulfillment) orders = orders.filter(o => o.fulfillmentChannel === selectedFulfillment);
+      // The flat file writes 'Amazon'/'Merchant'; the dropdown uses the
+      // AFN/MFN codes. Map both spellings to the codes before comparing.
+      if (selectedFulfillment) {
+        const toCode = (v) => {
+          const s = String(v || '').trim().toLowerCase();
+          if (s === 'amazon' || s === 'afn') return 'AFN';
+          if (s === 'merchant' || s === 'mfn') return 'MFN';
+          return '';
+        };
+        orders = orders.filter(o => toCode(o.fulfillmentChannel) === selectedFulfillment);
+      }
 
       // For the rolling 13-month chart/list, always aggregate from the
       // full orders array (already filtered by SKU / brand /
