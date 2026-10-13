@@ -1510,6 +1510,10 @@
     const V2024_LEAF_HANDLER = {
       // Item-level Order/Refund leaves
       'OurPricePrincipal':         { kind: 'item', bucket: 'sale' },
+      // Plain 'Principal' is the item price on FBAToAmazonTitleTransfer
+      // shipments (Amazon taking title to FBA units), in place of
+      // OurPricePrincipal.
+      'Principal':                 { kind: 'item', bucket: 'sale' },
       'Shipping':                  { kind: 'item', bucket: 'otherCharges' },
       'ShippingPrincipal':         { kind: 'item', bucket: 'otherCharges' },
       'Promo':                     { kind: 'item', bucket: 'promotions' },
