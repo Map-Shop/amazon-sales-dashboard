@@ -9,6 +9,7 @@
 // file can modify or delete data — Upstash rejects writes server-side.
 //
 // CLI (run from the project root):
+//   node tools/kv.mjs keys                   list every key
 //   node tools/kv.mjs keys "orders:v2:*"     list keys matching a pattern
 //   node tools/kv.mjs get products           print one value as JSON
 //
