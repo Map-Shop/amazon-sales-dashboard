@@ -7,6 +7,7 @@
 //
 // Only the read-only token is ever loaded, so nothing run through this
 // file can modify or delete data — Upstash rejects writes server-side.
+// Reads of credential:* keys are refused.
 //
 // CLI (run from the project root):
 //   node tools/kv.mjs keys                   list every key
