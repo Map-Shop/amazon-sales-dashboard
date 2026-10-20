@@ -22,7 +22,7 @@ import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { neon } from '@neondatabase/serverless';
-import { kvKeys, kvGetRaw } from './kv.mjs';
+import { kvKeys, kvGetRaw } from './upstash.mjs';
 
 // Records left behind, with why. Everything else is copied.
 const SKIP = [

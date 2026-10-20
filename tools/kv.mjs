@@ -1,13 +1,13 @@
-// Read-only access to the dashboard's Upstash database for local ad-hoc
-// queries. Credentials come from .env.local in the project root
+// Read-only access to the dashboard's Neon database for local ad-hoc
+// queries. The connection string comes from .env.local in the project root
 // (gitignored):
 //
-//   KV_REST_API_URL=https://...upstash.io
-//   KV_REST_API_READ_ONLY_TOKEN=...
+//   NEON_READONLY_URL=postgresql://claude_readonly:...@.../neondb?sslmode=require
 //
-// Only the read-only token is ever loaded, so nothing run through this
-// file can modify or delete data — Upstash rejects writes server-side.
-// Reads of credential:* keys are refused.
+// The role must be read-only: before the first query this file checks the
+// role's privileges on the kv table and refuses to run if it could write.
+// Reads of credential:* keys are refused. Values decode with the app's own
+// rules (lib/kv.js), so they come back exactly as the API sees them.
 //
 // CLI (run from the project root):
 //   node tools/kv.mjs keys                   list every key
@@ -20,11 +20,12 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { neon } from '@neondatabase/serverless';
+import { decodeValue } from '../lib/kv.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-function loadEnv() {
-  const env = {};
+function loadUrl() {
   let text;
   try {
     text = readFileSync(path.join(ROOT, '.env.local'), 'utf-8');
@@ -32,38 +33,29 @@ function loadEnv() {
     throw new Error('.env.local not found in the project root');
   }
   for (const line of text.split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
-    if (!m) continue;
-    env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+    const m = line.match(/^\s*NEON_READONLY_URL\s*=\s*(.*?)\s*$/);
+    if (m && m[1]) {
+      const url = m[1].replace(/^(['"])(.*)\1$/, '$2');
+      // Validated before use so a malformed value can't surface in an error.
+      if (!/^postgres(ql)?:\/\/[^\s]+$/.test(url)) {
+        throw new Error('NEON_READONLY_URL in .env.local is not a postgres:// connection string');
+      }
+      return url;
+    }
   }
-  for (const k of ['KV_REST_API_URL', 'KV_REST_API_READ_ONLY_TOKEN']) {
-    if (!env[k]) throw new Error(`${k} is missing or empty in .env.local`);
-  }
-  // Errors must never echo either value — the URL check runs before any
-  // fetch so a misplaced token can't surface in a parse error.
-  if (!/^https:\/\/[^\s]+$/.test(env.KV_REST_API_URL)) {
-    throw new Error('KV_REST_API_URL in .env.local is not an https:// URL (is a token on that line?)');
-  }
-  return { url: env.KV_REST_API_URL.replace(/\/+$/, ''), token: env.KV_REST_API_READ_ONLY_TOKEN };
+  throw new Error('NEON_READONLY_URL is missing or empty in .env.local');
 }
 
-let _creds;
-async function command(args) {
-  _creds = _creds || loadEnv();
-  const res = await fetch(_creds.url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${_creds.token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(args)
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok || body.error) throw new Error(`Upstash ${args[0]} failed (${res.status}): ${body.error || 'unknown error'}`);
-  return body.result;
-}
-
-// @vercel/kv JSON-encodes values on write; decode on the way out.
-function decode(v) {
-  if (typeof v !== 'string') return v;
-  try { return JSON.parse(v); } catch { return v; }
+let _sql;
+async function sql() {
+  if (_sql) return _sql;
+  const s = neon(loadUrl());
+  const [p] = await s.query(`SELECT
+    has_table_privilege('kv', 'INSERT') OR has_table_privilege('kv', 'UPDATE')
+      OR has_table_privilege('kv', 'DELETE') OR has_table_privilege('kv', 'TRUNCATE') AS can_write`);
+  if (p.can_write) throw new Error('NEON_READONLY_URL uses a role that can write; use the read-only role');
+  _sql = s;
+  return _sql;
 }
 
 // credential:* keys hold the app's stored API secrets. Business-data
@@ -72,32 +64,31 @@ function assertReadable(key) {
   if (/^credential:/i.test(key)) throw new Error(`Refusing to read ${key}: credential keys hold secrets`);
 }
 
-export async function kvGet(key) {
-  assertReadable(key);
-  return decode(await command(['GET', key]));
-}
-
-// The stored text exactly as Upstash holds it, undecoded (for copying).
+// The stored text exactly as the database holds it, undecoded.
 export async function kvGetRaw(key) {
   assertReadable(key);
-  return command(['GET', key]);
+  const rows = await (await sql()).query('SELECT value FROM kv WHERE key = $1', [key]);
+  return rows.length ? rows[0].value : null;
+}
+
+export async function kvGet(key) {
+  const raw = await kvGetRaw(key);
+  return raw === null ? null : decodeValue(raw);
 }
 
 export async function kvMGet(keys) {
   if (keys.length === 0) return [];
   keys.forEach(assertReadable);
-  return (await command(['MGET', ...keys])).map(decode);
+  const rows = await (await sql()).query('SELECT key, value FROM kv WHERE key = ANY($1)', [keys]);
+  const byKey = new Map(rows.map(r => [r.key, r.value]));
+  return keys.map(k => (byKey.has(k) ? decodeValue(byKey.get(k)) : null));
 }
 
+// Glob patterns as Redis SCAN takes them: * any run, ? one character.
 export async function kvKeys(pattern = '*') {
-  const out = [];
-  let cursor = '0';
-  do {
-    const [next, batch] = await command(['SCAN', cursor, 'MATCH', pattern, 'COUNT', '1000']);
-    out.push(...batch);
-    cursor = next;
-  } while (cursor !== '0');
-  return out.sort();
+  const like = pattern.replace(/[\\%_]/g, c => '\\' + c).replace(/\*/g, '%').replace(/\?/g, '_');
+  const rows = await (await sql()).query("SELECT key FROM kv WHERE key LIKE $1 ESCAPE '\\' ORDER BY key", [like]);
+  return rows.map(r => r.key);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
