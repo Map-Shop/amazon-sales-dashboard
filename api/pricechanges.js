@@ -1,4 +1,4 @@
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Price-change log. Used by the Sales & Volume → Price Change Impacts

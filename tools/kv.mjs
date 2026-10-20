@@ -15,7 +15,7 @@
 //   node tools/kv.mjs get products           print one value as JSON
 //
 // Module:
-//   import { kvGet, kvMGet, kvKeys } from './tools/kv.mjs';
+//   import { kvGet, kvGetRaw, kvMGet, kvKeys } from './tools/kv.mjs';
 
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -75,6 +75,12 @@ function assertReadable(key) {
 export async function kvGet(key) {
   assertReadable(key);
   return decode(await command(['GET', key]));
+}
+
+// The stored text exactly as Upstash holds it, undecoded (for copying).
+export async function kvGetRaw(key) {
+  assertReadable(key);
+  return command(['GET', key]);
 }
 
 export async function kvMGet(keys) {

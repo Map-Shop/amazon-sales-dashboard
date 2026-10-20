@@ -1,4 +1,4 @@
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Listing-optimization Change Log. Used by the Listing Optimizations →

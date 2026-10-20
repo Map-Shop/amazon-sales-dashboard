@@ -1,4 +1,4 @@
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // ShipStation V1 API (ssapi.shipstation.com) with HTTP Basic auth.

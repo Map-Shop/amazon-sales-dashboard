@@ -1,4 +1,4 @@
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.

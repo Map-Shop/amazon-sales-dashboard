@@ -1,5 +1,5 @@
 import SellingPartner from 'amazon-sp-api';
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 //   GET  ?action=sync            [&month=YYYY-MM]            — pull SP-API → KV (v0 listFinancialEvents)

@@ -1,5 +1,5 @@
 import SellingPartner from 'amazon-sp-api';
-import { kv } from '@vercel/kv';
+import { kv } from '../lib/kv.js';
 
 export default async function handler(req, res) {
   const { action } = req.query;

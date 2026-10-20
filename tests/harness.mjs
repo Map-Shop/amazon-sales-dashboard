@@ -1,6 +1,7 @@
 // Loads api/adspend.js outside Vercel.
 //
-// Two imports do not resolve here. @vercel/kv is not installed locally, and
+// Two imports do not resolve here. The storage adapter (../lib/kv.js) pulls in
+// packages that are not installed locally, and
 // ./adcampaigns.js is relative to api/ rather than to this directory. Both are
 // rewritten in a copy written beside this file; the copies are gitignored.
 //
@@ -13,7 +14,7 @@ import { pathToFileURL, fileURLToPath } from 'url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-// An in-memory stand-in for @vercel/kv. Only get and set are used.
+// An in-memory stand-in for the storage adapter. Only get and set are used.
 export function memoryKv(seed = {}) {
   const store = new Map(Object.entries(seed));
   return {
@@ -25,7 +26,7 @@ export function memoryKv(seed = {}) {
 
 const stubKv = (src) =>
   // The stub is reached through globalThis so the test can hand one in.
-  src.replace(/^import \{ kv \} from '@vercel\/kv';$/m,
+  src.replace(/^import \{ kv \} from '\.\.\/lib\/kv\.js';$/m,
               'const kv = globalThis.__TEST_KV__ || null;');
 
 export async function loadAdspend(tag, kv) {
@@ -56,7 +57,7 @@ export async function loadAdspend(tag, kv) {
 }
 
 // Loads api/adcampaigns.js on its own, for suites that drive its write paths
-// directly. Its only unresolvable import is @vercel/kv.
+// directly. Its only unresolvable import is the storage adapter.
 export async function loadAdcampaigns(tag, kv) {
   const f = path.join(here, `.${tag}_testable.mjs`);
   fs.writeFileSync(f, stubKv(fs.readFileSync(path.join(here, '..', 'api', 'adcampaigns.js'), 'utf8')));

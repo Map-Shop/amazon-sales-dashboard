@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "dependencies": {
     "amazon-sp-api": "latest",
-    "@vercel/kv": "^1.0.0"
+    "@vercel/kv": "^1.0.0",
+    "@neondatabase/serverless": "^1.2.0"
   }
 }
