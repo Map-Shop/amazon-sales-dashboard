@@ -1,8 +1,8 @@
 // Copies the dashboard's data from Upstash to Neon and verifies the copy.
 //
 // Run from the project root:
-//   node tools/migrate-to-neon.mjs            copy, then verify
-//   node tools/migrate-to-neon.mjs --verify   verify only
+//   node tools/migrate-to-neon.mjs --verify   compare Upstash and Neon
+// (Copying is disabled now that production runs on Neon; see below.)
 //
 // Needs in .env.local: KV_REST_API_URL + KV_REST_API_READ_ONLY_TOKEN
 // (Upstash, read-only) and DATABASE_URL (Neon, a role that can write).
@@ -50,8 +50,18 @@ const md5 = (s) => createHash('md5').update(s, 'utf8').digest('hex');
 const bytes = (s) => Buffer.byteLength(s, 'utf8');
 const mb = (n) => (n / 1048576).toFixed(2);
 
-const sql = neon(databaseUrl());
 const verifyOnly = process.argv.includes('--verify');
+
+// Production switched to Neon on 2026-10-20, so Upstash is now the stale
+// copy. A mirror run would overwrite production's newer data and delete
+// records written since the switch, so only verification is allowed.
+if (!verifyOnly) {
+  console.error('Copying is disabled: production runs on Neon since 2026-10-20 and Upstash is stale.');
+  console.error('Use --verify to compare the two stores.');
+  process.exit(1);
+}
+
+const sql = neon(databaseUrl());
 
 await sql.query(`CREATE TABLE IF NOT EXISTS kv (
   key        text PRIMARY KEY,
