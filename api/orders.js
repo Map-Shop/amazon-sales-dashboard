@@ -1352,6 +1352,9 @@ async function handleCronCollect(req, res) {
 // but simpler is to just leave it — the next visit clears it via the
 // dismiss endpoint, and the count > 0 path can proactively mark it).
 async function handleCronDataCheck(req, res) {
+  // Logged (not returned) so the runtime's exact Node version is on record
+  // in Vercel's function logs once a day without exposing it publicly.
+  console.log(`[cron-data-check] runtime node ${process.version}`);
   const yesterday = _yesterdayPT();
   const yesterdayMonth = yesterday.slice(0, 7);
   try {
