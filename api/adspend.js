@@ -3,6 +3,7 @@ import * as ordersSql from '../lib/orders.js';
 import * as productsSql from '../lib/products.js';
 import * as adspendSql from '../lib/adspend.js';
 import * as adHistory from '../lib/adhistory.js';
+import * as reviews from '../lib/adreviews.js';
 
 // An ad type's month as { rows } (null when kv has no record), and its
 // replacement — the ad_spend_rows table when SQL_TABLES includes
@@ -1710,7 +1711,7 @@ const rfNoteKey = (portfolioId, weekStart) => `${String(portfolioId)}|${weekStar
 
 async function rfLoadNotes() {
   try {
-    const stored = await kv.get(RF_NOTES_KEY);
+    const stored = await reviewNotesRead();
     return (stored && stored.notes && typeof stored.notes === 'object') ? stored.notes : {};
   } catch (err) {
     // Notes are context. A failed read must not take the flags down with it.
@@ -1778,7 +1779,7 @@ async function handleWeeklyNote(req, res) {
       return res.status(400).json({ error: `A note can be at most ${RF_NOTE_MAX} characters.` });
     }
 
-    const stored = await kv.get(RF_NOTES_KEY);
+    const stored = await reviewNotesRead();
     const notes = (stored && stored.notes && typeof stored.notes === 'object') ? { ...stored.notes } : {};
     const key = rfNoteKey(portfolioId, weekStart);
 
@@ -1793,7 +1794,7 @@ async function handleWeeklyNote(req, res) {
         updatedAt: new Date().toISOString()
       };
     }
-    await kv.set(RF_NOTES_KEY, { notes });
+    await reviewNotesWrite({ notes });
 
     return res.status(200).json({ success: true, note: notes[key] || null });
   } catch (error) {
@@ -1818,7 +1819,7 @@ function rfPageResult({ run, census, logNotes }) {
 async function rfSaveRun(window, inputs) {
   await acEnsureHistory();
   const run = { window, inputs, collectedAt: new Date().toISOString() };
-  await kv.set(RF_RUN_KEY, run);
+  await reviewSlotWrite(RF_RUN_KEY, 'weekly', 'run', run);
   await adHistoryRecordRun('weekly', run, async () => {
     const [census, logNotes] = await Promise.all([loadCensus(), rfLoadNotes()]);
     return {
@@ -1836,15 +1837,49 @@ async function rfSaveRun(window, inputs) {
 async function adHistoryRecordRun(cadence, run, decide) {
   if (!adHistory.historyEnabled()) return;
   try {
-    await adHistory.recordRun(cadence, run, await decide());
+    // With the reviews in SQL the run row is already stored; it only gains
+    // what its page showed.
+    if (reviews.reviewsInSql()) await adHistory.recordDecisions(cadence, run.collectedAt, await decide());
+    else await adHistory.recordRun(cadence, run, await decide());
   } catch (err) {
     console.error(`[AD HISTORY] ${cadence} run not recorded:`, err.message);
   }
 }
 
+// ─── REVIEW STORAGE ──────────────────────────────────────────────────────────
+// The reviews' stored records — each cadence's run, the bi-weekly fetch, the
+// weekly notes, the postures, the two cron jobs — from tables when SQL_TABLES
+// includes "adreviews" (lib/adreviews.js), otherwise from their kv records.
+// Reads return the kv record's shape, or null.
+function reviewSlotRead(key, cadence, slot) {
+  return reviews.reviewsInSql() ? reviews.getSlot(cadence, slot) : kv.get(key);
+}
+function reviewSlotWrite(key, cadence, slot, record) {
+  return reviews.reviewsInSql() ? reviews.saveSlot(cadence, slot, record) : kv.set(key, record);
+}
+function reviewNotesRead() {
+  return reviews.reviewsInSql() ? reviews.getNotes() : kv.get(RF_NOTES_KEY);
+}
+function reviewNotesWrite(doc) {
+  return reviews.reviewsInSql() ? reviews.replaceNotes(doc) : kv.set(RF_NOTES_KEY, doc);
+}
+function reviewPosturesRead() {
+  return reviews.reviewsInSql() ? reviews.getPostures() : kv.get(BW_POSTURE_KEY);
+}
+function reviewPosturesWrite(postures) {
+  return reviews.reviewsInSql() ? reviews.replacePostures(postures) : kv.set(BW_POSTURE_KEY, postures);
+}
+// job: 'ads' (ADS_CRON_KEY) or 'monthly' (MO_CRON_KEY).
+function cronJobRead(key, job) {
+  return reviews.reviewsInSql() ? reviews.getCronJob(job) : kv.get(key);
+}
+function cronJobWrite(key, job, record) {
+  return reviews.reviewsInSql() ? reviews.saveCronJob(job, record) : kv.set(key, record);
+}
+
 async function rfLoadRun() {
   try {
-    const run = await kv.get(RF_RUN_KEY);
+    const run = await reviewSlotRead(RF_RUN_KEY, 'weekly', 'run');
     return (run && Array.isArray(run.inputs) && run.inputs.length) ? run : null;
   } catch (err) {
     console.error('[REDFLAGS] stored run load failed:', err.message);
@@ -2690,7 +2725,7 @@ async function bwSaveRun(window, inputs, collectedAt) {
     collectedAt: collectedAt || new Date().toISOString(),
     adoptedAt: new Date().toISOString()
   };
-  await kv.set(BW_RUN_KEY, run);
+  await reviewSlotWrite(BW_RUN_KEY, 'biweekly', 'run', run);
   await adHistoryRecordRun('biweekly', run, async () => {
     const [census, postures] = await Promise.all([loadCensus(), bwLoadPostures()]);
     return {
@@ -2706,12 +2741,13 @@ async function bwSaveRun(window, inputs, collectedAt) {
 const BW_AVAILABLE_KEY = 'biweekly:available';
 
 async function bwSaveAvailable(window, inputs) {
-  await kv.set(BW_AVAILABLE_KEY, { window, inputs, fetchedAt: new Date().toISOString() });
+  await reviewSlotWrite(BW_AVAILABLE_KEY, 'biweekly', 'available',
+    { window, inputs, fetchedAt: new Date().toISOString() });
 }
 
 async function bwLoadAvailable() {
   try {
-    const a = await kv.get(BW_AVAILABLE_KEY);
+    const a = await reviewSlotRead(BW_AVAILABLE_KEY, 'biweekly', 'available');
     return (a && Array.isArray(a.inputs) && a.inputs.length) ? a : null;
   } catch (err) {
     console.error('[BIWEEKLY] available load failed:', err.message);
@@ -2732,7 +2768,7 @@ async function bwAdoptLatest() {
 
 async function bwLoadRun() {
   try {
-    const run = await kv.get(BW_RUN_KEY);
+    const run = await reviewSlotRead(BW_RUN_KEY, 'biweekly', 'run');
     return (run && Array.isArray(run.inputs) && run.inputs.length) ? run : null;
   } catch (err) {
     console.error('[BIWEEKLY] stored run load failed:', err.message);
@@ -3045,7 +3081,7 @@ async function handleBiweeklyAdopt(req, res) {
 // judgement, not computation, so they are set here rather than derived.
 async function bwLoadPostures() {
   try {
-    const stored = await kv.get(BW_POSTURE_KEY);
+    const stored = await reviewPosturesRead();
     const out = {};
     for (const [brand, posture] of Object.entries(stored || {})) {
       if (BW_POSTURES.includes(posture)) out[brand] = posture;
@@ -3076,7 +3112,7 @@ async function handleBiweeklyPosture(req, res) {
     if (posture === 'hold') delete next[brand];
     else next[brand] = posture;
 
-    await kv.set(BW_POSTURE_KEY, next);
+    await reviewPosturesWrite(next);
     return res.status(200).json({ success: true, postures: next });
   } catch (error) {
     console.error('[BIWEEKLY POSTURE] Error:', error);
@@ -3782,7 +3818,7 @@ function moPageResult({ run, census, postures, brandSales }) {
 async function moSaveRun(window, inputs) {
   await acEnsureHistory();
   const run = { window, inputs, collectedAt: new Date().toISOString() };
-  await kv.set(MO_RUN_KEY, run);
+  await reviewSlotWrite(MO_RUN_KEY, 'monthly', 'run', run);
   await adHistoryRecordRun('monthly', run, async () => {
     const [census, postures, brandSales] = await Promise.all([
       loadCensus(), bwLoadPostures(), moLoadBrandSales(window)
@@ -3796,7 +3832,7 @@ async function moSaveRun(window, inputs) {
 
 async function moLoadRun() {
   try {
-    const run = await kv.get(MO_RUN_KEY);
+    const run = await reviewSlotRead(MO_RUN_KEY, 'monthly', 'run');
     return (run && run.inputs && Array.isArray(run.inputs.sp) && run.inputs.sp.length) ? run : null;
   } catch (err) {
     console.error('[MONTHLY] run load failed:', err.message);
@@ -4216,7 +4252,7 @@ async function adsCronNotify(summary, pending) {
   await adsCronSlack(text);
   if (pending) {
     try {
-      await kv.set(ADS_CRON_KEY, {
+      await cronJobWrite(ADS_CRON_KEY, 'ads', {
         ...pending, notified: true, notifiedAt: new Date().toISOString()
       });
     } catch (err) {
@@ -4301,7 +4337,7 @@ async function handleCronAdsRequest(req, res) {
       return res.status(200).json({ success: false, requested: 0, failures, censusError });
     }
 
-    await kv.set(ADS_CRON_KEY, {
+    await cronJobWrite(ADS_CRON_KEY, 'ads', {
       weekly, biweekly, reports, failures, censusError,
       // Stamped so a collect can tell this batch from last week's — see below.
       ptDate: _ptDate(new Date()),
@@ -4326,7 +4362,7 @@ async function handleCronAdsCollect(req, res) {
   const final = String(req.query.final || '') === '1';
   let pending = null;
   try {
-    pending = await kv.get(ADS_CRON_KEY);
+    pending = await cronJobRead(ADS_CRON_KEY, 'ads');
     if (!pending || !Array.isArray(pending.reports) || !pending.reports.length) {
       return res.status(200).json({ success: true, skipped: 'nothing pending' });
     }
@@ -4408,7 +4444,7 @@ async function handleCronAdsCollect(req, res) {
     // Terminal: everything landed, or this was the last attempt.
     let outcome = null;
     if (done || final) outcome = await adsCronNotify(summary, record);
-    else await kv.set(ADS_CRON_KEY, record);
+    else await cronJobWrite(ADS_CRON_KEY, 'ads', record);
 
     return res.status(200).json({ success: true, stored, notReady, collected: done,
                                   notified: outcome });
@@ -4526,7 +4562,7 @@ async function moCronNotify(summary, pending) {
   await adsCronSlack(text);
   if (pending) {
     try {
-      await kv.set(MO_CRON_KEY, {
+      await cronJobWrite(MO_CRON_KEY, 'monthly', {
         ...pending, notified: true, notifiedAt: new Date().toISOString()
       });
     } catch (err) {
@@ -4577,7 +4613,7 @@ async function handleCronMonthlyRequest(req, res) {
       return res.status(200).json({ success: false, requested: 0, failures, censusError });
     }
 
-    await kv.set(MO_CRON_KEY, {
+    await cronJobWrite(MO_CRON_KEY, 'monthly', {
       window, reports, failures, notes, censusError,
       ptDate: _ptDate(new Date()),
       requestedAt: new Date().toISOString(), collected: false, notified: false
@@ -4599,7 +4635,7 @@ async function handleCronMonthlyCollect(req, res) {
   const final = String(req.query.final || '') === '1';
   let pending = null;
   try {
-    pending = await kv.get(MO_CRON_KEY);
+    pending = await cronJobRead(MO_CRON_KEY, 'monthly');
     if (!pending || !Array.isArray(pending.reports) || !pending.reports.length) {
       return res.status(200).json({ success: true, skipped: 'nothing pending' });
     }
@@ -4683,7 +4719,7 @@ async function handleCronMonthlyCollect(req, res) {
 
     let outcome = null;
     if (done || final) outcome = await moCronNotify(summary, record);
-    else await kv.set(MO_CRON_KEY, record);
+    else await cronJobWrite(MO_CRON_KEY, 'monthly', record);
 
     return res.status(200).json({ success: true, stored, notReady, collected: done,
                                   notified: outcome });

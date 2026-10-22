@@ -36,13 +36,21 @@ const lib = (name) => import(pathToFileURL(path.join(ROOT, 'lib', name)).href);
 const { rawExtracted, RAW_EXTRACTED_COLUMNS } = await lib('transactions.js');
 const { recordColumns, recordValues, recordCompareColumns } = await lib('records.js');
 const adcensus = await lib('adcensus.js');
+const adreviews = await lib('adreviews.js');
+
+// The review records and where each lives in the tables.
+const REVIEW_SLOTS = [
+  ['weekly:lastrun', 'weekly', 'run'], ['biweekly:lastrun', 'biweekly', 'run'],
+  ['monthly:lastrun', 'monthly', 'run'], ['biweekly:available', 'biweekly', 'available']
+];
 
 // A data set stored in more than one table fills and verifies them together.
 const GROUPS = {
   transactions: ['transactions-raw', 'transactions-months', 'transactions-imported'],
   // Rows before the snapshot documents, whose check reads them back whole.
   adcampaigns: ['ad-campaigns', 'ad-portfolios', 'ad-census', 'ad-census-syncs',
-                'ad-brand-overrides', 'campaign-changes']
+                'ad-brand-overrides', 'campaign-changes'],
+  adreviews: ['ad-review-runs', 'review-notes', 'brand-postures', 'ad-cron-jobs']
 };
 
 // readMonthV2024's kv reassembly, in SQL: a month record holding its own
@@ -553,6 +561,117 @@ const TABLES = {
         samples: cmp.samples
       };
     }
+  },
+
+  // ── Ad reviews (lib/adreviews.js) ─────────────────────────────────────
+  // The runs. ad_review_runs may already hold history (lib/adhistory.js), so
+  // it is merged into, never dropped: history rows still carrying inputs as
+  // json get them as ad_review_inputs rows, then each kv record (every
+  // cadence's run, the bi-weekly fetch) is stored through the app's own
+  // saveSlot. Verified by reading every record back through getSlot.
+  'ad-review-runs': {
+    ddl: ['CREATE TABLE IF NOT EXISTS ad_review_runs (cadence text)'],
+    async fill(sql, decodeValue) {
+      const { DDL } = await lib('adhistory.js');
+      for (const d of [...DDL, ...adreviews.RUN_DDL]) await sql.query(d);
+      const legacy = await sql.query('SELECT cadence, collected_at, run_window, inputs FROM ad_review_runs WHERE inputs IS NOT NULL');
+      for (const r of legacy) {
+        await sql.transaction(adreviews.runStatements(sql, r.cadence, r.collected_at, r.run_window, r.inputs));
+      }
+      for (const [key, cadence, slot] of REVIEW_SLOTS) {
+        const [rec] = await sql.query('SELECT value FROM kv WHERE key = $1', [key]);
+        if (rec) await adreviews.saveSlot(cadence, slot, decodeValue(rec.value));
+      }
+    },
+    async verify(sql, decodeValue) {
+      const expected = [], actual = [];
+      for (const [key, cadence, slot] of REVIEW_SLOTS) {
+        const [rec] = await sql.query('SELECT value FROM kv WHERE key = $1', [key]);
+        expected.push(rec ? decodeValue(rec.value) : null);
+        actual.push(await adreviews.getSlot(cadence, slot));
+      }
+      const cmp = compareLists(expected, actual);
+      const [{ runs, withJson, inputs }] = await sql.query(`SELECT (SELECT count(*) FROM ad_review_runs)::int AS runs,
+        (SELECT count(*) FROM ad_review_runs WHERE inputs IS NOT NULL)::int AS "withJson",
+        (SELECT count(*) FROM ad_review_inputs)::int AS inputs`);
+      return {
+        ok: cmp.diffs === 0 && withJson === 0,
+        summary: `${REVIEW_SLOTS.length} records read back: ${cmp.diffs} differ · runs ${runs} · campaign input rows ${inputs} · runs still holding json inputs ${withJson}`,
+        samples: cmp.samples
+      };
+    }
+  },
+
+  'review-notes': {
+    allowEmpty: true,
+    ddl: [
+      `CREATE TABLE review_notes (
+        position integer PRIMARY KEY,
+        note_key text    NOT NULL UNIQUE,
+        ${adreviews.NOTE_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields   text[]  NOT NULL,
+        extra    json
+      )`
+    ],
+    columns: `position, note_key, ${recordColumns(adreviews.NOTE_SPEC)}`,
+    compareColumns: `position, note_key, ${recordCompareColumns(adreviews.NOTE_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.k AS note_key,
+        ${recordValues(adreviews.NOTE_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_each(kv.value::json->'notes') WITH ORDINALITY AS e(k, v, ord)
+      WHERE kv.key = 'weekly:notes'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'weekly:notes'");
+      const fromKv = r ? decodeValue(r.value) : null;
+      // The page treats no notes and an empty set alike.
+      return compareLists([fromKv && Object.keys(fromKv.notes || {}).length ? fromKv : null], [await adreviews.getNotes()]);
+    }
+  },
+
+  'brand-postures': {
+    allowEmpty: true,
+    ddl: [
+      `CREATE TABLE brand_postures (
+        position integer PRIMARY KEY,
+        brand    text    NOT NULL UNIQUE,
+        posture  text
+      )`
+    ],
+    columns: 'position, brand, posture',
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.k AS brand, e.v AS posture
+      FROM kv, json_each_text(kv.value::json) WITH ORDINALITY AS e(k, v, ord)
+      WHERE kv.key = 'biweekly:posture'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'biweekly:posture'");
+      const fromKv = r ? decodeValue(r.value) : null;
+      return compareLists([fromKv && Object.keys(fromKv).length ? fromKv : null], [await adreviews.getPostures()]);
+    }
+  },
+
+  'ad-cron-jobs': {
+    allowEmpty: true,
+    ddl: [
+      `CREATE TABLE ad_cron_jobs (
+        job        text        PRIMARY KEY,
+        ${adreviews.CRON_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields     text[]      NOT NULL,
+        extra      json,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`
+    ],
+    columns: `job, ${recordColumns(adreviews.CRON_SPEC)}`,
+    compareColumns: `job, ${recordCompareColumns(adreviews.CRON_SPEC)}`,
+    kvRows: `SELECT j.job, ${recordValues(adreviews.CRON_SPEC, 'j.v', { aliased: true })}
+      FROM (SELECT CASE key WHEN 'ads:cron:pending' THEN 'ads' ELSE 'monthly' END AS job, value::json AS v
+            FROM kv WHERE key IN ('ads:cron:pending', 'monthly:cron:pending')) j`,
+    async apiCheck(sql, decodeValue) {
+      const expected = [], actual = [];
+      for (const [key, job] of [['ads:cron:pending', 'ads'], ['monthly:cron:pending', 'monthly']]) {
+        const [r] = await sql.query('SELECT value FROM kv WHERE key = $1', [key]);
+        expected.push(r ? decodeValue(r.value) : null);
+        actual.push(await adreviews.getCronJob(job));
+      }
+      return compareLists(expected, actual);
+    }
   }
 };
 
@@ -653,7 +772,7 @@ for (const name of names) {
   const table = t.ddl[0].match(/CREATE TABLE (?:IF NOT EXISTS )?(\w+)/)[1];
   if (fill && t.fill) {
     // A table holding history kv never had is merged into, never dropped.
-    await t.fill(sql);
+    await t.fill(sql, decodeValue);
   } else if (fill) {
     // Never rebuild a table from nothing. Production's kv data records were
     // deleted after the switch, so a dev branch reset from production has the
