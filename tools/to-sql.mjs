@@ -4,18 +4,17 @@
 // Run from the project root:
 //   node tools/to-sql.mjs <table|all> --verify
 //   node tools/to-sql.mjs <table|all> --fill
-//   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
 // Tables: orders, shipping, sessions, pricechanges, changelog, products,
-// mappings, adspend, transactions (three tables, filled together). Default
-// target is the dev database.
-//
-// Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
-// DATABASE_URL (an owner role). Nothing here prints a credential.
+// mappings, adspend, transactions (three tables, filled together). The
+// target is the dev database (DATABASE_URL_DEV in .env.local), e.g. to
+// rebuild the tables after resetting the Neon dev branch from production.
+// Nothing here prints a credential.
 //
 // --fill DROPS and recreates each table from the kv records, in one
-// transaction. That is right only before production switches the table on
-// in SQL_TABLES; afterwards the table is newer than kv. Production fills
-// therefore also require --before-switch.
+// transaction. Production was filled this way once, just before it switched
+// to the tables on 2026-10-22. It is refused there now: production writes
+// only to the tables, its kv records are frozen at the switch, and a fill
+// would overwrite newer data (a verify would only report the difference).
 //
 // Verification: row counts, a field-by-field comparison in SQL in both
 // directions (kv rows minus table rows, and table rows minus kv rows, must
@@ -469,12 +468,12 @@ const fill = args.includes('--fill');
 const target = args.includes('--target') ? args[args.indexOf('--target') + 1] : 'dev';
 const envName = { dev: 'DATABASE_URL_DEV', prod: 'DATABASE_URL' }[target];
 const names = which === 'all' ? Object.keys(TABLES) : (GROUPS[which] || [which]);
-if (!names.every(n => TABLES[n]) || !envName || !(fill || args.includes('--verify'))) {
-  console.error(`Usage: node tools/to-sql.mjs <${Object.keys(TABLES).join('|')}|all> --verify | --fill [--target dev|prod]`);
+if (target === 'prod') {
+  console.error('Refusing to target production: it has read and written the SQL tables since 2026-10-22, and its kv records are frozen at the switch. A fill would overwrite newer data.');
   process.exit(1);
 }
-if (fill && target === 'prod' && !args.includes('--before-switch')) {
-  console.error('Refusing a production fill without --before-switch: once production reads a table, refilling it from kv would overwrite newer data.');
+if (!names.every(n => TABLES[n]) || !envName || !(fill || args.includes('--verify'))) {
+  console.error(`Usage: node tools/to-sql.mjs <${Object.keys(TABLES).join('|')}|all> --verify | --fill`);
   process.exit(1);
 }
 
