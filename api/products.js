@@ -3,8 +3,9 @@ import * as productsSql from '../lib/products.js';
 
 // The catalog and its replacement — the products table when SQL_TABLES
 // includes "products", otherwise the `products` kv record. The
-// products:updated-at timestamp stays in kv either way.
-async function readProducts() {
+// products:updated-at timestamp stays in kv either way. readProducts is
+// also used by the profitability statement (api/transactions.js).
+export async function readProducts() {
   if (productsSql.productsInSql()) return productsSql.getProducts();
   return kv.get('products');
 }

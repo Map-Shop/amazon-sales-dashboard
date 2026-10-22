@@ -3,8 +3,9 @@ import * as mappingsSql from '../lib/mappings.js';
 
 // A mapping's lookup object and its replacement — the mapping_entries
 // table when SQL_TABLES includes "mappings", otherwise the mappings:<type>
-// kv record. The :updated-at timestamps stay in kv either way.
-async function readMap(type) {
+// kv record. The :updated-at timestamps stay in kv either way. readMap is
+// also used by the profitability statement (api/transactions.js).
+export async function readMap(type) {
   if (mappingsSql.mappingsInSql()) return mappingsSql.getMap(type);
   return kv.get(kvKey(type));
 }
@@ -27,7 +28,7 @@ async function writeMap(type, map) {
 //   mappings:product           → { [campaign]: { brand: str, skus: string[] } }
 //   mappings:brand             → { [campaign]: string (brand) }
 //   mappings:fee               → { [feeType]: '<statement line>' | '_skip' }
-//                                  used by overview-upstash.js to override
+//                                  used by lib/profitability.js to override
 //                                  SERVICE_FEE_LINE_MAP / V2024_LEAF_HANDLER
 //                                  for fee/breakdown types Amazon adds. Save
 //                                  body is { feeType, line }; '_skip' means

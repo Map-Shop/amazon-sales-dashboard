@@ -1,6 +1,14 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
 import * as txSql from '../lib/transactions.js';
+import * as profit from '../lib/profitability.js';
+// The profitability statement's other inputs, read the way their own
+// endpoints read them. Vercel bundles these modules; they do not add
+// serverless functions.
+import { readProducts } from './products.js';
+import { readMap } from './mappings.js';
+import { readShippingRange } from './shipping.js';
+import { readAdRange } from './adspend.js';
 
 // A month's uploaded 2024 rows as { rows } (null when kv has no record), and
 // their replacement — imported_transaction_rows when SQL_TABLES includes
@@ -37,6 +45,9 @@ async function rawMonthHasData(month) {
 //   GET  ?action=get-v2024       &month=YYYY-MM              — raw transactions, one month
 //   GET  ?action=get-range-v2024 &startMonth=&endMonth=      — raw transactions, many months
 //   GET  ?action=get-months-v2024                            — list of v2024-synced months
+//   GET  ?action=profit-period   &startDate=&endDate=        — one period's statement
+//   GET  ?action=profit-charts   &startMonth=&endMonth=      — per-month metrics for the charts
+//   GET  ?action=profit-brand-product &startDate=&endDate=&brand= — Brand & Product table
 //   POST ?action=upload-yearly-csv                           — backfill from
 //          Amazon "Custom Unified Transaction" CSV. Lands rows in the
 //          imported namespace (see KV layout below) so they coexist with
@@ -49,7 +60,7 @@ async function rawMonthHasData(month) {
 // the v2024-06-19 listTransactions endpoint which surfaces deferred
 // transactions with transactionStatus DEFERRED|RELEASED|DEFERRED_RELEASED.
 // Dedup rule (skip RELEASED with DEFERRED_TRANSACTION_ID) lives in the
-// derivation, not here — see _deriveV2024Rows in overview-upstash.js.
+// derivation, not here — see _deriveV2024Rows in lib/profitability.js.
 //
 // KV layout — v0 (legacy, will be retired after v2024 cutover):
 //   transactions:raw:YYYY-MM         → { pages: [<FinancialEvents>, ...] }
@@ -81,8 +92,9 @@ async function rawMonthHasData(month) {
 // path. handleGetV2024 / handleGetRangeV2024 transparently read either
 // shape so months synced before chunking still work.
 //
-// The derivation into report-ready rows happens client-side in
-// overview-upstash.js so mapping changes don't require a re-sync.
+// The derivation into report-ready rows happens at request time (the
+// profit-* actions, lib/profitability.js), so mapping changes don't require
+// a re-sync.
 export default async function handler(req, res) {
   const { action } = req.query;
   if (!action) return res.status(400).json({ error: 'Action parameter required' });
@@ -105,6 +117,9 @@ export default async function handler(req, res) {
     if (action === 'get-v2024')       return handleGetV2024(req, res);
     if (action === 'get-range-v2024') return handleGetRangeV2024(req, res);
     if (action === 'get-months-v2024') return handleGetMonthsV2024(req, res);
+    if (action === 'profit-period')   return handleProfitPeriod(req, res);
+    if (action === 'profit-charts')   return handleProfitCharts(req, res);
+    if (action === 'profit-brand-product') return handleProfitBrandProduct(req, res);
   }
   if (req.method === 'POST') {
     if (action === 'upload-yearly-csv') return handleUploadYearlyCsv(req, res);
@@ -330,56 +345,178 @@ async function handleGetRangeV2024(req, res) {
       return res.status(400).json({ error: 'startMonth and endMonth required (YYYY-MM)' });
     }
 
-    // Union the SP-API index and the imported (CSV-uploaded) index so a
-    // month present only in imported rows still shows up in the read.
-    const [rawIndex, importedIndex] = await Promise.all([
-      kv.get('transactions:v2024:index'),
-      kv.get('transactions:v2024:imported-index')
-    ]);
-    const monthSet = new Set();
-    for (const m of (rawIndex || [])) {
-      if (m >= startMonth && m <= endMonth) monthSet.add(m);
-    }
-    for (const m of (importedIndex || [])) {
-      if (m >= startMonth && m <= endMonth) monthSet.add(m);
-    }
-    const months = [...monthSet].sort();
-
-    // Raw and imported reads run in parallel — each independent month
-    // hits two keys at most, so the join here is fast.
-    const [monthArrays, importedBuckets] = await Promise.all([
-      Promise.all(months.map(m => readMonthV2024(m))),
-      Promise.all(months.map(m => readImportedMonth(m)))
-    ]);
-
-    // Flatten: all months' transactions concatenated. Dedup happens later
-    // in the client-side derivation, since the dedup rule needs to inspect
-    // each transaction's relatedIdentifiers.
-    const transactions = [];
-    for (const arr of monthArrays) {
-      for (const t of arr) transactions.push(t);
-    }
-    // Imported rows are already in the derived `_v2024BlankRow` shape and
-    // bypass _deriveV2024Rows on the client. We only emit imported rows
-    // for months where the raw SP-API namespace is empty — if both exist
-    // for the same month, raw wins (it's the authoritative source). This
-    // makes a future SP-API sync of a previously-imported month silently
-    // supersede the CSV without anyone having to delete the imported
-    // bucket by hand.
-    const importedRows = [];
-    for (let i = 0; i < months.length; i++) {
-      const rawHasData = monthArrays[i] && monthArrays[i].length > 0;
-      if (rawHasData) continue;
-      const b = importedBuckets[i];
-      if (!b || !Array.isArray(b.rows)) continue;
-      for (const r of b.rows) importedRows.push(r);
-    }
-
+    const { months, transactions, importedRows } = await readRangeV2024(startMonth, endMonth);
     return res.status(200).json({
       success: true, startMonth, endMonth, months, transactions, importedRows
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to get v2024 range: ' + error.message });
+  }
+}
+
+// The months in [startMonth, endMonth] with API or uploaded data, their
+// transactions concatenated in month order, and the uploaded rows of months
+// with no API data. Read by get-range-v2024 and the profit-* actions.
+async function readRangeV2024(startMonth, endMonth) {
+  // Union the SP-API index and the imported (CSV-uploaded) index so a
+  // month present only in imported rows still shows up in the read.
+  const [rawIndex, importedIndex] = await Promise.all([
+    kv.get('transactions:v2024:index'),
+    kv.get('transactions:v2024:imported-index')
+  ]);
+  const monthSet = new Set();
+  for (const m of (rawIndex || [])) {
+    if (m >= startMonth && m <= endMonth) monthSet.add(m);
+  }
+  for (const m of (importedIndex || [])) {
+    if (m >= startMonth && m <= endMonth) monthSet.add(m);
+  }
+  const months = [...monthSet].sort();
+
+  // Raw and imported reads run in parallel — each independent month
+  // hits two keys at most, so the join here is fast.
+  const [monthArrays, importedBuckets] = await Promise.all([
+    Promise.all(months.map(m => readMonthV2024(m))),
+    Promise.all(months.map(m => readImportedMonth(m)))
+  ]);
+
+  // Flatten: all months' transactions concatenated. Dedup happens later
+  // in the derivation, since the dedup rule needs to inspect each
+  // transaction's relatedIdentifiers.
+  const transactions = [];
+  for (const arr of monthArrays) {
+    for (const t of arr) transactions.push(t);
+  }
+  // Imported rows are already in the derived `_v2024BlankRow` shape and
+  // bypass _deriveV2024Rows. We only emit imported rows for months where
+  // the raw SP-API namespace is empty — if both exist for the same month,
+  // raw wins (it's the authoritative source). This makes a future SP-API
+  // sync of a previously-imported month silently supersede the CSV
+  // without anyone having to delete the imported bucket by hand.
+  const importedRows = [];
+  for (let i = 0; i < months.length; i++) {
+    const rawHasData = monthArrays[i] && monthArrays[i].length > 0;
+    if (rawHasData) continue;
+    const b = importedBuckets[i];
+    if (!b || !Array.isArray(b.rows)) continue;
+    for (const r of b.rows) importedRows.push(r);
+  }
+  return { months, transactions, importedRows };
+}
+
+// ─── PROFITABILITY ───────────────────────────────────────────────────────────
+// The Profitability statement, its 12-month charts, and Brand & Product,
+// computed by lib/profitability.js from the same reads the page used to
+// fetch, so the page receives finished numbers instead of every raw
+// transaction. Fee mappings are read per request.
+
+// The inputs for [startDate, endDate]: transactions over the window's months
+// widened by the dedup lookback, plus the catalog, ad spend, mappings, and
+// shipping. The page treated ad spend, mappings, and shipping as optional (a
+// failed fetch read as empty) and the latest sync time as best-effort; so
+// does this.
+async function loadProfitInputs(startDate, endDate) {
+  const startMonth = startDate.slice(0, 7);
+  const endMonth   = endDate.slice(0, 7);
+  const widenedStart = profit.shiftMonth(startMonth, -profit.V2024_LOOKBACK_MONTHS);
+  const optional = (read, empty) => read.catch(() => empty);
+
+  const [tx, products, spAd, sbAd, prodMap, brandMap, feeMap, shipping] = await Promise.all([
+    readRangeV2024(widenedStart, endMonth),
+    readProducts(),
+    optional(readAdRange('sp', startMonth, endMonth), { rows: [] }),
+    optional(readAdRange('sb', startMonth, endMonth), { rows: [] }),
+    optional(readMap('product'), null),
+    optional(readMap('brand'), null),
+    optional(readMap('fee'), null),
+    optional(readShippingRange(startMonth, endMonth), { rows: [] })
+  ]);
+
+  const latestSyncedMonth = tx.months.length > 0 ? tx.months[tx.months.length - 1] : null;
+  let lastSynced = null;
+  try {
+    if (latestSyncedMonth) {
+      lastSynced = (await kv.get(`transactions:v2024:last-synced:${latestSyncedMonth}`)) || null;
+    }
+  } catch { /* non-fatal */ }
+
+  return profit.buildInputs({
+    tx,
+    prod: { products: products || [] },
+    spAd, sbAd,
+    prodMap: { mappings: prodMap || {} },
+    brandMap: { mappings: brandMap || {} },
+    feeMap: { mappings: feeMap || {} },
+    shipping,
+    lastSynced
+  });
+}
+
+const PROFIT_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const PROFIT_MONTH = /^\d{4}-\d{2}$/;
+// The charts ask for 12 months; this bounds what one request can load.
+const PROFIT_CHART_MAX_MONTHS = 24;
+
+async function handleProfitPeriod(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const { startDate, endDate } = req.query;
+    if (!PROFIT_DATE.test(startDate || '') || !PROFIT_DATE.test(endDate || '')) {
+      return res.status(400).json({ error: 'startDate and endDate required (YYYY-MM-DD)' });
+    }
+    const inputs = await loadProfitInputs(startDate, endDate);
+    // Every derived row stays here; nothing on the page reads them.
+    const { rows, ...period } = profit.computePeriod(inputs, startDate, endDate);
+    return res.status(200).json({ success: true, period });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to build the statement: ' + error.message });
+  }
+}
+
+async function handleProfitCharts(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const { startMonth, endMonth } = req.query;
+    if (!PROFIT_MONTH.test(startMonth || '') || !PROFIT_MONTH.test(endMonth || '') || startMonth > endMonth) {
+      return res.status(400).json({ error: 'startMonth and endMonth required (YYYY-MM, start first)' });
+    }
+    // Whole calendar months, as the page's 12-month window lists them.
+    const months = [];
+    for (let m = startMonth; m <= endMonth && months.length <= PROFIT_CHART_MAX_MONTHS; m = profit.shiftMonth(m, 1)) {
+      const [y, mo] = m.split('-').map(Number);
+      const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+      months.push({ startDate: `${m}-01`, endDate: `${m}-${String(lastDay).padStart(2, '0')}` });
+    }
+    if (months.length > PROFIT_CHART_MAX_MONTHS) {
+      return res.status(400).json({ error: `At most ${PROFIT_CHART_MAX_MONTHS} months` });
+    }
+    const inputs = await loadProfitInputs(months[0].startDate, months[months.length - 1].endDate);
+    return res.status(200).json({ success: true, months: profit.computeChartMonths(inputs, months) });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to build the charts: ' + error.message });
+  }
+}
+
+async function handleProfitBrandProduct(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const { startDate, endDate, brand } = req.query;
+    if (!PROFIT_DATE.test(startDate || '') || !PROFIT_DATE.test(endDate || '')) {
+      return res.status(400).json({ error: 'startDate and endDate required (YYYY-MM-DD)' });
+    }
+    const inputs = await loadProfitInputs(startDate, endDate);
+    return res.status(200).json({
+      success: true,
+      brands: profit.computeBrandProduct(inputs, startDate, endDate, brand)
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to build Brand & Product: ' + error.message });
   }
 }
 

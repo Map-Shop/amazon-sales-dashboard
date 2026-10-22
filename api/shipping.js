@@ -13,6 +13,23 @@ async function writeMonth(month, rows) {
   return kv.set(`shipping:raw:${month}`, { rows });
 }
 
+// The synced months in [startMonth, endMonth] and their rows, as get-range
+// returns them. Also used by the profitability statement (api/transactions.js).
+export async function readShippingRange(startMonth, endMonth) {
+  const index = (await kv.get('shipping:index')) || [];
+  const months = index.filter(m => m >= startMonth && m <= endMonth);
+  const rows = [];
+  if (shippingSql.shippingInSql()) {
+    rows.push(...await shippingSql.getMonths(months));
+  } else {
+    const buckets = await Promise.all(months.map(m => kv.get(`shipping:raw:${m}`)));
+    for (const b of buckets) {
+      if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
+    }
+  }
+  return { months, rows };
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // ShipStation V1 API (ssapi.shipstation.com) with HTTP Basic auth.
 //
@@ -151,17 +168,7 @@ async function handleGetRange(req, res) {
     const { startMonth, endMonth } = req.query;
     if (!startMonth || !endMonth) return res.status(400).json({ error: 'startMonth and endMonth required' });
 
-    const index = (await kv.get('shipping:index')) || [];
-    const months = index.filter(m => m >= startMonth && m <= endMonth);
-    const rows = [];
-    if (shippingSql.shippingInSql()) {
-      rows.push(...await shippingSql.getMonths(months));
-    } else {
-      const buckets = await Promise.all(months.map(m => kv.get(`shipping:raw:${m}`)));
-      for (const b of buckets) {
-        if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
-      }
-    }
+    const { months, rows } = await readShippingRange(startMonth, endMonth);
     return res.status(200).json({ success: true, startMonth, endMonth, months, rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });

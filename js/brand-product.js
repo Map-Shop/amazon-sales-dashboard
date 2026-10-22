@@ -210,9 +210,10 @@
       }
     }
     
-    // Brand & Product data comes from the v2024 Upstash pipeline (see
-    // `_loadBrandProductV2024` in overview-upstash.js — handles dedup,
-    // ad-spend allocation, shipping, etc.). Wrapped in this thin shim
+    // Brand & Product data comes from the server's profitability pipeline
+    // (`_loadBrandProductV2024` in overview-upstash.js asks for it;
+    // lib/profitability.js handles dedup, ad-spend allocation, shipping,
+    // etc.). Wrapped in this thin shim
     // so `generateBPYTDReport` / `generateBPMonthlyReport` keep their
     // existing call sites.
     async function loadBrandProductData(startDate, endDate, brandFilter) {
@@ -372,68 +373,6 @@
     }
     
     
-    // Extract profitability metrics from a financial statement
-    function extractProfitabilityMetrics(statement) {
-      // Calculate FBM totals
-      const fbmIncome = (statement.income['FBM Sales']?.credit || 0) - (statement.income['FBM Sales']?.debit || 0) +
-                        (statement.income['FBM Returns']?.credit || 0) - (statement.income['FBM Returns']?.debit || 0) +
-                        (statement.income['FBM Other']?.credit || 0) - (statement.income['FBM Other']?.debit || 0);
-      
-      const fbmOpEx = (statement.expenses['FBM Shipping Costs']?.debit || 0) - (statement.expenses['FBM Shipping Costs']?.credit || 0) +
-                      (statement.expenses['FBM Transaction Fees']?.debit || 0) - (statement.expenses['FBM Transaction Fees']?.credit || 0);
-      
-      const fbmProductCosts = (statement.expenses['FBM Product Costs']?.debit || 0) - (statement.expenses['FBM Product Costs']?.credit || 0);
-      const fbmAdSpend = (statement.expenses['FBM Ad Spend']?.debit || 0) - (statement.expenses['FBM Ad Spend']?.credit || 0);
-      const fbmProfit = fbmIncome - fbmOpEx - fbmProductCosts - fbmAdSpend;
-      const fbmMargin = fbmIncome > 0 ? (fbmProfit / fbmIncome * 100) : 0;
-      
-      // Calculate FBA totals
-      const fbaIncome = (statement.income['FBA Sales']?.credit || 0) - (statement.income['FBA Sales']?.debit || 0) +
-                        (statement.income['FBA Returns']?.credit || 0) - (statement.income['FBA Returns']?.debit || 0) +
-                        (statement.income['FBA Other']?.credit || 0) - (statement.income['FBA Other']?.debit || 0);
-      
-      const fbaOpEx = (statement.expenses['FBA Fees']?.debit || 0) - (statement.expenses['FBA Fees']?.credit || 0);
-      
-      const fbaProductCosts = (statement.expenses['FBA Product Costs']?.debit || 0) - (statement.expenses['FBA Product Costs']?.credit || 0);
-      const fbaAdSpend = (statement.expenses['FBA Ad Spend']?.debit || 0) - (statement.expenses['FBA Ad Spend']?.credit || 0);
-      const fbaProfit = fbaIncome - fbaOpEx - fbaProductCosts - fbaAdSpend;
-      const fbaMargin = fbaIncome > 0 ? (fbaProfit / fbaIncome * 100) : 0;
-      
-      // Calculate Total
-      const totalIncome = fbmIncome + fbaIncome;
-      const totalOpEx = fbmOpEx + fbaOpEx;
-      const totalProductCosts = fbmProductCosts + fbaProductCosts;
-      const totalAdSpend = fbmAdSpend + fbaAdSpend;
-      const totalProfit = fbmProfit + fbaProfit;
-      const totalMargin = totalIncome > 0 ? (totalProfit / totalIncome * 100) : 0;
-      
-      return {
-        fbm: {
-          income: fbmIncome,
-          opex: fbmOpEx,
-          productCosts: fbmProductCosts,
-          adSpend: fbmAdSpend,
-          profit: fbmProfit,
-          margin: fbmMargin
-        },
-        fba: {
-          income: fbaIncome,
-          opex: fbaOpEx,
-          productCosts: fbaProductCosts,
-          adSpend: fbaAdSpend,
-          profit: fbaProfit,
-          margin: fbaMargin
-        },
-        total: {
-          income: totalIncome,
-          opex: totalOpEx,
-          productCosts: totalProductCosts,
-          adSpend: totalAdSpend,
-          profit: totalProfit,
-          margin: totalMargin
-        }
-      };
-    }
     
     
     // Format comparison percentage with color indicator

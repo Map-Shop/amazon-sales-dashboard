@@ -14,6 +14,19 @@ async function writeAdMonth(type, month, rows) {
   if (adspendSql.adspendInSql()) return adspendSql.replaceMonth(type, month, rows);
   return kv.set(`adspend:${type}:raw:${month}`, { rows });
 }
+// An ad type's synced months in [startMonth, endMonth] and their rows, as
+// get-range returns them. Also used by the profitability statement
+// (api/transactions.js).
+export async function readAdRange(type, startMonth, endMonth) {
+  const index = (await kv.get(`adspend:${type}:index`)) || [];
+  const months = index.filter(m => m >= startMonth && m <= endMonth);
+  const buckets = await Promise.all(months.map(m => readAdMonth(type, m)));
+  const rows = [];
+  for (const b of buckets) {
+    if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
+  }
+  return { months, rows };
+}
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
@@ -310,13 +323,7 @@ async function handleGetRange(req, res) {
     if (!['sp', 'sb'].includes(type)) return res.status(400).json({ error: 'type must be sp or sb' });
     if (!startMonth || !endMonth)      return res.status(400).json({ error: 'startMonth and endMonth required' });
 
-    const index = (await kv.get(`adspend:${type}:index`)) || [];
-    const months = index.filter(m => m >= startMonth && m <= endMonth);
-    const buckets = await Promise.all(months.map(m => readAdMonth(type, m)));
-    const rows = [];
-    for (const b of buckets) {
-      if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
-    }
+    const { months, rows } = await readAdRange(type, startMonth, endMonth);
     return res.status(200).json({ success: true, type, startMonth, endMonth, months, rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });
