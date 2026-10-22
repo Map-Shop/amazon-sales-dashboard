@@ -1,4 +1,32 @@
 import { kv } from '../lib/kv.js';
+import * as entriesSql from '../lib/entries.js';
+
+// The log in the order entries were added, and changes to it — the
+// price_changes table when SQL_TABLES includes "pricechanges", otherwise
+// the pricechanges:entries kv record.
+const LOG = 'pricechanges';
+async function readEntries() {
+  if (entriesSql.listInSql(LOG)) return entriesSql.getAll(LOG);
+  return (await kv.get('pricechanges:entries')) || [];
+}
+async function appendEntries(added) {
+  if (entriesSql.listInSql(LOG)) return entriesSql.append(LOG, added);
+  const entries = (await kv.get('pricechanges:entries')) || [];
+  for (const e of added) entries.push(e);
+  await kv.set('pricechanges:entries', entries);
+}
+// Returns how many entries were removed.
+async function deleteEntry(id) {
+  if (entriesSql.listInSql(LOG)) return entriesSql.deleteById(LOG, id);
+  const entries = (await kv.get('pricechanges:entries')) || [];
+  const kept = entries.filter(e => e?.id !== id);
+  if (kept.length !== entries.length) await kv.set('pricechanges:entries', kept);
+  return entries.length - kept.length;
+}
+async function replaceEntries(entries) {
+  if (entriesSql.listInSql(LOG)) return entriesSql.replaceAll(LOG, entries);
+  await kv.set('pricechanges:entries', entries);
+}
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Price-change log. Used by the Sales & Volume → Price Change Impacts
@@ -54,7 +82,7 @@ async function handleGet(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const entries = (await kv.get('pricechanges:entries')) || [];
+    const entries = await readEntries();
     // Newest first by user-supplied date, then by createdAt as a stable
     // tiebreaker for entries on the same date.
     const sorted = [...entries].sort((a, b) => {
@@ -79,9 +107,7 @@ async function handleAdd(req, res) {
     }
     const entry = { id: newId(), createdAt: new Date().toISOString(), ...cleaned };
 
-    const entries = (await kv.get('pricechanges:entries')) || [];
-    entries.push(entry);
-    await kv.set('pricechanges:entries', entries);
+    await appendEntries([entry]);
 
     return res.status(200).json({ success: true, entry });
   } catch (error) {
@@ -116,9 +142,7 @@ async function handleBulkAdd(req, res) {
       return res.status(400).json({ error: 'No valid entries', rejected });
     }
 
-    const entries = (await kv.get('pricechanges:entries')) || [];
-    for (const e of accepted) entries.push(e);
-    await kv.set('pricechanges:entries', entries);
+    await appendEntries(accepted);
 
     return res.status(200).json({
       success: true,
@@ -140,14 +164,11 @@ async function handleDelete(req, res) {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ error: 'id required' });
 
-    const entries = (await kv.get('pricechanges:entries')) || [];
-    const before = entries.length;
-    const kept = entries.filter(e => e?.id !== id);
-    if (kept.length === before) {
+    const removed = await deleteEntry(id);
+    if (removed === 0) {
       return res.status(404).json({ error: 'Entry not found', id });
     }
-    await kv.set('pricechanges:entries', kept);
-    return res.status(200).json({ success: true, removed: before - kept.length });
+    return res.status(200).json({ success: true, removed });
   } catch (error) {
     return res.status(500).json({ error: 'Delete failed: ' + error.message });
   }
@@ -195,7 +216,7 @@ async function handleMigrateFromSheets(req, res) {
       });
     });
 
-    await kv.set('pricechanges:entries', entries);
+    await replaceEntries(entries);
     return res.status(200).json({
       success: true,
       imported: entries.length,

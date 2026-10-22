@@ -5,7 +5,8 @@
 //   node tools/to-sql.mjs <table|all> --verify
 //   node tools/to-sql.mjs <table|all> --fill
 //   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
-// Tables: orders, shipping, sessions. Default target is the dev database.
+// Tables: orders, shipping, sessions, pricechanges, changelog. Default
+// target is the dev database.
 //
 // Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
 // DATABASE_URL (an owner role). Nothing here prints a credential.
@@ -130,8 +131,43 @@ const TABLES = {
       const [rec] = await sql.query("SELECT value FROM kv WHERE key = 'session_data'");
       return compareLists(rec ? decodeValue(rec.value) : [], await getAll());
     }
-  }
+  },
+
+  pricechanges: entryLog('pricechanges', 'pricechanges:entries', 'price_changes', [
+    ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
+    ['sku', 'sku', 'text'], ['oldPrice', 'old_price', 'numeric'], ['newPrice', 'new_price', 'numeric']
+  ]),
+
+  changelog: entryLog('changelog', 'changelog:entries', 'listing_changes', [
+    ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
+    ['productName', 'product_name', 'text'], ['asin', 'asin', 'text'],
+    ['changes', 'changes', 'text'], ['notes', 'notes', 'text']
+  ])
 };
+
+// An entry log (lib/entries.js): a list kept in the order entries were added.
+function entryLog(name, kvKey, table, columns) {
+  return {
+    ddl: [
+      `CREATE TABLE ${table} (
+        seq bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ${columns.map(([, col, type]) => `${col} ${type} NOT NULL`).join(',\n        ')}
+      )`,
+      `CREATE INDEX ${table}_id_idx ON ${table} (id)`
+    ],
+    columns: columns.map(([, col]) => col).join(', '),
+    kvRows: `SELECT ${columns.map(([field, col, type]) =>
+        type === 'text' ? `e.v->>'${field}' AS ${col}` : `(e.v->>'${field}')::${type} AS ${col}`).join(', ')}, e.ord
+      FROM kv, jsonb_array_elements(kv.value::jsonb) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = '${kvKey}'`,
+    fillOrder: 'ord',
+    async apiCheck(sql, decodeValue) {
+      const { getAll } = await lib('entries.js');
+      const [rec] = await sql.query('SELECT value FROM kv WHERE key = $1', [kvKey]);
+      return compareLists(rec ? decodeValue(rec.value) : [], await getAll(name));
+    }
+  };
+}
 
 function compareLists(expected, actual) {
   let diffs = 0;
