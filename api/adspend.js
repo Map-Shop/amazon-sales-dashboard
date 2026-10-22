@@ -335,11 +335,14 @@ async function handleGetMonths(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
+    // Each month's latest row date comes from the table in SQL mode; kv
+    // mode keeps it in adspend:<type>:latest-posted (see storeMonthly).
+    const sqlLatest = adspendSql.adspendInSql();
     const [spIndex, sbIndex, spLatestMap, sbLatestMap] = await Promise.all([
       kv.get('adspend:sp:index'),
       kv.get('adspend:sb:index'),
-      kv.get('adspend:sp:latest-posted'),
-      kv.get('adspend:sb:latest-posted')
+      sqlLatest ? adspendSql.getLatestByMonth('sp') : kv.get('adspend:sp:latest-posted'),
+      sqlLatest ? adspendSql.getLatestByMonth('sb') : kv.get('adspend:sb:latest-posted')
     ]);
 
     const sp = Array.isArray(spIndex) ? spIndex : [];
@@ -356,7 +359,7 @@ async function handleGetMonths(req, res) {
     const sbMap = sanitize(sbLatestMap);
 
     async function backfill(type, months, map, mapKey) {
-      if (months.length === 0) return;
+      if (sqlLatest || months.length === 0) return;
       const latestMonth = months[months.length - 1];
       if (map[latestMonth]) return;
       const stored = await readAdMonth(type, latestMonth);
@@ -810,7 +813,9 @@ async function storeMonthly(type, month, rows) {
   // Track the latest daily date in this month's rows so the overview
   // page can render "Most Recent Ad Spend Data: 3/31/26" without
   // scanning every blob. Stored as a single dictionary key per type
-  // keyed by YYYY-MM.
+  // keyed by YYYY-MM. In SQL mode the table answers this directly
+  // (adspendSql.getLatestByMonth), so nothing is stored.
+  if (adspendSql.adspendInSql()) return;
   let monthLatest = null;
   for (const r of rows) {
     const d = r?.date;

@@ -34,6 +34,30 @@ async function rawMonthHasData(month) {
   ));
 }
 
+// The months holding API data and uploaded rows, as { rawIndex,
+// importedIndex }, and each month's latest posted date. With SQL_TABLES
+// including "transactions" the tables answer (lib/transactions.js);
+// otherwise the transactions:v2024:index / :imported-index /
+// :latest-posted kv records do, which the sync and upload maintain only in
+// that mode.
+async function readMonthIndexes() {
+  if (txSql.transactionsInSql()) {
+    const [rawIndex, importedIndex] = await Promise.all([
+      txSql.getRawMonths(), txSql.getImportedMonths()
+    ]);
+    return { rawIndex, importedIndex };
+  }
+  const [rawIndex, importedIndex] = await Promise.all([
+    kv.get('transactions:v2024:index'),
+    kv.get('transactions:v2024:imported-index')
+  ]);
+  return { rawIndex, importedIndex };
+}
+async function readLatestPostedMap() {
+  if (txSql.transactionsInSql()) return txSql.getLatestPostedByMonth();
+  return kv.get('transactions:v2024:latest-posted');
+}
+
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 //   GET  ?action=sync            [&month=YYYY-MM]            — pull SP-API → KV (v0 listFinancialEvents)
 //   GET  ?action=get             &month=YYYY-MM              — raw pages, one month
@@ -83,6 +107,9 @@ async function rawMonthHasData(month) {
 //                                            as `importedRows`. Client merges
 //                                            them with derived rows before
 //                                            _buildStatement runs.
+// With SQL_TABLES including "transactions", the raw and imported records,
+// the index, imported-index, and latest-posted are all answered by tables
+// (lib/transactions.js) and no longer written; last-synced stays in kv.
 //
 // Chunked storage: Upstash imposes a 10 MB per-request size limit on KV
 // writes. A single month's transactions can exceed that (notably 2025-08
@@ -182,9 +209,14 @@ async function handleSyncV2024(req, res) {
 
     const chunks = await storeRawMonthV2024(month, transactions);
 
-    const index = (await kv.get('transactions:v2024:index')) || [];
-    const updatedIndex = [...new Set([...index, month])].sort();
-    await kv.set('transactions:v2024:index', updatedIndex);
+    // In SQL mode the tables already record the month and its latest
+    // postedDate (see readMonthIndexes); kv mode keeps them here.
+    const kvBookkeeping = !txSql.transactionsInSql();
+    if (kvBookkeeping) {
+      const index = (await kv.get('transactions:v2024:index')) || [];
+      const updatedIndex = [...new Set([...index, month])].sort();
+      await kv.set('transactions:v2024:index', updatedIndex);
+    }
     await kv.set(`transactions:v2024:last-synced:${month}`, new Date().toISOString());
 
     // Track the absolute latest postedDate for this month so the
@@ -194,7 +226,7 @@ async function handleSyncV2024(req, res) {
       const d = t?.postedDate;
       return (d && (!acc || d > acc)) ? d : acc;
     }, null);
-    if (monthLatest) {
+    if (monthLatest && kvBookkeeping) {
       const map = (await kv.get('transactions:v2024:latest-posted')) || {};
       map[month] = monthLatest;
       await kv.set('transactions:v2024:latest-posted', map);
@@ -360,10 +392,7 @@ async function handleGetRangeV2024(req, res) {
 async function readRangeV2024(startMonth, endMonth) {
   // Union the SP-API index and the imported (CSV-uploaded) index so a
   // month present only in imported rows still shows up in the read.
-  const [rawIndex, importedIndex] = await Promise.all([
-    kv.get('transactions:v2024:index'),
-    kv.get('transactions:v2024:imported-index')
-  ]);
+  const { rawIndex, importedIndex } = await readMonthIndexes();
   const monthSet = new Set();
   for (const m of (rawIndex || [])) {
     if (m >= startMonth && m <= endMonth) monthSet.add(m);
@@ -524,10 +553,9 @@ async function handleGetMonthsV2024(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    const [index, importedIndex, storedMap] = await Promise.all([
-      kv.get('transactions:v2024:index'),
-      kv.get('transactions:v2024:imported-index'),
-      kv.get('transactions:v2024:latest-posted')
+    const [{ rawIndex: index, importedIndex }, storedMap] = await Promise.all([
+      readMonthIndexes(),
+      readLatestPostedMap()
     ]);
     const latestPostedMap = (storedMap && typeof storedMap === 'object') ? { ...storedMap } : {};
     // Union with imported months so the navigation widget / data-blurb
@@ -542,7 +570,8 @@ async function handleGetMonthsV2024(req, res) {
     // the *most recent* synced month if it's missing — that's the only
     // month that could affect the global "latest" label, so we don't
     // need to scan older months. After this populates once it persists.
-    if (months.length > 0) {
+    // (kv mode only: the tables' map always covers every month with data.)
+    if (months.length > 0 && !txSql.transactionsInSql()) {
       const latestMonth = months[months.length - 1];
       if (!latestPostedMap[latestMonth]) {
         const txs = await readMonthV2024(latestMonth);
@@ -1073,23 +1102,27 @@ async function handleUploadYearlyCsv(req, res) {
       await writeImportedMonth(m, byMonth[m]);
       totalRows += byMonth[m].length;
     }
-    const existingIndex = (await kv.get('transactions:v2024:imported-index')) || [];
-    const mergedIndex = [...new Set([...existingIndex, ...writtenMonths])].sort();
-    await kv.set('transactions:v2024:imported-index', mergedIndex);
+    // In SQL mode the table already knows the months and their latest
+    // dates (see readMonthIndexes); kv mode keeps them here.
+    if (!txSql.transactionsInSql()) {
+      const existingIndex = (await kv.get('transactions:v2024:imported-index')) || [];
+      const mergedIndex = [...new Set([...existingIndex, ...writtenMonths])].sort();
+      await kv.set('transactions:v2024:imported-index', mergedIndex);
 
-    // Latest-posted: store as an ISO timestamp at end-of-day UTC so the
-    // overview's "Most Recent Transaction Data" label renders the right
-    // calendar date. Only updates the per-month entry; the global max
-    // is computed at read time.
-    const latestPostedMap = (await kv.get('transactions:v2024:latest-posted')) || {};
-    for (const m of writtenMonths) {
-      const date = monthLatestDate[m];
-      const iso = `${date}T23:59:59Z`;
-      if (!latestPostedMap[m] || iso > latestPostedMap[m]) {
-        latestPostedMap[m] = iso;
+      // Latest-posted: store as an ISO timestamp at end-of-day UTC so the
+      // overview's "Most Recent Transaction Data" label renders the right
+      // calendar date. Only updates the per-month entry; the global max
+      // is computed at read time.
+      const latestPostedMap = (await kv.get('transactions:v2024:latest-posted')) || {};
+      for (const m of writtenMonths) {
+        const date = monthLatestDate[m];
+        const iso = `${date}T23:59:59Z`;
+        if (!latestPostedMap[m] || iso > latestPostedMap[m]) {
+          latestPostedMap[m] = iso;
+        }
       }
+      await kv.set('transactions:v2024:latest-posted', latestPostedMap);
     }
-    await kv.set('transactions:v2024:latest-posted', latestPostedMap);
 
     return res.status(200).json({
       success: true,
