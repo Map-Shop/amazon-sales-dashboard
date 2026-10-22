@@ -2,14 +2,13 @@
 // database, and verifies the two match.
 //
 // Run from the project root:
-//   node tools/to-sql.mjs <table|group|all> --verify [--target prod]
-//   node tools/to-sql.mjs <table|group|all> --fill [--target prod --before-switch]
+//   node tools/to-sql.mjs <table|group|all> --verify
+//   node tools/to-sql.mjs <table|group|all> --fill
 // Tables: orders, shipping, sessions, pricechanges, changelog, products,
 // mappings, adspend, transactions (three tables, filled together), and the
-// groups adcampaigns, adreviews, adspendops, ordersops, stamps. The default
-// target is the dev database (DATABASE_URL_DEV in .env.local); prod uses
-// DATABASE_URL (an owner role) and only for tables not yet live there.
-// Nothing here prints a credential.
+// groups adcampaigns, adreviews, adspendops, ordersops, stamps. The target
+// is the dev database (DATABASE_URL_DEV in .env.local); production is
+// refused. Nothing here prints a credential.
 //
 // Production's kv data records were deleted once the tables were live, so a
 // dev branch reset from production already has the tables and needs no
@@ -1017,20 +1016,13 @@ const fill = args.includes('--fill');
 const target = args.includes('--target') ? args[args.indexOf('--target') + 1] : 'dev';
 const envName = { dev: 'DATABASE_URL_DEV', prod: 'DATABASE_URL' }[target];
 const names = which === 'all' ? Object.keys(TABLES) : (GROUPS[which] || [which]);
-// Production has read and written these since the 2026-10-22 switch, and their
-// kv records are gone: never filled or checked against kv there again.
-const LIVE_IN_PROD = new Set(['orders', 'shipping', 'sessions', 'pricechanges', 'changelog', 'products',
-  'mappings', 'adspend', 'transactions-raw', 'transactions-months', 'transactions-imported']);
+// Every table has been live in production since 2026-10-22 (the first nine
+// data sets in the morning, the rest at 20:13 UTC): production writes only
+// to them, so a fill from kv would overwrite newer data and a verify would
+// only report the difference.
 if (target === 'prod') {
-  const live = names.filter(n => LIVE_IN_PROD.has(n));
-  if (live.length) {
-    console.error(`Refusing to target production for ${live.join(', ')}: live there since 2026-10-22, with no kv records left to fill from.`);
-    process.exit(1);
-  }
-  if (fill && !args.includes('--before-switch')) {
-    console.error('Refusing a production fill without --before-switch: once production reads a table, refilling it from kv would overwrite newer data.');
-    process.exit(1);
-  }
+  console.error('Refusing to target production: every table is live there since 2026-10-22, and kv no longer holds its data.');
+  process.exit(1);
 }
 if (!names.every(n => TABLES[n]) || !envName || !(fill || args.includes('--verify'))) {
   console.error(`Usage: node tools/to-sql.mjs <${Object.keys(TABLES).join('|')}|all> --verify | --fill`);
