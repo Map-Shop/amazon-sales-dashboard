@@ -1,4 +1,17 @@
 import { kv } from '../lib/kv.js';
+import * as productsSql from '../lib/products.js';
+
+// The catalog and its replacement — the products table when SQL_TABLES
+// includes "products", otherwise the `products` kv record. The
+// products:updated-at timestamp stays in kv either way.
+async function readProducts() {
+  if (productsSql.productsInSql()) return productsSql.getProducts();
+  return kv.get('products');
+}
+async function writeProducts(products) {
+  if (productsSql.productsInSql()) return productsSql.replaceProducts(products);
+  return kv.set('products', products);
+}
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 //  GET  ?action=get                          — read full catalog
@@ -55,7 +68,7 @@ async function handleGet(req, res) {
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
     const [products, updatedAt] = await Promise.all([
-      kv.get('products'),
+      readProducts(),
       kv.get('products:updated-at')
     ]);
 
@@ -91,7 +104,7 @@ async function handleBulkUpsert(req, res) {
     const incoming = Array.isArray(req.body?.products) ? req.body.products : null;
     if (!incoming) return res.status(400).json({ error: 'products array required' });
 
-    const existing = (await kv.get('products')) || [];
+    const existing = (await readProducts()) || [];
     const bySku = {};
     for (const p of existing) if (p?.sku) bySku[p.sku] = p;
 
@@ -115,7 +128,7 @@ async function handleBulkUpsert(req, res) {
     }
 
     const merged = Object.values(bySku).sort((a, b) => a.sku.localeCompare(b.sku));
-    await kv.set('products', merged);
+    await writeProducts(merged);
     await kv.set('products:updated-at', new Date().toISOString());
 
     return res.status(200).json({
@@ -144,7 +157,7 @@ async function handleReplace(req, res) {
       .map(normalizeProduct)
       .sort((a, b) => a.sku.localeCompare(b.sku));
 
-    await kv.set('products', normalized);
+    await writeProducts(normalized);
     await kv.set('products:updated-at', new Date().toISOString());
 
     return res.status(200).json({ success: true, total: normalized.length });
@@ -208,7 +221,7 @@ async function handleMigrate(req, res) {
     }
 
     products.sort((a, b) => a.sku.localeCompare(b.sku));
-    await kv.set('products', products);
+    await writeProducts(products);
     await kv.set('products:updated-at', new Date().toISOString());
 
     return res.status(200).json({

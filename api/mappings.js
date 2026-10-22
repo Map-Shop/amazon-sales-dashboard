@@ -1,4 +1,17 @@
 import { kv } from '../lib/kv.js';
+import * as mappingsSql from '../lib/mappings.js';
+
+// A mapping's lookup object and its replacement — the mapping_entries
+// table when SQL_TABLES includes "mappings", otherwise the mappings:<type>
+// kv record. The :updated-at timestamps stay in kv either way.
+async function readMap(type) {
+  if (mappingsSql.mappingsInSql()) return mappingsSql.getMap(type);
+  return kv.get(kvKey(type));
+}
+async function writeMap(type, map) {
+  if (mappingsSql.mappingsInSql()) return mappingsSql.replaceMap(type, map);
+  return kv.set(kvKey(type), map);
+}
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Single endpoint serving product, brand, and fee mappings via ?type=.
@@ -53,7 +66,7 @@ async function handleGet(req, res, type) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
     const [mappings, updatedAt] = await Promise.all([
-      kv.get(kvKey(type)),
+      readMap(type),
       kv.get(`${kvKey(type)}:updated-at`)
     ]);
     return res.status(200).json({
@@ -95,10 +108,10 @@ async function handleSaveOne(req, res, type) {
       const feeType = String(req.body?.feeType || '').trim();
       if (!feeType) return res.status(400).json({ error: 'feeType required' });
       const line = String(req.body?.line || '').trim();
-      const current = (await kv.get(kvKey(type))) || {};
+      const current = (await readMap(type)) || {};
       if (!line) delete current[feeType];
       else        current[feeType] = line;
-      await kv.set(kvKey(type), current);
+      await writeMap(type, current);
       await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
       return res.status(200).json({ success: true, total: Object.keys(current).length });
     }
@@ -106,7 +119,7 @@ async function handleSaveOne(req, res, type) {
     const campaign = String(req.body?.campaign || '').trim();
     if (!campaign) return res.status(400).json({ error: 'campaign required' });
 
-    const current = (await kv.get(kvKey(type))) || {};
+    const current = (await readMap(type)) || {};
 
     if (type === 'product') {
       const brand = String(req.body?.brand || '').trim();
@@ -121,7 +134,7 @@ async function handleSaveOne(req, res, type) {
       else         current[campaign] = brand;
     }
 
-    await kv.set(kvKey(type), current);
+    await writeMap(type, current);
     await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
     return res.status(200).json({ success: true, total: Object.keys(current).length });
   } catch (error) {
@@ -138,10 +151,10 @@ async function handleDeleteOne(req, res, type) {
     const keyField = type === 'fee' ? 'feeType' : 'campaign';
     const key = String(req.body?.[keyField] || '').trim();
     if (!key) return res.status(400).json({ error: `${keyField} required` });
-    const current = (await kv.get(kvKey(type))) || {};
+    const current = (await readMap(type)) || {};
     const existed = Object.prototype.hasOwnProperty.call(current, key);
     delete current[key];
-    await kv.set(kvKey(type), current);
+    await writeMap(type, current);
     await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
     return res.status(200).json({ success: true, existed, total: Object.keys(current).length });
   } catch (error) {
@@ -160,7 +173,7 @@ async function handleBulkUpsert(req, res, type) {
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
     if (!rows) return res.status(400).json({ error: 'rows array required' });
 
-    const current = (await kv.get(kvKey(type))) || {};
+    const current = (await readMap(type)) || {};
     let addedCount = 0;
     let updatedCount = 0;
 
@@ -194,7 +207,7 @@ async function handleBulkUpsert(req, res, type) {
       }
     }
 
-    await kv.set(kvKey(type), current);
+    await writeMap(type, current);
     await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
     return res.status(200).json({
       success: true,
@@ -228,7 +241,7 @@ async function handleMigrate(req, res, type) {
     const body = await sheetsRes.json();
     const rows = body.values || [];
     if (rows.length < 2) {
-      await kv.set(kvKey(type), {});
+      await writeMap(type, {});
       await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
       return res.status(200).json({ success: true, total: 0, message: `${sheetName} was empty` });
     }
@@ -261,7 +274,7 @@ async function handleMigrate(req, res, type) {
       }
     }
 
-    await kv.set(kvKey(type), out);
+    await writeMap(type, out);
     await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
     return res.status(200).json({
       success: true,

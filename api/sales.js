@@ -1,4 +1,5 @@
 import { kv } from '../lib/kv.js';
+import * as productsSql from '../lib/products.js';
 
 export default async function handler(req, res) {
   const { action } = req.query;
@@ -65,7 +66,7 @@ async function handleGetData(req, res) {
       data = await kv.get('summary');
     } else if (type === 'products') {
       // Fetch product data
-      data = await kv.get('products');
+      data = productsSql.productsInSql() ? await productsSql.getProducts() : await kv.get('products');
     } else {
       return res.status(400).json({ error: 'Invalid type parameter' });
     }

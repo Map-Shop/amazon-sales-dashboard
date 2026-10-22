@@ -26,12 +26,14 @@ export function memoryKv(seed = {}) {
 
 const stubKv = (src) =>
   // The stub is reached through globalThis so the test can hand one in.
-  // Orders stay in kv under test (the SQL order store is off), so the
-  // order-store import becomes a stand-in that reports exactly that.
+  // Orders and products stay in kv under test (the SQL stores are off), so
+  // those imports become stand-ins that report exactly that.
   src.replace(/^import \{ kv \} from '\.\.\/lib\/kv\.js';$/m,
               'const kv = globalThis.__TEST_KV__ || null;')
      .replace(/^import \* as ordersSql from '\.\.\/lib\/orders\.js';$/m,
-              'const ordersSql = { ordersInSql: () => false };');
+              'const ordersSql = { ordersInSql: () => false };')
+     .replace(/^import \* as productsSql from '\.\.\/lib\/products\.js';$/m,
+              'const productsSql = { productsInSql: () => false };');
 
 export async function loadAdspend(tag, kv) {
   // adcampaigns.js is copied and stubbed too, rather than having its imports

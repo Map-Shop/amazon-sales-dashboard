@@ -1,5 +1,6 @@
 import { kv } from '../lib/kv.js';
 import * as ordersSql from '../lib/orders.js';
+import * as productsSql from '../lib/products.js';
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
@@ -3324,7 +3325,7 @@ function moBuildInputs({ census, rows, window }) {
 async function moLoadBrandSales(window) {
   const sqlOrders = ordersSql.ordersInSql();
   const [products, index] = await Promise.all([
-    kv.get('products'),
+    productsSql.productsInSql() ? productsSql.getProducts() : kv.get('products'),
     sqlOrders ? null : kv.get('orders:v2:index')
   ]);
   const catalog = Array.isArray(products) ? products : [];

@@ -5,8 +5,8 @@
 //   node tools/to-sql.mjs <table|all> --verify
 //   node tools/to-sql.mjs <table|all> --fill
 //   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
-// Tables: orders, shipping, sessions, pricechanges, changelog. Default
-// target is the dev database.
+// Tables: orders, shipping, sessions, pricechanges, changelog, products,
+// mappings. Default target is the dev database.
 //
 // Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
 // DATABASE_URL (an owner role). Nothing here prints a credential.
@@ -138,6 +138,72 @@ const TABLES = {
     ['sku', 'sku', 'text'], ['oldPrice', 'old_price', 'numeric'], ['newPrice', 'new_price', 'numeric']
   ]),
 
+  products: {
+    ddl: [
+      `CREATE TABLE products (
+        position         integer     PRIMARY KEY,
+        sku              text        NOT NULL,
+        name             text,
+        brand            text,
+        fulfillment      text,
+        cost             numeric,
+        asin             text,
+        type             text,
+        status           text,
+        transaction_fees numeric,
+        fba_fees         numeric,
+        avg_shipping     numeric,
+        updated_at       timestamptz NOT NULL DEFAULT now()
+      )`,
+      'CREATE INDEX products_sku_idx ON products (sku)'
+    ],
+    columns: 'position, sku, name, brand, fulfillment, cost, asin, type, status, transaction_fees, fba_fees, avg_shipping',
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.v->>'sku' AS sku, e.v->>'name' AS name,
+        e.v->>'brand' AS brand, e.v->>'fulfillment' AS fulfillment, (e.v->>'cost')::numeric AS cost,
+        e.v->>'asin' AS asin, e.v->>'type' AS type, e.v->>'status' AS status,
+        (e.v->>'transactionFees')::numeric AS transaction_fees, (e.v->>'fbaFees')::numeric AS fba_fees,
+        (e.v->>'avgShipping')::numeric AS avg_shipping
+      FROM kv, jsonb_array_elements(kv.value::jsonb) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = 'products'`,
+    async apiCheck(sql, decodeValue) {
+      const { getProducts } = await lib('products.js');
+      const [rec] = await sql.query("SELECT value FROM kv WHERE key = 'products'");
+      return compareLists(rec ? decodeValue(rec.value) : [], await getProducts());
+    }
+  },
+
+  mappings: {
+    ddl: [
+      `CREATE TABLE mapping_entries (
+        type       text        NOT NULL,
+        position   integer     NOT NULL,
+        key        text        NOT NULL,
+        value      json        NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (type, position),
+        UNIQUE (type, key)
+      )`
+    ],
+    columns: 'type, position, key, value',
+    // json has no equality operator; compare its exact text.
+    compareColumns: 'type, position, key, value::text AS value',
+    // json_each (not jsonb) keeps the object's key order and exact value text.
+    kvRows: `SELECT substring(kv.key from 10) AS type, (e.ord - 1)::int AS position, e.key AS key, e.value AS value
+      FROM kv, json_each(kv.value::json) WITH ORDINALITY AS e(key, value, ord)
+      WHERE kv.key IN ('mappings:product', 'mappings:brand', 'mappings:fee')`,
+    // Entries in order, so key order is checked as well as values.
+    async apiCheck(sql, decodeValue) {
+      const { getMap } = await lib('mappings.js');
+      const fromKv = [], fromApi = [];
+      for (const type of ['product', 'brand', 'fee']) {
+        const [rec] = await sql.query('SELECT value FROM kv WHERE key = $1', [`mappings:${type}`]);
+        fromKv.push(...Object.entries(rec ? decodeValue(rec.value) : {}).map(e => [type, ...e]));
+        fromApi.push(...Object.entries(await getMap(type)).map(e => [type, ...e]));
+      }
+      return compareLists(fromKv, fromApi);
+    }
+  },
+
   changelog: entryLog('changelog', 'changelog:entries', 'listing_changes', [
     ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
     ['productName', 'product_name', 'text'], ['asin', 'asin', 'text'],
@@ -222,8 +288,9 @@ for (const name of names) {
         (t.fillOrder ? ` ORDER BY src.${t.fillOrder}` : ''))
     ]);
   }
-  const tableRows = `SELECT ${t.columns} FROM ${table}`;
-  const kvRows = `SELECT ${t.columns} FROM (${t.kvRows}) src`;
+  const cmp = t.compareColumns || t.columns;
+  const tableRows = `SELECT ${cmp} FROM ${table}`;
+  const kvRows = `SELECT ${cmp} FROM (${t.kvRows}) src`;
   const [counts] = await sql.query(`SELECT (SELECT count(*) FROM (${kvRows}) a)::int AS kv, (SELECT count(*) FROM ${table})::int AS tbl`);
   const [onlyKv] = await sql.query(`SELECT count(*)::int AS n FROM ((${kvRows}) EXCEPT ALL (${tableRows})) d`);
   const [onlyTable] = await sql.query(`SELECT count(*)::int AS n FROM ((${tableRows}) EXCEPT ALL (${kvRows})) d`);
