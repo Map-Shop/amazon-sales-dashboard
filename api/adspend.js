@@ -4,6 +4,7 @@ import * as productsSql from '../lib/products.js';
 import * as adspendSql from '../lib/adspend.js';
 import * as adHistory from '../lib/adhistory.js';
 import * as reviews from '../lib/adreviews.js';
+import * as spendOps from '../lib/adspendops.js';
 
 // An ad type's month as { rows } (null when kv has no record), and its
 // replacement — the ad_spend_rows table when SQL_TABLES includes
@@ -16,11 +17,40 @@ async function writeAdMonth(type, month, rows) {
   if (adspendSql.adspendInSql()) return adspendSql.replaceMonth(type, month, rows);
   return kv.set(`adspend:${type}:raw:${month}`, { rows });
 }
+
+// The ad spend bookkeeping — each type's month list, each month's last
+// collection time, the pending report queue, the weekly rollups — from tables
+// when SQL_TABLES includes "adspendops" (lib/adspendops.js), otherwise from
+// the adspend:* kv records. Reads return the kv record's shape, or null.
+function adIndexRead(type) {
+  return spendOps.adspendOpsInSql() ? spendOps.getIndex(type) : kv.get(`adspend:${type}:index`);
+}
+function adIndexWrite(type, months) {
+  return spendOps.adspendOpsInSql() ? spendOps.replaceIndex(type, months) : kv.set(`adspend:${type}:index`, months);
+}
+function adLastSyncedRead(month) {
+  return spendOps.adspendOpsInSql() ? spendOps.getLastSynced(month) : kv.get(`adspend:last-synced:${month}`);
+}
+function adLastSyncedWrite(month, at) {
+  return spendOps.adspendOpsInSql() ? spendOps.setLastSynced(month, at) : kv.set(`adspend:last-synced:${month}`, at);
+}
+function adQueueRead() {
+  return spendOps.adspendOpsInSql() ? spendOps.getQueue() : kv.get('adspend:pending');
+}
+function adQueueWrite(entries) {
+  return spendOps.adspendOpsInSql() ? spendOps.replaceQueue(entries) : kv.set('adspend:pending', entries);
+}
+function whYearRead(year) {
+  return spendOps.adspendOpsInSql() ? spendOps.getWeekYear(year) : kv.get(WH_KEY(year));
+}
+function whYearWrite(year, doc) {
+  return spendOps.adspendOpsInSql() ? spendOps.replaceWeekYear(year, doc) : kv.set(WH_KEY(year), doc);
+}
 // An ad type's synced months in [startMonth, endMonth] and their rows, as
 // get-range returns them. Also used by the profitability statement
 // (api/transactions.js).
 export async function readAdRange(type, startMonth, endMonth) {
-  const index = (await kv.get(`adspend:${type}:index`)) || [];
+  const index = (await adIndexRead(type)) || [];
   const months = index.filter(m => m >= startMonth && m <= endMonth);
   const buckets = await Promise.all(months.map(m => readAdMonth(type, m)));
   const rows = [];
@@ -197,9 +227,9 @@ async function handleSyncRequest(req, res) {
     }
 
     // Merge new report requests into the pending list (keep existing ones).
-    const pending = (await kv.get('adspend:pending')) || [];
+    const pending = (await adQueueRead()) || [];
     const goodOnes = requested.filter(r => r.reportId);
-    await kv.set('adspend:pending', [...pending, ...goodOnes]);
+    await adQueueWrite([...pending, ...goodOnes]);
 
     return res.status(200).json({
       success: true,
@@ -219,7 +249,7 @@ async function handleSyncRequest(req, res) {
 // done. Idempotent: safe to call repeatedly (UI polling) or on a cron.
 async function handleSyncCollect(req, res) {
   try {
-    const pending = (await kv.get('adspend:pending')) || [];
+    const pending = (await adQueueRead()) || [];
     if (pending.length === 0) {
       return res.status(200).json({ success: true, collected: [], stillPending: [], message: 'Nothing pending.' });
     }
@@ -244,7 +274,7 @@ async function handleSyncCollect(req, res) {
           const rawRows = await downloadReport(status.url);
           const normalized = normalizeRows(rawRows, p.type);
           await storeMonthly(p.type, p.month, normalized);
-          await kv.set(`adspend:last-synced:${p.month}`, new Date().toISOString());
+          await adLastSyncedWrite(p.month, new Date().toISOString());
           collected.push({ ...p, rowCount: normalized.length });
         } else if (statusStr === 'FAILURE' || statusStr === 'CANCELLED') {
           failed.push({ ...p, error: status.statusDetails || `status=${statusStr}` });
@@ -261,7 +291,7 @@ async function handleSyncCollect(req, res) {
 
     // Anything collected or explicitly failed is removed from pending. Still-
     // pending items stay for the next call.
-    await kv.set('adspend:pending', stillPending);
+    await adQueueWrite(stillPending);
 
     return res.status(200).json({
       success: true,
@@ -283,7 +313,7 @@ async function handleSyncStatus(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    const pending = (await kv.get('adspend:pending')) || [];
+    const pending = (await adQueueRead()) || [];
     return res.status(200).json({ success: true, pending, count: pending.length });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });
@@ -302,7 +332,7 @@ async function handleGet(req, res) {
 
     const [stored, lastSynced] = await Promise.all([
       readAdMonth(type, month),
-      kv.get(`adspend:last-synced:${month}`)
+      adLastSyncedRead(month)
     ]);
     return res.status(200).json({
       success: true,
@@ -341,8 +371,8 @@ async function handleGetMonths(req, res) {
     // mode keeps it in adspend:<type>:latest-posted (see storeMonthly).
     const sqlLatest = adspendSql.adspendInSql();
     const [spIndex, sbIndex, spLatestMap, sbLatestMap] = await Promise.all([
-      kv.get('adspend:sp:index'),
-      kv.get('adspend:sb:index'),
+      adIndexRead('sp'),
+      adIndexRead('sb'),
       sqlLatest ? adspendSql.getLatestByMonth('sp') : kv.get('adspend:sp:latest-posted'),
       sqlLatest ? adspendSql.getLatestByMonth('sb') : kv.get('adspend:sb:latest-posted')
     ]);
@@ -455,7 +485,7 @@ async function handleMigrateFromSheets(req, res) {
       // API data already exists (detected by the presence of at least one
       // sku-bearing row). API data is richer and authoritative; we only
       // want Sheets migration to fill in months the API hasn't touched.
-      const index = (await kv.get(`adspend:${type}:index`)) || [];
+      const index = (await adIndexRead(type)) || [];
       let writtenRows = 0;
       const skippedMonths = [];
       for (const [month, rows] of Object.entries(byMonth)) {
@@ -471,7 +501,7 @@ async function handleMigrateFromSheets(req, res) {
         if (!index.includes(month)) index.push(month);
       }
       index.sort();
-      await kv.set(`adspend:${type}:index`, index);
+      await adIndexWrite(type, index);
       counts[type] = { rows: writtenRows, skippedMonths };
     }
 
@@ -551,7 +581,7 @@ async function handleUploadYearlyCsv(req, res) {
     // rows are detected by the presence of a `sku` field on at least one
     // row — historical/Sheets/upload rows never set sku, so this check
     // cleanly separates the two sources.
-    const index = (await kv.get(`adspend:${type}:index`)) || [];
+    const index = (await adIndexRead(type)) || [];
     let writtenRows = 0;
     const writtenMonths = [];
     const skippedMonths = [];
@@ -569,7 +599,7 @@ async function handleUploadYearlyCsv(req, res) {
       if (!index.includes(month)) index.push(month);
     }
     index.sort();
-    await kv.set(`adspend:${type}:index`, index);
+    await adIndexWrite(type, index);
 
     return res.status(200).json({
       success: true,
@@ -662,7 +692,7 @@ async function handleDedupeSheetsVsApi(req, res) {
 
     const monthsToCheck = month
       ? [month]
-      : ((await kv.get(`adspend:${type}:index`)) || []);
+      : ((await adIndexRead(type)) || []);
 
     const results = [];
     for (const m of monthsToCheck) {
@@ -805,11 +835,11 @@ async function storeMonthly(type, month, rows) {
   // the same month is expected to overwrite cleanly.
   await writeAdMonth(type, month, rows);
 
-  const index = (await kv.get(`adspend:${type}:index`)) || [];
+  const index = (await adIndexRead(type)) || [];
   if (!index.includes(month)) {
     index.push(month);
     index.sort();
-    await kv.set(`adspend:${type}:index`, index);
+    await adIndexWrite(type, index);
   }
 
   // Track the latest daily date in this month's rows so the overview
@@ -4851,13 +4881,13 @@ async function whUpsert(binned) {
 
   const years = [];
   for (const [year, rows] of byYear) {
-    const stored = await kv.get(WH_KEY(year));
+    const stored = await whYearRead(year);
     const existing = (stored && Array.isArray(stored.rows)) ? stored.rows : [];
     const index = new Map(existing.map(r => [`${r.week}|${r.campaign}`, r]));
     for (const r of rows) index.set(`${r.week}|${r.campaign}`, r);
     const merged = [...index.values()].sort(
       (a, b) => a.week.localeCompare(b.week) || a.campaign.localeCompare(b.campaign));
-    await kv.set(WH_KEY(year), { rows: merged, updatedAt: new Date().toISOString() });
+    await whYearWrite(year, { rows: merged, updatedAt: new Date().toISOString() });
     years.push(year);
   }
   return {
@@ -4870,7 +4900,7 @@ async function whUpsert(binned) {
 async function whLoadRange(from, to) {
   const years = [];
   for (let y = Number(from.slice(0, 4)); y <= Number(to.slice(0, 4)); y++) years.push(String(y));
-  const stores = await Promise.all(years.map(y => kv.get(WH_KEY(y))));
+  const stores = await Promise.all(years.map(y => whYearRead(y)));
   const rows = [];
   for (const s of stores) {
     for (const r of ((s && s.rows) || [])) {
@@ -5003,7 +5033,7 @@ async function handleWeeksRebuild(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const index = (await kv.get('adspend:sp:index')) || [];
+    const index = (await adIndexRead('sp')) || [];
     if (!Array.isArray(index) || !index.length) {
       return res.status(409).json({ error: 'No monthly ad spend data is stored.' });
     }

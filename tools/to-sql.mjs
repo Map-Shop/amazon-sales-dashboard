@@ -34,9 +34,10 @@ import { neon } from '@neondatabase/serverless';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const lib = (name) => import(pathToFileURL(path.join(ROOT, 'lib', name)).href);
 const { rawExtracted, RAW_EXTRACTED_COLUMNS } = await lib('transactions.js');
-const { recordColumns, recordValues, recordCompareColumns } = await lib('records.js');
+const { recordColumns, recordValues, recordCompareColumns, toRecord } = await lib('records.js');
 const adcensus = await lib('adcensus.js');
 const adreviews = await lib('adreviews.js');
+const adspendops = await lib('adspendops.js');
 
 // The review records and where each lives in the tables.
 const REVIEW_SLOTS = [
@@ -50,7 +51,10 @@ const GROUPS = {
   // Rows before the snapshot documents, whose check reads them back whole.
   adcampaigns: ['ad-campaigns', 'ad-portfolios', 'ad-census', 'ad-census-syncs',
                 'ad-brand-overrides', 'campaign-changes'],
-  adreviews: ['ad-review-runs', 'review-notes', 'brand-postures', 'ad-cron-jobs']
+  adreviews: ['ad-review-runs', 'review-notes', 'brand-postures', 'ad-cron-jobs'],
+  // Rollup rows before the year table, whose check reads both back whole.
+  adspendops: ['ad-spend-months', 'ad-spend-month-syncs', 'ad-spend-report-queue',
+               'ad-spend-weeks', 'ad-spend-week-years']
 };
 
 // readMonthV2024's kv reassembly, in SQL: a month record holding its own
@@ -671,6 +675,111 @@ const TABLES = {
         actual.push(await adreviews.getCronJob(job));
       }
       return compareLists(expected, actual);
+    }
+  },
+
+  // ── Ad spend bookkeeping (lib/adspendops.js) ──────────────────────────
+  'ad-spend-months': {
+    ddl: [
+      `CREATE TABLE ad_spend_months (
+        ad_type  text    NOT NULL,
+        position integer NOT NULL,
+        month    text    NOT NULL,
+        PRIMARY KEY (ad_type, position)
+      )`
+    ],
+    columns: 'ad_type, position, month',
+    kvRows: `SELECT split_part(kv.key, ':', 2) AS ad_type, (e.ord - 1)::int AS position, e.m AS month
+      FROM kv, json_array_elements_text(kv.value::json) WITH ORDINALITY AS e(m, ord)
+      WHERE kv.key IN ('adspend:sp:index', 'adspend:sb:index')`,
+    async apiCheck(sql, decodeValue) {
+      const expected = [], actual = [];
+      for (const type of ['sp', 'sb']) {
+        const [r] = await sql.query('SELECT value FROM kv WHERE key = $1', [`adspend:${type}:index`]);
+        expected.push(r ? decodeValue(r.value) : null);
+        actual.push(await adspendops.getIndex(type));
+      }
+      return compareLists(expected, actual);
+    }
+  },
+
+  // Bare string values: kv keeps a string as its own text.
+  'ad-spend-month-syncs': {
+    ddl: [`CREATE TABLE ad_spend_month_syncs (month text PRIMARY KEY, synced_at text)`],
+    columns: 'month, synced_at',
+    kvRows: `SELECT split_part(kv.key, ':', 3) AS month, kv.value AS synced_at
+      FROM kv WHERE kv.key ~ '^adspend:last-synced:[0-9]{4}-[0-9]{2}$'`,
+    async apiCheck(sql, decodeValue) {
+      const recs = await sql.query("SELECT key, value FROM kv WHERE key ~ '^adspend:last-synced:[0-9]{4}-[0-9]{2}$' ORDER BY key");
+      const actual = [];
+      for (const r of recs) actual.push(await adspendops.getLastSynced(r.key.split(':')[2]));
+      return compareLists(recs.map(r => decodeValue(r.value)), actual);
+    }
+  },
+
+  'ad-spend-report-queue': {
+    allowEmpty: true,   // nothing pending is the normal state
+    ddl: [
+      `CREATE TABLE ad_spend_report_queue (
+        position integer PRIMARY KEY,
+        ${adspendops.QUEUE_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields   text[]  NOT NULL,
+        extra    json
+      )`
+    ],
+    columns: `position, ${recordColumns(adspendops.QUEUE_SPEC)}`,
+    compareColumns: `position, ${recordCompareColumns(adspendops.QUEUE_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, ${recordValues(adspendops.QUEUE_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_array_elements(kv.value::json) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = 'adspend:pending'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'adspend:pending'");
+      // Every reader treats no queue and an empty one alike; the table reads [].
+      return compareLists([(r ? decodeValue(r.value) : null) || []], [await adspendops.getQueue()]);
+    }
+  },
+
+  'ad-spend-weeks': {
+    ddl: [
+      `CREATE TABLE ad_spend_weeks (
+        year     text    NOT NULL,
+        position integer NOT NULL,
+        ${adspendops.WEEK_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields   text[]  NOT NULL,
+        extra    json,
+        PRIMARY KEY (year, position)
+      )`,
+      'CREATE INDEX ad_spend_weeks_week_idx ON ad_spend_weeks (week, campaign)'
+    ],
+    columns: `year, position, ${recordColumns(adspendops.WEEK_SPEC)}`,
+    compareColumns: `year, position, ${recordCompareColumns(adspendops.WEEK_SPEC)}`,
+    kvRows: `SELECT split_part(kv.key, ':', 3) AS year, (e.ord - 1)::int AS position,
+        ${recordValues(adspendops.WEEK_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_array_elements(kv.value::json->'rows') WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key ~ '^adspend:weeks:[0-9]{4}$'`,
+    async apiCheck(sql, decodeValue) {
+      const recs = await sql.query("SELECT key, value FROM kv WHERE key ~ '^adspend:weeks:[0-9]{4}$' ORDER BY key");
+      const fromKv = [], fromApi = [];
+      for (const r of recs) {
+        fromKv.push(...(decodeValue(r.value).rows || []));
+        const rows = await sql.query(`SELECT ${recordColumns(adspendops.WEEK_SPEC)} FROM ad_spend_weeks WHERE year = $1 ORDER BY position`, [r.key.split(':')[2]]);
+        fromApi.push(...rows.map(x => toRecord(x, adspendops.WEEK_SPEC)));
+      }
+      return compareLists(fromKv, fromApi);
+    }
+  },
+
+  // When each year's rollup was written. Its check reads the years back whole.
+  'ad-spend-week-years': {
+    ddl: [`CREATE TABLE ad_spend_week_years (year text PRIMARY KEY, updated_at text)`],
+    columns: 'year, updated_at',
+    kvRows: `SELECT split_part(kv.key, ':', 3) AS year, kv.value::json->>'updatedAt' AS updated_at
+      FROM kv WHERE kv.key ~ '^adspend:weeks:[0-9]{4}$'`,
+    async apiCheck(sql, decodeValue) {
+      const recs = await sql.query("SELECT key, value FROM kv WHERE key ~ '^adspend:weeks:[0-9]{4}$' ORDER BY key");
+      const actual = [];
+      for (const r of recs) actual.push(await adspendops.getWeekYear(r.key.split(':')[2]));
+      return compareLists(recs.map(r => decodeValue(r.value)), actual);
     }
   }
 };
