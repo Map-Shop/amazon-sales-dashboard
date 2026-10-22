@@ -1,6 +1,19 @@
 import { kv } from '../lib/kv.js';
 import * as ordersSql from '../lib/orders.js';
 import * as productsSql from '../lib/products.js';
+import * as adspendSql from '../lib/adspend.js';
+
+// An ad type's month as { rows } (null when kv has no record), and its
+// replacement — the ad_spend_rows table when SQL_TABLES includes
+// "adspend", otherwise the adspend:<type>:raw:YYYY-MM kv record.
+async function readAdMonth(type, month) {
+  if (adspendSql.adspendInSql()) return { rows: await adspendSql.getMonth(type, month) };
+  return kv.get(`adspend:${type}:raw:${month}`);
+}
+async function writeAdMonth(type, month, rows) {
+  if (adspendSql.adspendInSql()) return adspendSql.replaceMonth(type, month, rows);
+  return kv.set(`adspend:${type}:raw:${month}`, { rows });
+}
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
@@ -273,7 +286,7 @@ async function handleGet(req, res) {
     if (!/^\d{4}-\d{2}$/.test(month))  return res.status(400).json({ error: 'month=YYYY-MM required' });
 
     const [stored, lastSynced] = await Promise.all([
-      kv.get(`adspend:${type}:raw:${month}`),
+      readAdMonth(type, month),
       kv.get(`adspend:last-synced:${month}`)
     ]);
     return res.status(200).json({
@@ -299,7 +312,7 @@ async function handleGetRange(req, res) {
 
     const index = (await kv.get(`adspend:${type}:index`)) || [];
     const months = index.filter(m => m >= startMonth && m <= endMonth);
-    const buckets = await Promise.all(months.map(m => kv.get(`adspend:${type}:raw:${m}`)));
+    const buckets = await Promise.all(months.map(m => readAdMonth(type, m)));
     const rows = [];
     for (const b of buckets) {
       if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
@@ -339,7 +352,7 @@ async function handleGetMonths(req, res) {
       if (months.length === 0) return;
       const latestMonth = months[months.length - 1];
       if (map[latestMonth]) return;
-      const stored = await kv.get(`adspend:${type}:raw:${latestMonth}`);
+      const stored = await readAdMonth(type, latestMonth);
       const rows = (stored && Array.isArray(stored.rows)) ? stored.rows : [];
       let monthLatest = null;
       for (const r of rows) {
@@ -434,14 +447,14 @@ async function handleMigrateFromSheets(req, res) {
       let writtenRows = 0;
       const skippedMonths = [];
       for (const [month, rows] of Object.entries(byMonth)) {
-        const existing = await kv.get(`adspend:${type}:raw:${month}`);
+        const existing = await readAdMonth(type, month);
         const existingRows = (existing && Array.isArray(existing.rows)) ? existing.rows : [];
         const apiRowsPresent = existingRows.some(r => r && r.sku);
         if (apiRowsPresent) {
           skippedMonths.push(month);
           continue;
         }
-        await kv.set(`adspend:${type}:raw:${month}`, { rows: dedupeRows(rows) });
+        await writeAdMonth(type, month, dedupeRows(rows));
         writtenRows += rows.length;
         if (!index.includes(month)) index.push(month);
       }
@@ -531,14 +544,14 @@ async function handleUploadYearlyCsv(req, res) {
     const writtenMonths = [];
     const skippedMonths = [];
     for (const [month, rows] of Object.entries(byMonth)) {
-      const existing = await kv.get(`adspend:${type}:raw:${month}`);
+      const existing = await readAdMonth(type, month);
       const existingRows = (existing && Array.isArray(existing.rows)) ? existing.rows : [];
       const apiRowsPresent = existingRows.some(rw => rw && rw.sku);
       if (apiRowsPresent) {
         skippedMonths.push(month);
         continue;
       }
-      await kv.set(`adspend:${type}:raw:${month}`, { rows: dedupeRows(rows) });
+      await writeAdMonth(type, month, dedupeRows(rows));
       writtenRows += rows.length;
       writtenMonths.push(month);
       if (!index.includes(month)) index.push(month);
@@ -590,7 +603,7 @@ async function handleDeleteSheetsRows(req, res) {
     if (!['sp', 'sb'].includes(type)) return res.status(400).json({ error: 'type must be sp or sb' });
     if (!/^\d{4}-\d{2}$/.test(month || '')) return res.status(400).json({ error: 'month=YYYY-MM required' });
 
-    const stored = await kv.get(`adspend:${type}:raw:${month}`);
+    const stored = await readAdMonth(type, month);
     const rows = (stored && Array.isArray(stored.rows)) ? stored.rows : [];
     const before = rows.length;
     const beforeCost = rows.reduce((s, r) => s + (Number(r?.cost) || 0), 0);
@@ -599,7 +612,7 @@ async function handleDeleteSheetsRows(req, res) {
     const dropped = before - kept.length;
     const keptCost = kept.reduce((s, r) => s + (Number(r.cost) || 0), 0);
 
-    await kv.set(`adspend:${type}:raw:${month}`, { rows: kept });
+    await writeAdMonth(type, month, kept);
 
     return res.status(200).json({
       success: true,
@@ -641,7 +654,7 @@ async function handleDedupeSheetsVsApi(req, res) {
 
     const results = [];
     for (const m of monthsToCheck) {
-      const stored = await kv.get(`adspend:${type}:raw:${m}`);
+      const stored = await readAdMonth(type, m);
       const rows = (stored && Array.isArray(stored.rows)) ? stored.rows : [];
       if (rows.length === 0) { results.push({ month: m, action: 'no-data' }); continue; }
 
@@ -652,7 +665,7 @@ async function handleDedupeSheetsVsApi(req, res) {
       const dropped = rows.length - kept.length;
       if (dropped === 0) { results.push({ month: m, action: 'already-clean', rows: rows.length }); continue; }
 
-      await kv.set(`adspend:${type}:raw:${m}`, { rows: kept });
+      await writeAdMonth(type, m, kept);
       results.push({ month: m, action: 'deduped', kept: kept.length, dropped });
     }
 
@@ -778,7 +791,7 @@ async function storeMonthly(type, month, rows) {
   // month. Merging would stack Sheets-migrated campaign-level rows on top
   // of API-delivered SKU-level rows and double-count totals. Re-pulling
   // the same month is expected to overwrite cleanly.
-  await kv.set(`adspend:${type}:raw:${month}`, { rows });
+  await writeAdMonth(type, month, rows);
 
   const index = (await kv.get(`adspend:${type}:index`)) || [];
   if (!index.includes(month)) {
@@ -4923,7 +4936,7 @@ async function handleWeeksRebuild(req, res) {
     };
 
     for (const month of months) {
-      const bucket = await kv.get(`adspend:sp:raw:${month}`);
+      const bucket = await readAdMonth('sp', month);
       const monthRows = ((bucket && bucket.rows) || []);
       // A month written before the API sync took over carries spend and nothing
       // else. Binning it would invent a week of zero clicks and zero orders,

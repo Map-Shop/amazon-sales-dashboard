@@ -6,7 +6,7 @@
 //   node tools/to-sql.mjs <table|all> --fill
 //   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
 // Tables: orders, shipping, sessions, pricechanges, changelog, products,
-// mappings. Default target is the dev database.
+// mappings, adspend. Default target is the dev database.
 //
 // Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
 // DATABASE_URL (an owner role). Nothing here prints a credential.
@@ -204,6 +204,52 @@ const TABLES = {
     }
   },
 
+  adspend: {
+    ddl: [
+      `CREATE TABLE ad_spend_rows (
+        ad_type     text        NOT NULL,
+        month       text        NOT NULL,
+        position    integer     NOT NULL,
+        date        date,
+        campaign    text,
+        ad_group    text,
+        sku         text,
+        asin        text,
+        campaign_id json,
+        cost        numeric,
+        impressions numeric,
+        clicks      numeric,
+        purchases7d numeric,
+        sales7d     numeric,
+        updated_at  timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (ad_type, month, position)
+      )`,
+      'CREATE INDEX ad_spend_rows_date_idx ON ad_spend_rows (ad_type, date)',
+      'CREATE INDEX ad_spend_rows_sku_idx ON ad_spend_rows (sku)'
+    ],
+    columns: 'ad_type, month, position, date, campaign, ad_group, sku, asin, campaign_id, cost, impressions, clicks, purchases7d, sales7d',
+    compareColumns: 'ad_type, month, position, date, campaign, ad_group, sku, asin, campaign_id::text AS campaign_id, cost, impressions, clicks, purchases7d, sales7d',
+    kvRows: `SELECT split_part(kv.key, ':', 2) AS ad_type, split_part(kv.key, ':', 4) AS month,
+        (e.ord - 1)::int AS position, (e.v->>'date')::date AS date, e.v->>'campaign' AS campaign,
+        e.v->>'adGroup' AS ad_group, e.v->>'sku' AS sku, e.v->>'asin' AS asin,
+        (e.v->'campaignId')::text::json AS campaign_id, (e.v->>'cost')::numeric AS cost,
+        (e.v->>'impressions')::numeric AS impressions, (e.v->>'clicks')::numeric AS clicks,
+        (e.v->>'purchases7d')::numeric AS purchases7d, (e.v->>'sales7d')::numeric AS sales7d
+      FROM kv, jsonb_array_elements(kv.value::jsonb->'rows') WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key ~ '^adspend:(sp|sb):raw:[0-9]{4}-[0-9]{2}$'`,
+    async apiCheck(sql, decodeValue) {
+      const { getMonth } = await lib('adspend.js');
+      const buckets = await sql.query("SELECT key, value FROM kv WHERE key ~ '^adspend:(sp|sb):raw:[0-9]{4}-[0-9]{2}$' ORDER BY key");
+      const fromKv = [], fromApi = [];
+      for (const b of buckets) {
+        const [, type, , month] = b.key.split(':');
+        fromKv.push(...(decodeValue(b.value)?.rows || []));
+        fromApi.push(...await getMonth(type, month));
+      }
+      return compareLists(fromKv, fromApi);
+    }
+  },
+
   changelog: entryLog('changelog', 'changelog:entries', 'listing_changes', [
     ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
     ['productName', 'product_name', 'text'], ['asin', 'asin', 'text'],
@@ -235,11 +281,12 @@ function entryLog(name, kvKey, table, columns) {
   };
 }
 
+// Equal values AND equal field order (JSON text), item by item.
 function compareLists(expected, actual) {
   let diffs = 0;
   const samples = [];
   for (let i = 0; i < Math.max(expected.length, actual.length); i++) {
-    if (!isDeepStrictEqual(expected[i], actual[i])) {
+    if (!isDeepStrictEqual(expected[i], actual[i]) || JSON.stringify(expected[i]) !== JSON.stringify(actual[i])) {
       diffs++;
       if (samples.length < 3) samples.push(`${JSON.stringify(expected[i])} | ${JSON.stringify(actual[i])}`);
     }
