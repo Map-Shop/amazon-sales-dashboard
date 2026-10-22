@@ -1,5 +1,30 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
+import * as txSql from '../lib/transactions.js';
+
+// A month's uploaded 2024 rows as { rows } (null when kv has no record), and
+// their replacement — imported_transaction_rows when SQL_TABLES includes
+// "transactions", otherwise the transactions:v2024:imported:YYYY-MM record.
+async function readImportedMonth(month) {
+  if (txSql.transactionsInSql()) return { rows: await txSql.getImportedMonth(month) };
+  return kv.get(`transactions:v2024:imported:${month}`);
+}
+async function writeImportedMonth(month, rows) {
+  if (txSql.transactionsInSql()) return txSql.replaceImportedMonth(month, rows);
+  return kv.set(`transactions:v2024:imported:${month}`, { rows });
+}
+
+// Whether a month holds API transactions — the upload refuses to overwrite
+// those. In kv a synced month counts even with zero transactions (its
+// metadata says chunkCount 1); transaction_months records the same.
+async function rawMonthHasData(month) {
+  if (txSql.transactionsInSql()) return txSql.rawMonthHasData(month);
+  const raw = await kv.get(`transactions:v2024:raw:${month}`);
+  return Boolean(raw && (
+    Array.isArray(raw.transactions) && raw.transactions.length > 0 ||
+    Number.isFinite(raw.chunkCount) && raw.chunkCount > 0
+  ));
+}
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 //   GET  ?action=sync            [&month=YYYY-MM]            — pull SP-API → KV (v0 listFinancialEvents)
@@ -140,33 +165,7 @@ async function handleSyncV2024(req, res) {
     const { start, end } = monthBounds(month);
     const { transactions, pageCount } = await fetchListTransactions(start, end);
 
-    // Chunk to stay under Upstash's 10 MB per-request limit. Each chunk
-    // serializes to roughly the target size; if a single transaction
-    // somehow exceeds the target the chunk holds just that one record.
-    const chunks = chunkTransactions(transactions, V2024_CHUNK_TARGET_BYTES);
-
-    // Wipe stale chunks from a previous sync that produced more chunks
-    // than this one (otherwise old tail chunks would linger and double-
-    // count on read). We don't know the previous chunkCount cheaply so
-    // we delete the standard range we'd ever have written.
-    const prevMeta = await kv.get(`transactions:v2024:raw:${month}`);
-    const prevChunkCount = (prevMeta && Number.isFinite(prevMeta.chunkCount))
-      ? prevMeta.chunkCount : 0;
-    const wipeUpTo = Math.max(prevChunkCount, chunks.length);
-    for (let k = chunks.length; k < wipeUpTo; k++) {
-      await kv.del(`transactions:v2024:raw:${month}:p${k}`);
-    }
-
-    // Write chunks first, then the metadata pointer last — so a partial
-    // failure leaves the prior month's data intact rather than half-
-    // overwriting it.
-    for (let k = 0; k < chunks.length; k++) {
-      await kv.set(`transactions:v2024:raw:${month}:p${k}`, { transactions: chunks[k] });
-    }
-    await kv.set(`transactions:v2024:raw:${month}`, {
-      chunkCount: chunks.length,
-      totalCount: transactions.length
-    });
+    const chunks = await storeRawMonthV2024(month, transactions);
 
     const index = (await kv.get('transactions:v2024:index')) || [];
     const updatedIndex = [...new Set([...index, month])].sort();
@@ -202,6 +201,46 @@ async function handleSyncV2024(req, res) {
   }
 }
 
+// Stores a synced month's transactions and returns its chunks (the sync's
+// response reports chunkCount, so they're computed in both modes). With
+// SQL_TABLES including "transactions" the month goes to the
+// amazon_transactions table whole; otherwise to chunked kv records.
+async function storeRawMonthV2024(month, transactions) {
+  // Chunk to stay under Upstash's 10 MB per-request limit. Each chunk
+  // serializes to roughly the target size; if a single transaction
+  // somehow exceeds the target the chunk holds just that one record.
+  const chunks = chunkTransactions(transactions, V2024_CHUNK_TARGET_BYTES);
+
+  if (txSql.transactionsInSql()) {
+    await txSql.replaceRawMonth(month, transactions);
+    return chunks;
+  }
+
+  // Wipe stale chunks from a previous sync that produced more chunks
+  // than this one (otherwise old tail chunks would linger and double-
+  // count on read). We don't know the previous chunkCount cheaply so
+  // we delete the standard range we'd ever have written.
+  const prevMeta = await kv.get(`transactions:v2024:raw:${month}`);
+  const prevChunkCount = (prevMeta && Number.isFinite(prevMeta.chunkCount))
+    ? prevMeta.chunkCount : 0;
+  const wipeUpTo = Math.max(prevChunkCount, chunks.length);
+  for (let k = chunks.length; k < wipeUpTo; k++) {
+    await kv.del(`transactions:v2024:raw:${month}:p${k}`);
+  }
+
+  // Write chunks first, then the metadata pointer last — so a partial
+  // failure leaves the prior month's data intact rather than half-
+  // overwriting it.
+  for (let k = 0; k < chunks.length; k++) {
+    await kv.set(`transactions:v2024:raw:${month}:p${k}`, { transactions: chunks[k] });
+  }
+  await kv.set(`transactions:v2024:raw:${month}`, {
+    chunkCount: chunks.length,
+    totalCount: transactions.length
+  });
+  return chunks;
+}
+
 // Target serialized size per chunk. Upstash caps single requests at
 // 10 MiB (10,485,760 bytes); 8 MiB leaves room for JSON wrapper bytes,
 // transport encoding, and the small metadata fields the @vercel/kv client
@@ -235,6 +274,7 @@ function chunkTransactions(transactions, targetBytes) {
 // both the chunked layout (current) and the legacy single-blob layout
 // (months synced before chunking).
 async function readMonthV2024(month) {
+  if (txSql.transactionsInSql()) return txSql.getRawMonth(month);
   const meta = await kv.get(`transactions:v2024:raw:${month}`);
   if (!meta) return [];
   if (Array.isArray(meta.transactions)) return meta.transactions; // legacy
@@ -309,7 +349,7 @@ async function handleGetRangeV2024(req, res) {
     // hits two keys at most, so the join here is fast.
     const [monthArrays, importedBuckets] = await Promise.all([
       Promise.all(months.map(m => readMonthV2024(m))),
-      Promise.all(months.map(m => kv.get(`transactions:v2024:imported:${m}`)))
+      Promise.all(months.map(m => readImportedMonth(m)))
     ]);
 
     // Flatten: all months' transactions concatenated. Dedup happens later
@@ -879,12 +919,7 @@ async function handleUploadYearlyCsv(req, res) {
     // explicitly clearing the raw key if they really want to replace it.
     const collisions = [];
     for (const m of writtenMonths) {
-      const raw = await kv.get(`transactions:v2024:raw:${m}`);
-      const hasRaw = raw && (
-        Array.isArray(raw.transactions) && raw.transactions.length > 0 ||
-        Number.isFinite(raw.chunkCount) && raw.chunkCount > 0
-      );
-      if (hasRaw) collisions.push(m);
+      if (await rawMonthHasData(m)) collisions.push(m);
     }
     if (collisions.length > 0) {
       return res.status(409).json({
@@ -898,7 +933,7 @@ async function handleUploadYearlyCsv(req, res) {
     // as handleSyncV2024 so a partial failure doesn't corrupt the index.
     let totalRows = 0;
     for (const m of writtenMonths) {
-      await kv.set(`transactions:v2024:imported:${m}`, { rows: byMonth[m] });
+      await writeImportedMonth(m, byMonth[m]);
       totalRows += byMonth[m].length;
     }
     const existingIndex = (await kv.get('transactions:v2024:imported-index')) || [];

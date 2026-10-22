@@ -6,7 +6,8 @@
 //   node tools/to-sql.mjs <table|all> --fill
 //   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
 // Tables: orders, shipping, sessions, pricechanges, changelog, products,
-// mappings, adspend. Default target is the dev database.
+// mappings, adspend, transactions (three tables, filled together). Default
+// target is the dev database.
 //
 // Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
 // DATABASE_URL (an owner role). Nothing here prints a credential.
@@ -29,6 +30,30 @@ import { neon } from '@neondatabase/serverless';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const lib = (name) => import(pathToFileURL(path.join(ROOT, 'lib', name)).href);
+const { rawExtracted, RAW_EXTRACTED_COLUMNS } = await lib('transactions.js');
+
+// A data set stored in more than one table fills and verifies them together.
+const GROUPS = { transactions: ['transactions-raw', 'transactions-months', 'transactions-imported'] };
+
+// readMonthV2024's kv reassembly, in SQL: a month record holding its own
+// transactions array is used as-is; otherwise its parts p0..p(chunkCount-1)
+// in order.
+const RAW_MONTH_PARTS = `
+  WITH base AS (
+    SELECT split_part(key, ':', 4) AS month, value::json AS v
+    FROM kv WHERE key ~ '^transactions:v2024:raw:[0-9]{4}-[0-9]{2}$'
+  ), parts AS (
+    SELECT month, 0 AS part, v->'transactions' AS arr
+    FROM base WHERE json_typeof(v->'transactions') = 'array'
+    UNION ALL
+    SELECT b.month, split_part(k.key, ':p', 2)::int, k.value::json->'transactions'
+    FROM base b JOIN kv k ON k.key LIKE 'transactions:v2024:raw:' || b.month || ':p%'
+    WHERE json_typeof(b.v->'transactions') IS DISTINCT FROM 'array'
+      AND json_typeof(b.v->'chunkCount') = 'number'
+      AND split_part(k.key, ':p', 2)::int < (b.v->>'chunkCount')::int
+  )
+  SELECT p.month, p.part, e.d, e.ord
+  FROM parts p, json_array_elements(p.arr) WITH ORDINALITY AS e(d, ord)`;
 
 const TABLES = {
   orders: {
@@ -250,6 +275,142 @@ const TABLES = {
     }
   },
 
+  'transactions-raw': {
+    ddl: [
+      `CREATE TABLE amazon_transactions (
+        month              text        NOT NULL,
+        position           integer     NOT NULL,
+        data               json        NOT NULL,
+        posted_date        text,
+        transaction_type   text,
+        transaction_status text,
+        order_id           text,
+        shipment_id        text,
+        refund_id          text,
+        updated_at         timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (month, position)
+      )`,
+      'CREATE INDEX amazon_transactions_posted_idx ON amazon_transactions (posted_date)',
+      'CREATE INDEX amazon_transactions_order_idx ON amazon_transactions (order_id)',
+      'CREATE INDEX amazon_transactions_shipment_idx ON amazon_transactions (shipment_id)'
+    ],
+    columns: `month, position, data, ${RAW_EXTRACTED_COLUMNS}`,
+    // Each record compared by the MD5 of its exact JSON text.
+    compareColumns: `month, position, md5(data::text) AS data_md5, ${RAW_EXTRACTED_COLUMNS}`,
+    kvRows: `SELECT month, (row_number() OVER (PARTITION BY month ORDER BY part, ord) - 1)::int AS position,
+        d AS data, ${rawExtracted('d').map(([col, expr]) => `${expr} AS ${col}`).join(', ')}
+      FROM (${RAW_MONTH_PARTS}) elems`,
+    // Month by month: kv reassembly (as readMonthV2024 does it) vs the table.
+    async apiCheck(sql, decodeValue) {
+      const { getRawMonth } = await lib('transactions.js');
+      // One month per query: all months at once exceeds Neon's 64 MB response cap.
+      const keys = await sql.query("SELECT key FROM kv WHERE key ~ '^transactions:v2024:raw:[0-9]{4}-[0-9]{2}$' ORDER BY key");
+      let result = { expected: 0, actual: 0, diffs: 0, samples: [] };
+      for (const { key } of keys) {
+        const [b] = await sql.query('SELECT key, value FROM kv WHERE key = $1', [key]);
+        const month = b.key.split(':')[3];
+        const meta = decodeValue(b.value);
+        let fromKv;
+        if (Array.isArray(meta?.transactions)) fromKv = meta.transactions;
+        else {
+          fromKv = [];
+          for (let k = 0; k < (meta?.chunkCount || 0); k++) {
+            const [part] = await sql.query('SELECT value FROM kv WHERE key = $1', [`${b.key}:p${k}`]);
+            fromKv.push(...((part && decodeValue(part.value)?.transactions) || []));
+          }
+        }
+        const r = compareLists(fromKv, await getRawMonth(month));
+        result = { expected: result.expected + r.expected, actual: result.actual + r.actual,
+          diffs: result.diffs + r.diffs, samples: [...result.samples, ...r.samples].slice(0, 3) };
+      }
+      return result;
+    }
+  },
+
+  'transactions-months': {
+    ddl: [
+      `CREATE TABLE transaction_months (
+        month             text        PRIMARY KEY,
+        has_raw           boolean     NOT NULL,
+        transaction_count integer     NOT NULL,
+        updated_at        timestamptz NOT NULL DEFAULT now()
+      )`
+    ],
+    columns: 'month, has_raw, transaction_count',
+    // The upload's hasRaw rule: a non-empty transactions array, or chunkCount > 0.
+    kvRows: `SELECT split_part(key, ':', 4) AS month,
+        CASE WHEN json_typeof(v->'transactions') = 'array' THEN json_array_length(v->'transactions') > 0
+             ELSE COALESCE(json_typeof(v->'chunkCount') = 'number' AND (v->>'chunkCount')::numeric > 0, false) END AS has_raw,
+        CASE WHEN json_typeof(v->'transactions') = 'array' THEN json_array_length(v->'transactions')
+             ELSE COALESCE((v->>'totalCount')::int, 0) END AS transaction_count
+      FROM (SELECT key, value::json AS v FROM kv WHERE key ~ '^transactions:v2024:raw:[0-9]{4}-[0-9]{2}$') b`,
+    async apiCheck(sql, decodeValue) {
+      const { rawMonthHasData } = await lib('transactions.js');
+      const keys = await sql.query("SELECT key FROM kv WHERE key ~ '^transactions:v2024:raw:[0-9]{4}-[0-9]{2}$' ORDER BY key");
+      const fromKv = [], fromApi = [];
+      for (const { key } of keys) {
+        const [b] = await sql.query('SELECT key, value FROM kv WHERE key = $1', [key]);
+        const month = b.key.split(':')[3];
+        const raw = decodeValue(b.value);
+        fromKv.push([month, Boolean(raw && (Array.isArray(raw.transactions) && raw.transactions.length > 0 ||
+          Number.isFinite(raw.chunkCount) && raw.chunkCount > 0))]);
+        fromApi.push([month, await rawMonthHasData(month)]);
+      }
+      return compareLists(fromKv, fromApi);
+    }
+  },
+
+  'transactions-imported': {
+    ddl: [
+      `CREATE TABLE imported_transaction_rows (
+        month              text        NOT NULL,
+        position           integer     NOT NULL,
+        type               text,
+        order_id           text,
+        date               date,
+        sku                text,
+        qty                numeric,
+        fulfillment        text,
+        sale               numeric,
+        other_charges      numeric,
+        fba_fees           numeric,
+        transaction_fees   numeric,
+        promotions         numeric,
+        fee_type           text,
+        fee_amount         numeric,
+        adjustment_type    text,
+        adjustment_amount  numeric,
+        src                text,
+        transaction_id     text,
+        transaction_status text,
+        updated_at         timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (month, position)
+      )`,
+      'CREATE INDEX imported_transaction_rows_date_idx ON imported_transaction_rows (date)'
+    ],
+    columns: 'month, position, type, order_id, date, sku, qty, fulfillment, sale, other_charges, fba_fees, transaction_fees, promotions, fee_type, fee_amount, adjustment_type, adjustment_amount, src, transaction_id, transaction_status',
+    kvRows: `SELECT split_part(kv.key, ':', 4) AS month, (e.ord - 1)::int AS position,
+        e.v->>'type' AS type, e.v->>'orderId' AS order_id, (e.v->>'date')::date AS date, e.v->>'sku' AS sku,
+        (e.v->>'qty')::numeric AS qty, e.v->>'fulfillment' AS fulfillment, (e.v->>'sale')::numeric AS sale,
+        (e.v->>'otherCharges')::numeric AS other_charges, (e.v->>'fbaFees')::numeric AS fba_fees,
+        (e.v->>'transactionFees')::numeric AS transaction_fees, (e.v->>'promotions')::numeric AS promotions,
+        e.v->>'feeType' AS fee_type, (e.v->>'feeAmount')::numeric AS fee_amount,
+        e.v->>'adjustmentType' AS adjustment_type, (e.v->>'adjustmentAmount')::numeric AS adjustment_amount,
+        e.v->>'_src' AS src, e.v->>'_transactionId' AS transaction_id, e.v->>'_transactionStatus' AS transaction_status
+      FROM kv, jsonb_array_elements(kv.value::jsonb->'rows') WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key ~ '^transactions:v2024:imported:[0-9]{4}-[0-9]{2}$'`,
+    async apiCheck(sql, decodeValue) {
+      const { getImportedMonth } = await lib('transactions.js');
+      const buckets = await sql.query("SELECT key, value FROM kv WHERE key ~ '^transactions:v2024:imported:[0-9]{4}-[0-9]{2}$' ORDER BY key");
+      const fromKv = [], fromApi = [];
+      for (const b of buckets) {
+        fromKv.push(...(decodeValue(b.value)?.rows || []));
+        fromApi.push(...await getImportedMonth(b.key.split(':')[3]));
+      }
+      return compareLists(fromKv, fromApi);
+    }
+  },
+
   changelog: entryLog('changelog', 'changelog:entries', 'listing_changes', [
     ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
     ['productName', 'product_name', 'text'], ['asin', 'asin', 'text'],
@@ -307,7 +468,7 @@ const which = args[0];
 const fill = args.includes('--fill');
 const target = args.includes('--target') ? args[args.indexOf('--target') + 1] : 'dev';
 const envName = { dev: 'DATABASE_URL_DEV', prod: 'DATABASE_URL' }[target];
-const names = which === 'all' ? Object.keys(TABLES) : [which];
+const names = which === 'all' ? Object.keys(TABLES) : (GROUPS[which] || [which]);
 if (!names.every(n => TABLES[n]) || !envName || !(fill || args.includes('--verify'))) {
   console.error(`Usage: node tools/to-sql.mjs <${Object.keys(TABLES).join('|')}|all> --verify | --fill [--target dev|prod]`);
   process.exit(1);
