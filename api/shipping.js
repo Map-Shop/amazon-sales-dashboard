@@ -1,5 +1,6 @@
 import { kv } from '../lib/kv.js';
 import * as shippingSql from '../lib/shipping.js';
+import * as stamps from '../lib/stamps.js';
 
 // A month's rows as { rows } (null when kv has no record), and its
 // replacement — from the shipping_costs table when SQL_TABLES includes
@@ -13,10 +14,26 @@ async function writeMonth(month, rows) {
   return kv.set(`shipping:raw:${month}`, { rows });
 }
 
+// The month list and each month's last sync time, from tables when
+// SQL_TABLES includes "stamps" (lib/stamps.js), otherwise from the
+// shipping:index and shipping:last-synced:YYYY-MM kv records.
+function _shippingIndexRead() {
+  return stamps.stampsInSql() ? stamps.getShippingIndex() : kv.get('shipping:index');
+}
+function _shippingIndexWrite(months) {
+  return stamps.stampsInSql() ? stamps.replaceShippingIndex(months) : kv.set('shipping:index', months);
+}
+function _shippingSyncedRead(month) {
+  return stamps.stampsInSql() ? stamps.getMonthSync('shipping', month) : kv.get(`shipping:last-synced:${month}`);
+}
+function _shippingSyncedWrite(month, at) {
+  return stamps.stampsInSql() ? stamps.setMonthSync('shipping', month, at) : kv.set(`shipping:last-synced:${month}`, at);
+}
+
 // The synced months in [startMonth, endMonth] and their rows, as get-range
 // returns them. Also used by the profitability statement (api/transactions.js).
 export async function readShippingRange(startMonth, endMonth) {
-  const index = (await kv.get('shipping:index')) || [];
+  const index = (await _shippingIndexRead()) || [];
   const months = index.filter(m => m >= startMonth && m <= endMonth);
   const rows = [];
   if (shippingSql.shippingInSql()) {
@@ -113,13 +130,13 @@ async function handleSync(req, res) {
     const rows = normalizeShipments(shipments);
 
     await writeMonth(month, rows);
-    const index = (await kv.get('shipping:index')) || [];
+    const index = (await _shippingIndexRead()) || [];
     if (!index.includes(month)) {
       index.push(month);
       index.sort();
-      await kv.set('shipping:index', index);
+      await _shippingIndexWrite(index);
     }
-    await kv.set(`shipping:last-synced:${month}`, new Date().toISOString());
+    await _shippingSyncedWrite(month, new Date().toISOString());
 
     console.log(`[SHIPPING SYNC] ${month}: shipments=${shipments.length} rows=${rows.length}`);
     return res.status(200).json({
@@ -147,7 +164,7 @@ async function handleGet(req, res) {
 
     const [stored, lastSynced] = await Promise.all([
       readMonth(month),
-      kv.get(`shipping:last-synced:${month}`)
+      _shippingSyncedRead(month)
     ]);
     return res.status(200).json({
       success: true,
@@ -179,7 +196,7 @@ async function handleGetMonths(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    const index = (await kv.get('shipping:index')) || [];
+    const index = (await _shippingIndexRead()) || [];
     return res.status(200).json({ success: true, months: index });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });
@@ -231,7 +248,7 @@ async function handleMigrateFromSheets(req, res) {
     }
 
     // Same "skip if API data present" rule as ad spend. API rows have sku.
-    const index = (await kv.get('shipping:index')) || [];
+    const index = (await _shippingIndexRead()) || [];
     let writtenRows = 0;
     const skippedMonths = [];
     for (const [month, rows] of Object.entries(byMonth)) {
@@ -246,7 +263,7 @@ async function handleMigrateFromSheets(req, res) {
       if (!index.includes(month)) index.push(month);
     }
     index.sort();
-    await kv.set('shipping:index', index);
+    await _shippingIndexWrite(index);
 
     return res.status(200).json({
       success: true,
@@ -330,7 +347,7 @@ async function handleUploadYearlyCsv(req, res) {
 
     // Same "skip month if API rows present" rule as migrate-from-sheets.
     // API rows have a non-empty sku; CSV-uploaded rows leave it blank.
-    const index = (await kv.get('shipping:index')) || [];
+    const index = (await _shippingIndexRead()) || [];
     let writtenRows = 0;
     const writtenMonths = [];
     const skippedMonths = [];
@@ -347,7 +364,7 @@ async function handleUploadYearlyCsv(req, res) {
       if (!index.includes(month)) index.push(month);
     }
     index.sort();
-    await kv.set('shipping:index', index);
+    await _shippingIndexWrite(index);
 
     return res.status(200).json({
       success: true,

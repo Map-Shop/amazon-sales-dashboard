@@ -1,5 +1,6 @@
 import { kv } from '../lib/kv.js';
 import * as productsSql from '../lib/products.js';
+import * as stamps from '../lib/stamps.js';
 
 // The catalog and its replacement — the products table when SQL_TABLES
 // includes "products", otherwise the `products` kv record. The
@@ -12,6 +13,14 @@ export async function readProducts() {
 async function writeProducts(products) {
   if (productsSql.productsInSql()) return productsSql.replaceProducts(products);
   return kv.set('products', products);
+}
+// When the catalog was last written: edit_stamps when SQL_TABLES includes
+// "stamps" (lib/stamps.js), otherwise the products:updated-at kv record.
+function readProductsStamp() {
+  return stamps.stampsInSql() ? stamps.getEditStamp('products') : kv.get('products:updated-at');
+}
+function writeProductsStamp(at) {
+  return stamps.stampsInSql() ? stamps.setEditStamp('products', at) : kv.set('products:updated-at', at);
 }
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
@@ -70,7 +79,7 @@ async function handleGet(req, res) {
 
     const [products, updatedAt] = await Promise.all([
       readProducts(),
-      kv.get('products:updated-at')
+      readProductsStamp()
     ]);
 
     return res.status(200).json({
@@ -87,7 +96,7 @@ async function handleLastUpdated(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    const updatedAt = await kv.get('products:updated-at');
+    const updatedAt = await readProductsStamp();
     return res.status(200).json({ success: true, updatedAt: updatedAt || null });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });
@@ -130,7 +139,7 @@ async function handleBulkUpsert(req, res) {
 
     const merged = Object.values(bySku).sort((a, b) => a.sku.localeCompare(b.sku));
     await writeProducts(merged);
-    await kv.set('products:updated-at', new Date().toISOString());
+    await writeProductsStamp(new Date().toISOString());
 
     return res.status(200).json({
       success: true,
@@ -159,7 +168,7 @@ async function handleReplace(req, res) {
       .sort((a, b) => a.sku.localeCompare(b.sku));
 
     await writeProducts(normalized);
-    await kv.set('products:updated-at', new Date().toISOString());
+    await writeProductsStamp(new Date().toISOString());
 
     return res.status(200).json({ success: true, total: normalized.length });
   } catch (error) {
@@ -223,7 +232,7 @@ async function handleMigrate(req, res) {
 
     products.sort((a, b) => a.sku.localeCompare(b.sku));
     await writeProducts(products);
-    await kv.set('products:updated-at', new Date().toISOString());
+    await writeProductsStamp(new Date().toISOString());
 
     return res.status(200).json({
       success: true,

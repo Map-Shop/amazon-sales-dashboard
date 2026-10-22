@@ -1,6 +1,7 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
 import * as txSql from '../lib/transactions.js';
+import * as stamps from '../lib/stamps.js';
 import * as profit from '../lib/profitability.js';
 // The profitability statement's other inputs, read the way their own
 // endpoints read them. Vercel bundles these modules; they do not add
@@ -56,6 +57,16 @@ async function readMonthIndexes() {
 async function readLatestPostedMap() {
   if (txSql.transactionsInSql()) return txSql.getLatestPostedByMonth();
   return kv.get('transactions:v2024:latest-posted');
+}
+
+// When a month was last synced, from transaction_month_syncs when SQL_TABLES
+// includes "stamps" (lib/stamps.js), otherwise from the
+// transactions:v2024:last-synced:YYYY-MM kv record.
+function txSyncedRead(month) {
+  return stamps.stampsInSql() ? stamps.getMonthSync('transactions', month) : kv.get(`transactions:v2024:last-synced:${month}`);
+}
+function txSyncedWrite(month, at) {
+  return stamps.stampsInSql() ? stamps.setMonthSync('transactions', month, at) : kv.set(`transactions:v2024:last-synced:${month}`, at);
 }
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
@@ -217,7 +228,7 @@ async function handleSyncV2024(req, res) {
       const updatedIndex = [...new Set([...index, month])].sort();
       await kv.set('transactions:v2024:index', updatedIndex);
     }
-    await kv.set(`transactions:v2024:last-synced:${month}`, new Date().toISOString());
+    await txSyncedWrite(month, new Date().toISOString());
 
     // Track the absolute latest postedDate for this month so the
     // overview page can render "Most Recent Transaction Data: 3/31/26"
@@ -353,7 +364,7 @@ async function handleGetV2024(req, res) {
 
     const [transactions, lastSynced] = await Promise.all([
       readMonthV2024(month),
-      kv.get(`transactions:v2024:last-synced:${month}`)
+      txSyncedRead(month)
     ]);
 
     return res.status(200).json({
@@ -465,7 +476,7 @@ async function loadProfitInputs(startDate, endDate) {
   let lastSynced = null;
   try {
     if (latestSyncedMonth) {
-      lastSynced = (await kv.get(`transactions:v2024:last-synced:${latestSyncedMonth}`)) || null;
+      lastSynced = (await txSyncedRead(latestSyncedMonth)) || null;
     }
   } catch { /* non-fatal */ }
 

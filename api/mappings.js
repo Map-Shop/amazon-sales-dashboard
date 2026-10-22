@@ -1,5 +1,6 @@
 import { kv } from '../lib/kv.js';
 import * as mappingsSql from '../lib/mappings.js';
+import * as stamps from '../lib/stamps.js';
 
 // A mapping's lookup object and its replacement — the mapping_entries
 // table when SQL_TABLES includes "mappings", otherwise the mappings:<type>
@@ -12,6 +13,15 @@ export async function readMap(type) {
 async function writeMap(type, map) {
   if (mappingsSql.mappingsInSql()) return mappingsSql.replaceMap(type, map);
   return kv.set(kvKey(type), map);
+}
+// When a mapping was last written: edit_stamps ('mappings:<type>') when
+// SQL_TABLES includes "stamps" (lib/stamps.js), otherwise the
+// mappings:<type>:updated-at kv record.
+function readMapStamp(type) {
+  return stamps.stampsInSql() ? stamps.getEditStamp(kvKey(type)) : kv.get(`${kvKey(type)}:updated-at`);
+}
+function writeMapStamp(type, at) {
+  return stamps.stampsInSql() ? stamps.setEditStamp(kvKey(type), at) : kv.set(`${kvKey(type)}:updated-at`, at);
 }
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
@@ -68,7 +78,7 @@ async function handleGet(req, res, type) {
     if (!auth.ok) return res.status(401).json({ error: auth.error });
     const [mappings, updatedAt] = await Promise.all([
       readMap(type),
-      kv.get(`${kvKey(type)}:updated-at`)
+      readMapStamp(type)
     ]);
     return res.status(200).json({
       success: true,
@@ -85,7 +95,7 @@ async function handleLastUpdated(req, res, type) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    const updatedAt = await kv.get(`${kvKey(type)}:updated-at`);
+    const updatedAt = await readMapStamp(type);
     return res.status(200).json({ success: true, updatedAt: updatedAt || null });
   } catch (error) {
     return res.status(500).json({ error: 'Failed: ' + error.message });
@@ -113,7 +123,7 @@ async function handleSaveOne(req, res, type) {
       if (!line) delete current[feeType];
       else        current[feeType] = line;
       await writeMap(type, current);
-      await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+      await writeMapStamp(type, new Date().toISOString());
       return res.status(200).json({ success: true, total: Object.keys(current).length });
     }
 
@@ -136,7 +146,7 @@ async function handleSaveOne(req, res, type) {
     }
 
     await writeMap(type, current);
-    await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+    await writeMapStamp(type, new Date().toISOString());
     return res.status(200).json({ success: true, total: Object.keys(current).length });
   } catch (error) {
     return res.status(500).json({ error: 'Save failed: ' + error.message });
@@ -156,7 +166,7 @@ async function handleDeleteOne(req, res, type) {
     const existed = Object.prototype.hasOwnProperty.call(current, key);
     delete current[key];
     await writeMap(type, current);
-    await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+    await writeMapStamp(type, new Date().toISOString());
     return res.status(200).json({ success: true, existed, total: Object.keys(current).length });
   } catch (error) {
     return res.status(500).json({ error: 'Delete failed: ' + error.message });
@@ -209,7 +219,7 @@ async function handleBulkUpsert(req, res, type) {
     }
 
     await writeMap(type, current);
-    await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+    await writeMapStamp(type, new Date().toISOString());
     return res.status(200).json({
       success: true,
       addedCount,
@@ -243,7 +253,7 @@ async function handleMigrate(req, res, type) {
     const rows = body.values || [];
     if (rows.length < 2) {
       await writeMap(type, {});
-      await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+      await writeMapStamp(type, new Date().toISOString());
       return res.status(200).json({ success: true, total: 0, message: `${sheetName} was empty` });
     }
 
@@ -276,7 +286,7 @@ async function handleMigrate(req, res, type) {
     }
 
     await writeMap(type, out);
-    await kv.set(`${kvKey(type)}:updated-at`, new Date().toISOString());
+    await writeMapStamp(type, new Date().toISOString());
     return res.status(200).json({
       success: true,
       total: Object.keys(out).length,

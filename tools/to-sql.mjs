@@ -39,6 +39,7 @@ const adcensus = await lib('adcensus.js');
 const adreviews = await lib('adreviews.js');
 const adspendops = await lib('adspendops.js');
 const ordersops = await lib('ordersops.js');
+const stamps = await lib('stamps.js');
 const specColumnDefs = (spec) => spec.map(([, col, type]) => `${col} ${type}`).join(',\n        ');
 
 // The review records and where each lives in the tables.
@@ -57,8 +58,25 @@ const GROUPS = {
   // Rollup rows before the year table, whose check reads both back whole.
   adspendops: ['ad-spend-months', 'ad-spend-month-syncs', 'ad-spend-report-queue',
                'ad-spend-weeks', 'ad-spend-week-years'],
-  ordersops: ['orders-sync-status', 'orders-alerts', 'orders-report-queue', 'orders-report-results']
+  ordersops: ['orders-sync-status', 'orders-alerts', 'orders-report-queue', 'orders-report-results'],
+  stamps: ['shipping-months', 'shipping-month-syncs', 'transaction-month-syncs', 'edit-stamps']
 };
+
+// A set of kv records each holding one bare string (kv keeps a string as its
+// own text), keyed by part of the record's key, as a two-column table.
+function stringRecords({ table, keyCol, valueCol, keyPattern, keyExpr, read, keyOf }) {
+  return {
+    ddl: [`CREATE TABLE ${table} (${keyCol} text PRIMARY KEY, ${valueCol} text)`],
+    columns: `${keyCol}, ${valueCol}`,
+    kvRows: `SELECT ${keyExpr} AS ${keyCol}, kv.value AS ${valueCol} FROM kv WHERE kv.key ~ '${keyPattern}'`,
+    async apiCheck(sql, decodeValue) {
+      const recs = await sql.query(`SELECT key, value FROM kv WHERE key ~ '${keyPattern}' ORDER BY key`);
+      const actual = [];
+      for (const r of recs) actual.push(await read(keyOf(r.key)));
+      return compareLists(recs.map(r => decodeValue(r.value)), actual);
+    }
+  };
+}
 
 // readMonthV2024's kv reassembly, in SQL: a month record holding its own
 // transactions array is used as-is; otherwise its parts p0..p(chunkCount-1)
@@ -885,7 +903,40 @@ const TABLES = {
       const fromApi = await ordersops.getResults();
       return compareLists([...Object.entries(fromKv)], [...Object.entries(fromApi)]);
     }
-  }
+  },
+
+  // ── Remaining bookkeeping (lib/stamps.js) ─────────────────────────────
+  'shipping-months': {
+    ddl: [`CREATE TABLE shipping_months (position integer PRIMARY KEY, month text NOT NULL)`],
+    columns: 'position, month',
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.m AS month
+      FROM kv, json_array_elements_text(kv.value::json) WITH ORDINALITY AS e(m, ord)
+      WHERE kv.key = 'shipping:index'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'shipping:index'");
+      return compareLists([r ? decodeValue(r.value) : null], [await stamps.getShippingIndex()]);
+    }
+  },
+
+  'shipping-month-syncs': stringRecords({
+    table: 'shipping_month_syncs', keyCol: 'month', valueCol: 'synced_at',
+    keyPattern: '^shipping:last-synced:[0-9]{4}-[0-9]{2}$', keyExpr: "split_part(kv.key, ':', 3)",
+    read: (month) => stamps.getMonthSync('shipping', month), keyOf: (key) => key.split(':')[2]
+  }),
+
+  'transaction-month-syncs': stringRecords({
+    table: 'transaction_month_syncs', keyCol: 'month', valueCol: 'synced_at',
+    keyPattern: '^transactions:v2024:last-synced:[0-9]{4}-[0-9]{2}$', keyExpr: "split_part(kv.key, ':', 4)",
+    read: (month) => stamps.getMonthSync('transactions', month), keyOf: (key) => key.split(':')[3]
+  }),
+
+  // 'products' and 'mappings:<type>', from their :updated-at records.
+  'edit-stamps': stringRecords({
+    table: 'edit_stamps', keyCol: 'data_set', valueCol: 'updated_at',
+    keyPattern: '^(products|mappings:(product|brand|fee)):updated-at$',
+    keyExpr: "regexp_replace(kv.key, ':updated-at$', '')",
+    read: (dataSet) => stamps.getEditStamp(dataSet), keyOf: (key) => key.replace(/:updated-at$/, '')
+  })
 };
 
 // A kv record holding { rows: [record] } as a table of exact-shape rows
