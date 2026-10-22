@@ -1,4 +1,5 @@
 import { kv } from '../lib/kv.js';
+import * as adHistory from '../lib/adhistory.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Campaign Overview — Amazon ad campaign and portfolio CONFIGURATION.
@@ -35,6 +36,9 @@ import { kv } from '../lib/kv.js';
 //   adcampaigns:current     → { syncedAt, ptDate, rows: [campaign] }
 //   adcampaigns:portfolios  → { syncedAt, rows: [portfolio] }
 //   adcampaigns:changes     → { rows: [change] }   capped 200, human-facing
+//                             (every record also goes to the uncapped
+//                             campaign_changes table when SQL_TABLES includes
+//                             "adhistory" — see lib/adhistory.js)
 //   adcampaigns:meta        → { lastSyncAt, lastSyncOk, counts, sources,
 //                               pages, coverage, warnings, lastError }
 //   adcampaigns:overrides   → { [campaignId]: { brand, at } }  dashboard-only
@@ -398,6 +402,8 @@ async function handleUpdate(req, res) {
 
     const campaignId = acStr(req.body?.campaignId);
     if (!campaignId) return res.status(400).json({ error: 'campaignId required' });
+    // Which page the edit was made from, for the change history only.
+    const origin = AC_EDIT_ORIGINS.includes(req.body?.origin) ? req.body.origin : null;
 
     const local = (req.body && req.body.local) || {};
     const amazon = (req.body && req.body.amazon) || {};
@@ -532,6 +538,9 @@ async function handleUpdate(req, res) {
     }
 
     if (changeRecords.length) {
+      // History first, so it copies in the log before this append can push
+      // the oldest record past the cap.
+      await acEnsureHistory();
       const stored = await kv.get('adcampaigns:changes');
       writes.push(kv.set('adcampaigns:changes', {
         rows: acAppendChanges((stored && stored.rows) || [], changeRecords)
@@ -539,6 +548,7 @@ async function handleUpdate(req, res) {
     }
 
     await Promise.all(writes);
+    await acRecordHistory(changeRecords, origin);
 
     return res.status(200).json({
       success: true, stage, campaignId, ...result, row: updatedRow
@@ -1081,6 +1091,9 @@ async function acRunSync({ dry = false, force = false } = {}) {
     return result;
   }
 
+  // History first, so it copies in the log before this append can push the
+  // oldest records past the cap.
+  if (changeRecords.length) await acEnsureHistory();
   const changesOut = acAppendChanges(prevChanges?.rows || [], changeRecords);
 
   await Promise.all([
@@ -1093,6 +1106,7 @@ async function acRunSync({ dry = false, force = false } = {}) {
       coverage, warnings, lastError: null
     })
   ]);
+  await acRecordHistory(changeRecords, null);
 
   return result;
 }
@@ -1590,9 +1604,35 @@ function acSame(a, b) {
   return a === b;
 }
 
+// The pages that send edits, as the change history records them.
+const AC_EDIT_ORIGINS = ['weekly', 'biweekly', 'monthly', 'campaigns'];
+
+// The permanent change history (lib/adhistory.js), when SQL_TABLES includes
+// "adhistory". acEnsureHistory runs before the capped log is appended to, so
+// the history copies in every record before any can be evicted;
+// acRecordHistory adds the new records after. Neither ever throws: a history
+// failure is logged and the edit or refresh goes ahead.
+async function acEnsureHistory() {
+  if (!adHistory.historyEnabled()) return;
+  try {
+    await adHistory.ensure(k => kv.get(k));
+  } catch (err) {
+    console.error('[AD HISTORY] setup failed:', err.message);
+  }
+}
+async function acRecordHistory(records, origin) {
+  if (!adHistory.historyEnabled() || !records.length) return;
+  try {
+    await adHistory.ensure(k => kv.get(k));
+    await adHistory.recordChanges(records, origin);
+  } catch (err) {
+    console.error('[AD HISTORY] changes not recorded:', err.message);
+  }
+}
+
 // Capped, dedupe by stable id so a same-day re-run replaces rather than stacks.
 // Eviction here is harmless: this log is human-facing only, never the substrate
-// anything is reconstructed from.
+// anything is reconstructed from. (The uncapped copy is campaign_changes.)
 function acAppendChanges(existing, incoming) {
   if (!incoming.length) return existing;
   const incomingIds = new Set(incoming.map(r => r.id));
@@ -1729,5 +1769,5 @@ export { acRunSync, acBrandFromPrefix, acWriteSbBudget, acWriteAmazonFields, acM
          acCoverageLooksWrong, acPlacementCensus, acReadPlacements,
          acPlacementsSummary, acApplyBrandOverride, acKnownBrands,
          acValidateAmazonFields, acCollectItemErrors, acAdsWrite, acJoinDefaultBids,
-         acWriteAdGroupBid,
+         acWriteAdGroupBid, acEnsureHistory,
          AC_ENDPOINTS, AC_CONFIG };

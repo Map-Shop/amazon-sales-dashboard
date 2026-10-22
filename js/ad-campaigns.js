@@ -996,7 +996,9 @@
               // What the row displayed. The server compares this against
               // Amazon's current values and refuses rather than silently
               // reverting a change made in Campaign Manager since the sync.
-              expected: acoExpectedFor(item.campaign, item.fields)
+              expected: acoExpectedFor(item.campaign, item.fields),
+              // For the change history: which page the edit came from.
+              origin: 'campaigns'
             })
           });
           const data = await res.json().catch(() => ({}));

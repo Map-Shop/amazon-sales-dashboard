@@ -767,7 +767,9 @@
           body: JSON.stringify({
             campaignId: row.campaignId, adProduct: row.adProduct, local: {},
             amazon: { dailyBudget: row.newBudget },
-            expected: { dailyBudget: row.dailyBudget }
+            expected: { dailyBudget: row.dailyBudget },
+            // For the change history: which review the edit came from.
+            origin: 'biweekly'
           })
         });
         const reply = await res.json().catch(() => ({}));

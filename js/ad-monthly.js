@@ -593,7 +593,9 @@
             amazon: { dailyBudget: row.recommendedBudget },
             // What this page showed. The budget can move between loading the
             // month and pressing the button.
-            expected: { dailyBudget: row.dailyBudget }
+            expected: { dailyBudget: row.dailyBudget },
+            // For the change history: which review the edit came from.
+            origin: 'monthly'
           })
         });
         const data = await res.json().catch(() => ({}));

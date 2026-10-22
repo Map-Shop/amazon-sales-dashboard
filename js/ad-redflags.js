@@ -806,14 +806,15 @@
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
           // What this page displayed goes in `expected`. Reports take minutes
           // to generate, so the value really can move between run and button.
+          // `origin` tells the change history which review the edit came from.
           body: JSON.stringify(kind === 'bid'
             ? { campaignId: row.campaignId, adProduct: row.adProduct, local: {},
                 adGroupId: row.adGroupId,
                 adGroup: { defaultBid: row.recommendedBid },
-                expected: { defaultBid: row.defaultBid } }
+                expected: { defaultBid: row.defaultBid }, origin: 'weekly' }
             : { campaignId: row.campaignId, adProduct: row.adProduct, local: {},
                 amazon: { dailyBudget: row.recommendedBudget },
-                expected: { dailyBudget: row.dailyBudget } })
+                expected: { dailyBudget: row.dailyBudget }, origin: 'weekly' })
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.success) {

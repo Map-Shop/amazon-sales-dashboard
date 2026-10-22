@@ -2,6 +2,7 @@ import { kv } from '../lib/kv.js';
 import * as ordersSql from '../lib/orders.js';
 import * as productsSql from '../lib/products.js';
 import * as adspendSql from '../lib/adspend.js';
+import * as adHistory from '../lib/adhistory.js';
 
 // An ad type's month as { rows } (null when kv has no record), and its
 // replacement — the ad_spend_rows table when SQL_TABLES includes
@@ -30,7 +31,7 @@ export async function readAdRange(type, startMonth, endMonth) {
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
-import { acRunSync, acBrandFromPrefix } from './adcampaigns.js';
+import { acRunSync, acBrandFromPrefix, acEnsureHistory } from './adcampaigns.js';
 import { gunzip } from 'zlib';
 import { promisify } from 'util';
 
@@ -1275,8 +1276,7 @@ async function handleWeeklyGet(req, res) {
       });
     }
 
-    const result = rfDecideAll({ inputs: run.inputs, census, window: run.window });
-    result.flags = rfAttachNotes(result.flags, logNotes, run.window.weekStart);
+    const result = rfPageResult({ run, census, logNotes });
     return res.status(200).json({
       success: true,
       window: run.window,
@@ -1810,8 +1810,39 @@ async function handleWeeklyNote(req, res) {
 // threshold shows up without another report.
 const RF_RUN_KEY = 'weekly:lastrun';
 
+// What the weekly page shows for a stored run, decided from the census and
+// notes as they are now. The page's read and the run history share it.
+function rfPageResult({ run, census, logNotes }) {
+  const result = rfDecideAll({ inputs: run.inputs, census, window: run.window });
+  result.flags = rfAttachNotes(result.flags, logNotes, run.window.weekStart);
+  return result;
+}
+
 async function rfSaveRun(window, inputs) {
-  await kv.set(RF_RUN_KEY, { window, inputs, collectedAt: new Date().toISOString() });
+  await acEnsureHistory();
+  const run = { window, inputs, collectedAt: new Date().toISOString() };
+  await kv.set(RF_RUN_KEY, run);
+  await adHistoryRecordRun('weekly', run, async () => {
+    const [census, logNotes] = await Promise.all([loadCensus(), rfLoadNotes()]);
+    return {
+      decisions: census.campaigns.length ? rfPageResult({ run, census, logNotes }) : null,
+      context: { config: RF_CONFIG, censusSyncedAt: census.syncedAt }
+    };
+  });
+}
+
+// Adds a stored run to the permanent history (lib/adhistory.js) with what its
+// page showed at that moment, when SQL_TABLES includes "adhistory". The pages
+// never read the history: they still decide afresh on every load. decide()
+// returns { decisions, context }. Never throws: a failure is logged and the
+// run stays stored.
+async function adHistoryRecordRun(cadence, run, decide) {
+  if (!adHistory.historyEnabled()) return;
+  try {
+    await adHistory.recordRun(cadence, run, await decide());
+  } catch (err) {
+    console.error(`[AD HISTORY] ${cadence} run not recorded:`, err.message);
+  }
 }
 
 async function rfLoadRun() {
@@ -2645,11 +2676,30 @@ function evaluateBiweekly({ census, rows, window, postures = {}, recentRaises = 
 // decision that can disagree with the current rules.
 const BW_RUN_KEY = 'biweekly:lastrun';
 
+// What the bi-weekly page shows for a stored run, decided from the census
+// and postures as they are now. The page's read and the run history share it.
+function bwPageResult({ run, census, postures }) {
+  return bwDecideAll({
+    inputs: run.inputs, census, window: run.window, postures,
+    recentRaises: bwRecentRaises(census.changes, run.window),
+    adjusted: bwAdjustedAfter(census.changes, run.window.end)
+  });
+}
+
 async function bwSaveRun(window, inputs, collectedAt) {
-  await kv.set(BW_RUN_KEY, {
+  await acEnsureHistory();
+  const run = {
     window, inputs,
     collectedAt: collectedAt || new Date().toISOString(),
     adoptedAt: new Date().toISOString()
+  };
+  await kv.set(BW_RUN_KEY, run);
+  await adHistoryRecordRun('biweekly', run, async () => {
+    const [census, postures] = await Promise.all([loadCensus(), bwLoadPostures()]);
+    return {
+      decisions: census.campaigns.length ? bwPageResult({ run, census, postures }) : null,
+      context: { config: BW_CONFIG, postures, censusSyncedAt: census.syncedAt }
+    };
   });
 }
 
@@ -2902,11 +2952,7 @@ async function handleBiweeklyGet(req, res) {
       });
     }
 
-    const result = bwDecideAll({
-      inputs: run.inputs, census, window: run.window, postures,
-      recentRaises: bwRecentRaises(census.changes, run.window),
-      adjusted: bwAdjustedAfter(census.changes, run.window.end)
-    });
+    const result = bwPageResult({ run, census, postures });
 
     // Normally null: the cron adopts what it fetches, so the stored fetch and
     // the run are the same. Non-null means a fetch was stored but not adopted,
@@ -3724,8 +3770,31 @@ function moDecideAll({ inputs, census, window, brandSales = {}, postures = {} })
   };
 }
 
+// What the monthly page shows for a stored run, decided from the census,
+// postures, and brand sales as they are now. The page's read and the run
+// history share it.
+function moPageResult({ run, census, postures, brandSales }) {
+  const result = moDecideAll({
+    inputs: run.inputs, census, window: run.window,
+    brandSales: brandSales.byBrand, postures
+  });
+  result.orders = brandSales;
+  return result;
+}
+
 async function moSaveRun(window, inputs) {
-  await kv.set(MO_RUN_KEY, { window, inputs, collectedAt: new Date().toISOString() });
+  await acEnsureHistory();
+  const run = { window, inputs, collectedAt: new Date().toISOString() };
+  await kv.set(MO_RUN_KEY, run);
+  await adHistoryRecordRun('monthly', run, async () => {
+    const [census, postures, brandSales] = await Promise.all([
+      loadCensus(), bwLoadPostures(), moLoadBrandSales(window)
+    ]);
+    return {
+      decisions: census.campaigns.length ? moPageResult({ run, census, postures, brandSales }) : null,
+      context: { config: MO_CONFIG, postures, censusSyncedAt: census.syncedAt }
+    };
+  });
 }
 
 async function moLoadRun() {
@@ -3968,11 +4037,7 @@ async function handleMonthlyGet(req, res) {
     }
 
     const brandSales = await moLoadBrandSales(run.window);
-    const result = moDecideAll({
-      inputs: run.inputs, census, window: run.window,
-      brandSales: brandSales.byBrand, postures
-    });
-    result.orders = brandSales;
+    const result = moPageResult({ run, census, postures, brandSales });
 
     return res.status(200).json({
       success: true, window: run.window, config: MO_CONFIG, postures,
