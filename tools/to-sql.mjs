@@ -5,7 +5,7 @@
 //   node tools/to-sql.mjs <table|all> --verify
 //   node tools/to-sql.mjs <table|all> --fill
 //   node tools/to-sql.mjs <table|all> --fill --target prod --before-switch
-// Tables: orders, shipping. Default target is the dev database.
+// Tables: orders, shipping, sessions. Default target is the dev database.
 //
 // Databases come from .env.local: dev = DATABASE_URL_DEV, prod =
 // DATABASE_URL (an owner role). Nothing here prints a credential.
@@ -99,6 +99,37 @@ const TABLES = {
       }
       return compareLists(fromKv, fromApi);
     }
+  },
+
+  sessions: {
+    ddl: [
+      `CREATE TABLE session_traffic (
+        id                      bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        date                    date,
+        asin                    text,
+        sessions                integer     NOT NULL,
+        session_percentage      numeric     NOT NULL,
+        page_views              integer     NOT NULL,
+        unit_session_percentage numeric     NOT NULL,
+        buy_box_percentage      numeric     NOT NULL,
+        created_at              timestamptz NOT NULL DEFAULT now()
+      )`,
+      'CREATE INDEX session_traffic_date_idx ON session_traffic (date)'
+    ],
+    columns: 'date, asin, sessions, session_percentage, page_views, unit_session_percentage, buy_box_percentage',
+    kvRows: `SELECT (e.v->>'date')::date AS date, e.v->>'asin' AS asin, (e.v->>'sessions')::int AS sessions,
+        (e.v->>'sessionPercentage')::numeric AS session_percentage, (e.v->>'pageViews')::int AS page_views,
+        (e.v->>'unitSessionPercentage')::numeric AS unit_session_percentage,
+        (e.v->>'buyBoxPercentage')::numeric AS buy_box_percentage, e.ord
+      FROM kv, jsonb_array_elements(kv.value::jsonb) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = 'session_data'`,
+    // Insert in list order so the identity column reproduces it.
+    fillOrder: 'ord',
+    async apiCheck(sql, decodeValue) {
+      const { getAll } = await lib('sessions.js');
+      const [rec] = await sql.query("SELECT value FROM kv WHERE key = 'session_data'");
+      return compareLists(rec ? decodeValue(rec.value) : [], await getAll());
+    }
   }
 };
 
@@ -151,7 +182,8 @@ for (const name of names) {
     await sql.transaction([
       sql.query(`DROP TABLE IF EXISTS ${table}`),
       ...t.ddl.map(d => sql.query(d)),
-      sql.query(`INSERT INTO ${table} (${t.columns}) SELECT ${t.columns} FROM (${t.kvRows}) src`)
+      sql.query(`INSERT INTO ${table} (${t.columns}) SELECT ${t.columns} FROM (${t.kvRows}) src` +
+        (t.fillOrder ? ` ORDER BY src.${t.fillOrder}` : ''))
     ]);
   }
   const tableRows = `SELECT ${t.columns} FROM ${table}`;

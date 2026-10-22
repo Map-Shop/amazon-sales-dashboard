@@ -1,5 +1,25 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
+import * as sessionsSql from '../lib/sessions.js';
+
+// The traffic list, its length, and appends to it — the session_traffic
+// table when SQL_TABLES includes "sessions", otherwise the session_data kv
+// record. appendSessions returns the list's new length.
+async function readSessions() {
+  if (sessionsSql.sessionsInSql()) return sessionsSql.getAll();
+  return kv.get('session_data');
+}
+async function countSessions() {
+  if (sessionsSql.sessionsInSql()) return sessionsSql.count();
+  return ((await kv.get('session_data')) || []).length;
+}
+async function appendSessions(rows) {
+  if (sessionsSql.sessionsInSql()) return sessionsSql.append(rows);
+  const existing = (await kv.get('session_data')) || [];
+  const combined = [...existing, ...rows];
+  await kv.set('session_data', combined);
+  return combined.length;
+}
 
 export default async function handler(req, res) {
   const { action } = req.query;
@@ -161,11 +181,7 @@ async function handleDownload(req, res) {
     
     const sessionData = parseSessionReport(reportData, reportDate);
     
-    // Get existing data and append new data
-    const existingData = await kv.get('session_data') || [];
-    const combinedData = [...existingData, ...sessionData];
-    
-    await kv.set('session_data', combinedData);
+    await appendSessions(sessionData);
 
     return res.status(200).json({
       status: 'DONE',
@@ -195,8 +211,8 @@ async function handleGet(req, res) {
       return res.status(401).json({ error: 'Invalid access token' });
     }
 
-    const sessionData = await kv.get('session_data');
-    
+    const sessionData = await readSessions();
+
     if (!sessionData) {
       return res.status(200).json({ 
         success: true,
@@ -248,10 +264,8 @@ async function handleBackfill(req, res) {
     const start = new Date(startDate);
     const end = new Date(endDate);
     
-    // Get existing data
-    const existingData = await kv.get('session_data') || [];
-    let allData = [...existingData];
-    
+    let totalRecords = await countSessions();
+
     let processedDays = 0;
     let currentDate = new Date(start);
 
@@ -319,13 +333,12 @@ async function handleBackfill(req, res) {
         const reportData = JSON.parse(decompressed.toString());
         
         const dayData = parseSessionReport(reportData, dateStr);
-        allData.push(...dayData);
-        
+
         // Save incrementally after each day
-        await kv.set('session_data', allData);
-        
+        totalRecords = await appendSessions(dayData);
+
         processedDays++;
-        res.write(`data: Completed ${dateStr} (${processedDays} days processed, ${allData.length} total records)\n\n`);
+        res.write(`data: Completed ${dateStr} (${processedDays} days processed, ${totalRecords} total records)\n\n`);
         
         await sleep(2000);
         
@@ -336,7 +349,7 @@ async function handleBackfill(req, res) {
       currentDate.setDate(currentDate.getDate() + 1);
     }
     
-    res.write(`data: COMPLETE - Total ${allData.length} records from ${processedDays} days\n\n`);
+    res.write(`data: COMPLETE - Total ${totalRecords} records from ${processedDays} days\n\n`);
     res.end();
 
   } catch (error) {
@@ -437,17 +450,14 @@ async function handleSync(req, res) {
     console.log(`[SYNC] Parsed ${sessionData.length} records`);
     
     // Append to existing data
-    const existingData = await kv.get('session_data') || [];
-    const combinedData = [...existingData, ...sessionData];
-    
-    await kv.set('session_data', combinedData);
-    console.log(`[SYNC] Stored successfully. Total records: ${combinedData.length}`);
-    
+    const totalRecords = await appendSessions(sessionData);
+    console.log(`[SYNC] Stored successfully. Total records: ${totalRecords}`);
+
     return res.status(200).json({
       success: true,
       date: dateStr,
       newRecords: sessionData.length,
-      totalRecords: combinedData.length,
+      totalRecords,
       message: `Daily sync complete for ${dateStr}`
     });
 
