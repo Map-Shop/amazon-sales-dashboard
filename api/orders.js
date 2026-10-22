@@ -1,5 +1,6 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
+import * as ordersSql from '../lib/orders.js';
 
 export default async function handler(req, res) {
   const { action } = req.query;
@@ -226,6 +227,13 @@ async function handleGetV2(req, res) {
 
     const { startDate, endDate } = req.query;
 
+    if (ordersSql.ordersInSql()) {
+      const orders = (startDate && endDate)
+        ? await ordersSql.getOrders({ startDate, endDate })
+        : await ordersSql.getOrders();
+      return res.status(200).json({ success: true, orders });
+    }
+
     const index = await kv.get('orders:v2:index') || [];
     if (index.length === 0) {
       return res.status(200).json({ success: true, orders: [] });
@@ -354,13 +362,28 @@ async function _normalizeAndWriteOrdersMonth(rawRows, { overwrite = false } = {}
   // accidental data loss on re-upload / re-pull.
   if (!overwrite) {
     const collisions = [];
-    for (const m of monthsToWrite) {
-      const existing = await kv.get(`orders:v2:${m}`);
-      if (Array.isArray(existing) && existing.length > 0) collisions.push(m);
+    if (ordersSql.ordersInSql()) {
+      collisions.push(...await ordersSql.monthsWithData(monthsToWrite));
+    } else {
+      for (const m of monthsToWrite) {
+        const existing = await kv.get(`orders:v2:${m}`);
+        if (Array.isArray(existing) && existing.length > 0) collisions.push(m);
+      }
     }
     if (collisions.length > 0) {
       return { collision: true, collidingMonths: collisions };
     }
+  }
+
+  if (ordersSql.ordersInSql()) {
+    await ordersSql.replaceMonths(byMonth);
+    return {
+      collision: false,
+      writtenMonths: monthsToWrite,
+      totalRows: monthsToWrite.reduce((n, m) => n + byMonth[m].length, 0),
+      rawRowCount, skippedCancelled, skippedNoDate, skippedNoOrder,
+      rowsWithItemTotal, rowsWithQuantity, ingestedOrders, ingestedRevenue, keptRowCount
+    };
   }
 
   // Write per-month buckets, then update the index. Data-first-then-
@@ -421,6 +444,26 @@ async function _mergeOrdersDay(rawRows, { updateOnly = false } = {}) {
     return {
       collision: false,
       writtenMonths: [], totalRows: 0, removedCancelled: 0, rawRowCount,
+      skippedCancelled, skippedNoDate, skippedNoOrder,
+      rowsWithItemTotal, rowsWithQuantity, ingestedOrders, ingestedRevenue, keptRowCount
+    };
+  }
+
+  if (ordersSql.ordersInSql()) {
+    // Same order of operations as the kv path below: apply the report's
+    // lines (refresh-only in update mode), then delete cancellations.
+    const rows = monthsToWrite.flatMap(m => byMonth[m] || []);
+    let applied;
+    if (updateOnly) {
+      applied = await ordersSql.updateExistingOrders(rows);
+    } else {
+      await ordersSql.upsertOrders(rows);
+      applied = rows.length;
+    }
+    const removed = await ordersSql.deleteOrderKeys(cancelledKeys);
+    return {
+      collision: false,
+      writtenMonths: monthsToWrite, totalRows: applied, removedCancelled: removed, rawRowCount,
       skippedCancelled, skippedNoDate, skippedNoOrder,
       rowsWithItemTotal, rowsWithQuantity, ingestedOrders, ingestedRevenue, keptRowCount
     };
@@ -1196,15 +1239,19 @@ async function handleDeleteV2Months(req, res) {
       return res.status(400).json({ error: `Invalid month format: ${invalid.join(', ')}. Use YYYY-MM.` });
     }
 
-    // 1. Delete the per-month buckets in parallel.
-    await Promise.all(months.map(m => kv.del(`orders:v2:${m}`)));
+    if (ordersSql.ordersInSql()) {
+      await ordersSql.deleteMonths(months);
+    } else {
+      // 1. Delete the per-month buckets in parallel.
+      await Promise.all(months.map(m => kv.del(`orders:v2:${m}`)));
 
-    // 2. Remove from the index.
-    const existingIndex = (await kv.get('orders:v2:index')) || [];
-    const toRemove = new Set(months);
-    const newIndex = existingIndex.filter(m => !toRemove.has(m));
-    if (newIndex.length !== existingIndex.length) {
-      await kv.set('orders:v2:index', newIndex);
+      // 2. Remove from the index.
+      const existingIndex = (await kv.get('orders:v2:index')) || [];
+      const toRemove = new Set(months);
+      const newIndex = existingIndex.filter(m => !toRemove.has(m));
+      if (newIndex.length !== existingIndex.length) {
+        await kv.set('orders:v2:index', newIndex);
+      }
     }
 
     // 3. Remove from lastResults (so the UI doesn't render stale "N
@@ -1362,7 +1409,11 @@ async function handleCronDataCheck(req, res) {
     // the trailing-weekday history reads from the same 1-2 months.
     const buckets = {};
     const getBucket = async (m) => {
-      if (!(m in buckets)) buckets[m] = (await kv.get(`orders:v2:${m}`)) || [];
+      if (!(m in buckets)) {
+        buckets[m] = ordersSql.ordersInSql()
+          ? await ordersSql.getMonth(m)
+          : (await kv.get(`orders:v2:${m}`)) || [];
+      }
       return buckets[m];
     };
 

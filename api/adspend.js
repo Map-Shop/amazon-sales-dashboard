@@ -1,4 +1,5 @@
 import { kv } from '../lib/kv.js';
+import * as ordersSql from '../lib/orders.js';
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
@@ -3321,12 +3322,13 @@ function moBuildInputs({ census, rows, window }) {
 // through the product catalog, so a SKU missing a brand there is missing from
 // the denominator; that count is reported rather than absorbed.
 async function moLoadBrandSales(window) {
+  const sqlOrders = ordersSql.ordersInSql();
   const [products, index] = await Promise.all([
     kv.get('products'),
-    kv.get('orders:v2:index')
+    sqlOrders ? null : kv.get('orders:v2:index')
   ]);
   const catalog = Array.isArray(products) ? products : [];
-  if (!catalog.length || !Array.isArray(index) || !index.length) {
+  if (!catalog.length || (!sqlOrders && (!Array.isArray(index) || !index.length))) {
     return { byBrand: {}, available: false, unmappedSkus: 0, unmappedSales: 0 };
   }
 
@@ -3337,13 +3339,22 @@ async function moLoadBrandSales(window) {
     if (sku && brand) brandBySku.set(sku, brand);
   }
 
-  const months = [...new Set([window.start.slice(0, 7), window.end.slice(0, 7)])]
-    .filter(m => index.includes(m));
-  if (!months.length) {
-    return { byBrand: {}, available: false, unmappedSkus: 0, unmappedSales: 0 };
+  const windowMonths = [...new Set([window.start.slice(0, 7), window.end.slice(0, 7)])];
+  let buckets;
+  if (sqlOrders) {
+    // "Available" means the window's month has order data at all, even if
+    // the window itself had no sales — same test as the index check below.
+    if (!(await ordersSql.monthsWithData(windowMonths)).length) {
+      return { byBrand: {}, available: false, unmappedSkus: 0, unmappedSales: 0 };
+    }
+    buckets = [await ordersSql.getOrders({ startDate: window.start, endDate: window.end })];
+  } else {
+    const months = windowMonths.filter(m => index.includes(m));
+    if (!months.length) {
+      return { byBrand: {}, available: false, unmappedSkus: 0, unmappedSales: 0 };
+    }
+    buckets = await Promise.all(months.map(m => kv.get(`orders:v2:${m}`)));
   }
-
-  const buckets = await Promise.all(months.map(m => kv.get(`orders:v2:${m}`)));
   const byBrand = {};
   const unmapped = new Set();
   let unmappedSales = 0;
