@@ -1,5 +1,6 @@
 import { kv } from '../lib/kv.js';
 import * as adHistory from '../lib/adhistory.js';
+import * as census from '../lib/adcensus.js';
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // Campaign Overview — Amazon ad campaign and portfolio CONFIGURATION.
@@ -42,6 +43,12 @@ import * as adHistory from '../lib/adhistory.js';
 //   adcampaigns:meta        → { lastSyncAt, lastSyncOk, counts, sources,
 //                               pages, coverage, warnings, lastError }
 //   adcampaigns:overrides   → { [campaignId]: { brand, at } }  dashboard-only
+//
+// With SQL_TABLES including "adcampaigns" these live in tables instead
+// (lib/adcensus.js: ad_census, ad_campaigns, ad_portfolios, ad_census_syncs,
+// ad_brand_overrides), and the change log is campaign_changes
+// (lib/adhistory.js), uncapped, with the page showing its latest 200. Every
+// read and write goes through the census storage helpers below.
 //
 // The brand override deliberately does NOT live on the campaign row. acRunSync
 // rebuilds rows from acMapCampaign and acMergePresence carries forward only
@@ -240,10 +247,7 @@ async function handleGet(req, res) {
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
     const [current, portfolios, changes, meta] = await Promise.all([
-      kv.get('adcampaigns:current'),
-      kv.get('adcampaigns:portfolios'),
-      kv.get('adcampaigns:changes'),
-      kv.get('adcampaigns:meta')
+      acReadCurrent(), acReadPortfolios(), acReadChanges(), acReadMeta()
     ]);
 
     return res.status(200).json({
@@ -431,7 +435,7 @@ async function handleUpdate(req, res) {
     }
 
     const [current, overrides] = await Promise.all([
-      kv.get('adcampaigns:current'),
+      acReadCurrent(),
       acLoadOverrides()
     ]);
 
@@ -461,7 +465,7 @@ async function handleUpdate(req, res) {
       next
     );
 
-    const writes = hasLocal ? [kv.set('adcampaigns:overrides', next)] : [];
+    const writes = hasLocal ? [acWriteOverrides(next)] : [];
     const changeRecords = [];
     const result = { applied: {}, notApplied: [], collateral: [], amazonErrors: [] };
 
@@ -534,17 +538,14 @@ async function handleUpdate(req, res) {
     if (Object.keys(result.applied).length) {
       const nextRows = rows.slice();
       nextRows[idx] = updatedRow;
-      writes.push(kv.set('adcampaigns:current', { ...current, rows: nextRows }));
+      writes.push(acWriteCurrent({ ...current, rows: nextRows }));
     }
 
     if (changeRecords.length) {
       // History first, so it copies in the log before this append can push
       // the oldest record past the cap.
       await acEnsureHistory();
-      const stored = await kv.get('adcampaigns:changes');
-      writes.push(kv.set('adcampaigns:changes', {
-        rows: acAppendChanges((stored && stored.rows) || [], changeRecords)
-      }));
+      writes.push(acAppendToLog(changeRecords, origin));
     }
 
     await Promise.all(writes);
@@ -1025,9 +1026,9 @@ async function acRunSync({ dry = false, force = false } = {}) {
   }
 
   const [prevCurrent, prevPortfolios, prevChanges, overrides] = await Promise.all([
-    kv.get('adcampaigns:current'),
-    kv.get('adcampaigns:portfolios'),
-    kv.get('adcampaigns:changes'),
+    acReadCurrent(),
+    acReadPortfolios(),
+    acReadChanges(),
     acLoadOverrides()
   ]);
   const prevRows = prevCurrent?.rows || [];
@@ -1077,7 +1078,7 @@ async function acRunSync({ dry = false, force = false } = {}) {
   if (aborted) {
     result.error = `Campaign count dropped ${prevRows.length} → ${campaigns.length}; ` +
                    `refusing to overwrite. Re-run with force=1 if this is real.`;
-    await kv.set('adcampaigns:meta', {
+    await acWriteMeta({
       lastSyncAt: now, lastSyncOk: false, lastError: result.error,
       counts: result.counts, sources: result.sources, pages: result.pages,
       coverage, warnings
@@ -1094,18 +1095,17 @@ async function acRunSync({ dry = false, force = false } = {}) {
   // History first, so it copies in the log before this append can push the
   // oldest records past the cap.
   if (changeRecords.length) await acEnsureHistory();
-  const changesOut = acAppendChanges(prevChanges?.rows || [], changeRecords);
 
-  await Promise.all([
-    kv.set('adcampaigns:current',    { syncedAt: now, ptDate, rows: merged }),
-    kv.set('adcampaigns:portfolios', { syncedAt: now, rows: mergedPortfolios }),
-    kv.set('adcampaigns:changes',    { rows: changesOut }),
-    kv.set('adcampaigns:meta', {
+  await acStoreRefresh({
+    current:    { syncedAt: now, ptDate, rows: merged },
+    portfolios: { syncedAt: now, rows: mergedPortfolios },
+    prevChanges, changeRecords,
+    meta: {
       lastSyncAt: now, lastSyncOk: true, lastSyncDurationMs: result.durationMs,
       counts: result.counts, sources: result.sources, pages: result.pages,
       coverage, warnings, lastError: null
-    })
-  ]);
+    }
+  });
   await acRecordHistory(changeRecords, null);
 
   return result;
@@ -1379,8 +1379,66 @@ function acApplyBrandOverride(row, overrides) {
 }
 
 async function acLoadOverrides() {
-  const stored = await kv.get('adcampaigns:overrides');
+  const stored = census.censusInSql() ? await census.getOverrides() : await kv.get('adcampaigns:overrides');
   return (stored && typeof stored === 'object') ? stored : {};
+}
+
+// ─── CENSUS STORAGE ──────────────────────────────────────────────────────────
+// The census and its change log, from the tables when SQL_TABLES includes
+// "adcampaigns" (lib/adcensus.js; the log is campaign_changes in
+// lib/adhistory.js), otherwise from the adcampaigns:* kv records. Reads
+// return each kv record's shape; null when there is none.
+function acReadCurrent() {
+  return census.censusInSql() ? census.getCampaigns() : kv.get('adcampaigns:current');
+}
+function acReadPortfolios() {
+  return census.censusInSql() ? census.getPortfolios() : kv.get('adcampaigns:portfolios');
+}
+function acReadMeta() {
+  return census.censusInSql() ? census.getStatus() : kv.get('adcampaigns:meta');
+}
+// { rows } — the capped log, oldest first.
+async function acReadChanges() {
+  if (!census.censusInSql()) return kv.get('adcampaigns:changes');
+  return { rows: await adHistory.getRecentChanges(AC_CONFIG.CHANGES_CAP) };
+}
+function acWriteCurrent(current) {
+  return census.censusInSql() ? census.replaceCampaigns(current) : kv.set('adcampaigns:current', current);
+}
+function acWriteMeta(meta) {
+  return census.censusInSql() ? census.recordStatus(meta) : kv.set('adcampaigns:meta', meta);
+}
+function acWriteOverrides(overrides) {
+  return census.censusInSql() ? census.replaceOverrides(overrides) : kv.set('adcampaigns:overrides', overrides);
+}
+// Appends records to the change log. In SQL they join campaign_changes (the
+// log uncapped, with the page an edit came from); the page still sees the
+// latest 200.
+async function acAppendToLog(records, origin) {
+  if (census.censusInSql()) return adHistory.recordChanges(records, origin);
+  const stored = await kv.get('adcampaigns:changes');
+  return kv.set('adcampaigns:changes', {
+    rows: acAppendChanges((stored && stored.rows) || [], records)
+  });
+}
+// A refresh's writes: both snapshots, the change log, and the status.
+async function acStoreRefresh({ current, portfolios, prevChanges, changeRecords, meta }) {
+  if (census.censusInSql()) {
+    await census.storeRefresh(current, portfolios, meta);
+    await adHistory.recordChanges(changeRecords, null);
+    return;
+  }
+  await Promise.all([
+    kv.set('adcampaigns:current',    current),
+    kv.set('adcampaigns:portfolios', portfolios),
+    kv.set('adcampaigns:changes',    { rows: acAppendChanges(prevChanges?.rows || [], changeRecords) }),
+    kv.set('adcampaigns:meta',       meta)
+  ]);
+}
+// The census for the review pages (api/adspend.js loadCensus).
+async function acReadCensus() {
+  const [current, portfolios, changes] = await Promise.all([acReadCurrent(), acReadPortfolios(), acReadChanges()]);
+  return { current, portfolios, changes };
 }
 
 function acBrandFromPrefix(name) {
@@ -1621,7 +1679,8 @@ async function acEnsureHistory() {
   }
 }
 async function acRecordHistory(records, origin) {
-  if (!adHistory.historyEnabled() || !records.length) return;
+  // With the census in SQL the log write already put them in the table.
+  if (!adHistory.historyEnabled() || census.censusInSql() || !records.length) return;
   try {
     await adHistory.ensure(k => kv.get(k));
     await adHistory.recordChanges(records, origin);
@@ -1769,5 +1828,5 @@ export { acRunSync, acBrandFromPrefix, acWriteSbBudget, acWriteAmazonFields, acM
          acCoverageLooksWrong, acPlacementCensus, acReadPlacements,
          acPlacementsSummary, acApplyBrandOverride, acKnownBrands,
          acValidateAmazonFields, acCollectItemErrors, acAdsWrite, acJoinDefaultBids,
-         acWriteAdGroupBid, acEnsureHistory,
+         acWriteAdGroupBid, acEnsureHistory, acReadCensus,
          AC_ENDPOINTS, AC_CONFIG };

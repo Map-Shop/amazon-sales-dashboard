@@ -31,7 +31,7 @@ export async function readAdRange(type, startMonth, endMonth) {
 // The campaign census. Imported rather than re-implemented: the cron needs to
 // refresh it before fetching reports, and there is exactly one correct way to
 // do that. Vercel bundles the module; it does not add a serverless function.
-import { acRunSync, acBrandFromPrefix, acEnsureHistory } from './adcampaigns.js';
+import { acRunSync, acBrandFromPrefix, acEnsureHistory, acReadCensus } from './adcampaigns.js';
 import { gunzip } from 'zlib';
 import { promisify } from 'util';
 
@@ -1293,16 +1293,13 @@ async function handleWeeklyGet(req, res) {
 }
 
 // ─── CENSUS ──────────────────────────────────────────────────────────────────
-// The campaign configuration snapshot written by the Campaign Overview page.
-// Read-only: nothing here writes an adcampaigns:* key.
+// The campaign configuration snapshot written by the Campaign Overview page,
+// read through api/adcampaigns.js (tables or kv, whichever holds it). The
+// change log says what changed and when: five of the six checks say something
+// moved without saying why, and the most common why is that we moved it
+// ourselves. Read-only: nothing here writes the census.
 async function loadCensus() {
-  const [current, portfolios, changes] = await Promise.all([
-    kv.get('adcampaigns:current'),
-    kv.get('adcampaigns:portfolios'),
-    // What changed and when. Five of the six checks say something moved without
-    // saying why, and the most common why is that we moved it ourselves.
-    kv.get('adcampaigns:changes')
-  ]);
+  const { current, portfolios, changes } = await acReadCensus();
   const portfolioNames = {};
   for (const p of (portfolios?.rows || [])) {
     if (p.portfolioId) portfolioNames[String(p.portfolioId)] = p.name;

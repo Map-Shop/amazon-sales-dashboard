@@ -34,9 +34,16 @@ import { neon } from '@neondatabase/serverless';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const lib = (name) => import(pathToFileURL(path.join(ROOT, 'lib', name)).href);
 const { rawExtracted, RAW_EXTRACTED_COLUMNS } = await lib('transactions.js');
+const { recordColumns, recordValues, recordCompareColumns } = await lib('records.js');
+const adcensus = await lib('adcensus.js');
 
 // A data set stored in more than one table fills and verifies them together.
-const GROUPS = { transactions: ['transactions-raw', 'transactions-months', 'transactions-imported'] };
+const GROUPS = {
+  transactions: ['transactions-raw', 'transactions-months', 'transactions-imported'],
+  // Rows before the snapshot documents, whose check reads them back whole.
+  adcampaigns: ['ad-campaigns', 'ad-portfolios', 'ad-census', 'ad-census-syncs',
+                'ad-brand-overrides', 'campaign-changes']
+};
 
 // readMonthV2024's kv reassembly, in SQL: a month record holding its own
 // transactions array is used as-is; otherwise its parts p0..p(chunkCount-1)
@@ -418,8 +425,161 @@ const TABLES = {
     ['id', 'id', 'text'], ['createdAt', 'created_at', 'text'], ['date', 'date', 'date'],
     ['productName', 'product_name', 'text'], ['asin', 'asin', 'text'],
     ['changes', 'changes', 'text'], ['notes', 'notes', 'text']
-  ])
+  ]),
+
+  // ── Campaign census (lib/adcensus.js) ─────────────────────────────────
+  'ad-campaigns': recordRows({
+    table: 'ad_campaigns', key: 'adcampaigns:current', spec: adcensus.CAMPAIGN_SPEC,
+    extraDdl: ['CREATE INDEX ad_campaigns_campaign_idx ON ad_campaigns (campaign_id)'],
+    read: () => adcensus.getCampaignRows()
+  }),
+
+  'ad-portfolios': recordRows({
+    table: 'ad_portfolios', key: 'adcampaigns:portfolios', spec: adcensus.PORTFOLIO_SPEC,
+    read: () => adcensus.getPortfolioRows()
+  }),
+
+  // When each snapshot was taken. Its check reads both snapshots back whole.
+  'ad-census': {
+    ddl: [
+      `CREATE TABLE ad_census (
+        doc        text        PRIMARY KEY,
+        synced_at  text,
+        pt_date    text,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )`
+    ],
+    columns: 'doc, synced_at, pt_date',
+    kvRows: `SELECT 'campaigns' AS doc, c.v->>'syncedAt' AS synced_at, c.v->>'ptDate' AS pt_date
+        FROM (SELECT value::json AS v FROM kv WHERE key = 'adcampaigns:current') c
+      UNION ALL
+      SELECT 'portfolios', p.v->>'syncedAt', NULL
+        FROM (SELECT value::json AS v FROM kv WHERE key = 'adcampaigns:portfolios') p`,
+    async apiCheck(sql, decodeValue) {
+      const read = async (key) => { const [r] = await sql.query('SELECT value FROM kv WHERE key = $1', [key]); return r ? decodeValue(r.value) : null; };
+      return compareLists([await read('adcampaigns:current'), await read('adcampaigns:portfolios')],
+                          [await adcensus.getCampaigns(), await adcensus.getPortfolios()]);
+    }
+  },
+
+  // The refresh status: one row per refresh from here on, the latest being
+  // what adcampaigns:meta held.
+  'ad-census-syncs': {
+    ddl: [
+      `CREATE TABLE ad_census_syncs (
+        id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ${adcensus.SYNC_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields      text[]      NOT NULL,
+        extra       json,
+        recorded_at timestamptz NOT NULL DEFAULT now()
+      )`
+    ],
+    columns: recordColumns(adcensus.SYNC_SPEC),
+    compareColumns: recordCompareColumns(adcensus.SYNC_SPEC),
+    kvRows: `SELECT ${recordValues(adcensus.SYNC_SPEC, 'm.v', { aliased: true })}
+      FROM (SELECT value::json AS v FROM kv WHERE key = 'adcampaigns:meta') m`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'adcampaigns:meta'");
+      return compareLists([r ? decodeValue(r.value) : null], [await adcensus.getStatus()]);
+    }
+  },
+
+  'ad-brand-overrides': {
+    allowEmpty: true,   // nobody may have set one
+    ddl: [
+      `CREATE TABLE ad_brand_overrides (
+        position    integer PRIMARY KEY,
+        campaign_id text    NOT NULL UNIQUE,
+        ${adcensus.OVERRIDE_SPEC.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields      text[]  NOT NULL,
+        extra       json
+      )`
+    ],
+    columns: `position, campaign_id, ${recordColumns(adcensus.OVERRIDE_SPEC)}`,
+    compareColumns: `position, campaign_id, ${recordCompareColumns(adcensus.OVERRIDE_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.k AS campaign_id,
+        ${recordValues(adcensus.OVERRIDE_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_each(kv.value::json) WITH ORDINALITY AS e(k, v, ord)
+      WHERE kv.key = 'adcampaigns:overrides'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'adcampaigns:overrides'");
+      // The page treats an absent record and an empty one alike.
+      const fromKv = r ? decodeValue(r.value) : null;
+      return compareLists([fromKv && Object.keys(fromKv).length ? fromKv : null], [await adcensus.getOverrides()]);
+    }
+  },
+
+  // The change log. This table may already hold history the kv log has
+  // evicted (lib/adhistory.js has been recording it), so it is merged into,
+  // never dropped: the kv log's records are upserted in the log's order, after
+  // everything older, keeping any recorded origin. Verified by reading the
+  // page's capped log back from the table.
+  'campaign-changes': {
+    ddl: [`CREATE TABLE IF NOT EXISTS campaign_changes (id text PRIMARY KEY)`],
+    async fill(sql) {
+      const { DDL } = await lib('adhistory.js');
+      for (const d of DDL) await sql.query(d);
+      await sql.transaction([
+        // Rows recorded before the table had an order: oldest first.
+        sql.query(`UPDATE campaign_changes c SET seq = n.rn
+          FROM (SELECT id, row_number() OVER (ORDER BY changed_at NULLS FIRST, id) AS rn
+                FROM campaign_changes WHERE seq IS NULL) n
+          WHERE c.id = n.id`),
+        sql.query(`INSERT INTO campaign_changes (id, campaign_id, field, pt_date, changed_at, source, origin, data, seq)
+          SELECT e.d->>'id', e.d->>'campaignId', e.d->>'field',
+            CASE WHEN e.d->>'ptDate' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN (e.d->>'ptDate')::date END,
+            CASE WHEN e.d->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (e.d->>'at')::timestamptz END,
+            e.d->>'source', NULL, e.d,
+            (SELECT coalesce(max(seq), 0) FROM campaign_changes) + e.ord
+          FROM kv, json_array_elements(kv.value::json->'rows') WITH ORDINALITY AS e(d, ord)
+          WHERE kv.key = 'adcampaigns:changes'
+          ON CONFLICT (id) DO UPDATE SET
+            campaign_id = EXCLUDED.campaign_id, field = EXCLUDED.field, pt_date = EXCLUDED.pt_date,
+            changed_at = EXCLUDED.changed_at, source = EXCLUDED.source,
+            origin = COALESCE(EXCLUDED.origin, campaign_changes.origin), data = EXCLUDED.data,
+            seq = EXCLUDED.seq`),
+        sql.query(`SELECT setval('campaign_changes_seq', GREATEST((SELECT coalesce(max(seq), 0) FROM campaign_changes), 1))`)
+      ]);
+    },
+    async verify(sql, decodeValue) {
+      const { getRecentChanges } = await lib('adhistory.js');
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'adcampaigns:changes'");
+      const log = r ? (decodeValue(r.value).rows || []) : [];
+      const [{ n }] = await sql.query('SELECT count(*)::int AS n FROM campaign_changes');
+      const cmp = compareLists(log, await getRecentChanges(200));
+      return {
+        ok: n >= log.length && cmp.diffs === 0 && cmp.expected === cmp.actual,
+        summary: `kv log ${log.length} · table rows ${n} · page log read from the table: ${cmp.actual} records, ${cmp.diffs} differ`,
+        samples: cmp.samples
+      };
+    }
+  }
 };
+
+// A kv record holding { rows: [record] } as a table of exact-shape rows
+// (lib/records.js), in stored order.
+function recordRows({ table, key, spec, extraDdl = [], read }) {
+  return {
+    ddl: [
+      `CREATE TABLE ${table} (
+        position integer PRIMARY KEY,
+        ${spec.map(([, col, type]) => `${col} ${type}`).join(',\n        ')},
+        fields   text[]  NOT NULL,
+        extra    json
+      )`,
+      ...extraDdl
+    ],
+    columns: `position, ${recordColumns(spec)}`,
+    compareColumns: `position, ${recordCompareColumns(spec)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, ${recordValues(spec, 'e.v', { aliased: true })}
+      FROM kv, json_array_elements(kv.value::json->'rows') WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = '${key}'`,
+    async apiCheck(sql, decodeValue) {
+      const [rec] = await sql.query('SELECT value FROM kv WHERE key = $1', [key]);
+      return compareLists(rec ? (decodeValue(rec.value).rows || []) : [], await read());
+    }
+  };
+}
 
 // An entry log (lib/entries.js): a list kept in the order entries were added.
 function entryLog(name, kvKey, table, columns) {
@@ -490,13 +650,17 @@ console.log(`Target: ${target} database`);
 let allOk = true;
 for (const name of names) {
   const t = TABLES[name];
-  const table = t.ddl[0].match(/CREATE TABLE (\w+)/)[1];
-  if (fill) {
+  const table = t.ddl[0].match(/CREATE TABLE (?:IF NOT EXISTS )?(\w+)/)[1];
+  if (fill && t.fill) {
+    // A table holding history kv never had is merged into, never dropped.
+    await t.fill(sql);
+  } else if (fill) {
     // Never rebuild a table from nothing. Production's kv data records were
     // deleted after the switch, so a dev branch reset from production has the
-    // tables but no records to fill them from.
+    // tables but no records to fill them from. (allowEmpty: a record that may
+    // legitimately not exist, like a set of brand overrides nobody has made.)
     const [{ n: sourceRows }] = await sql.query(`SELECT count(*)::int AS n FROM (${t.kvRows}) src`);
-    if (sourceRows === 0) {
+    if (sourceRows === 0 && !t.allowEmpty) {
       console.log(`${name}: no kv records to fill from — table left as it is`);
       allOk = false;
       continue;
@@ -507,6 +671,14 @@ for (const name of names) {
       sql.query(`INSERT INTO ${table} (${t.columns}) SELECT ${t.columns} FROM (${t.kvRows}) src` +
         (t.fillOrder ? ` ORDER BY src.${t.fillOrder}` : ''))
     ]);
+  }
+  if (t.verify) {
+    const v = await t.verify(sql, decodeValue);
+    allOk &&= v.ok;
+    console.log(`\n${name}${fill ? ' (filled)' : ''}: ${v.summary}`);
+    v.samples.forEach(s => console.log('  differs:', s));
+    console.log(`  ${v.ok ? 'VERIFIED' : 'VERIFY FAILED'}`);
+    continue;
   }
   const cmp = t.compareColumns || t.columns;
   const tableRows = `SELECT ${cmp} FROM ${table}`;
