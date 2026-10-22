@@ -38,6 +38,8 @@ const { recordColumns, recordValues, recordCompareColumns, toRecord } = await li
 const adcensus = await lib('adcensus.js');
 const adreviews = await lib('adreviews.js');
 const adspendops = await lib('adspendops.js');
+const ordersops = await lib('ordersops.js');
+const specColumnDefs = (spec) => spec.map(([, col, type]) => `${col} ${type}`).join(',\n        ');
 
 // The review records and where each lives in the tables.
 const REVIEW_SLOTS = [
@@ -54,7 +56,8 @@ const GROUPS = {
   adreviews: ['ad-review-runs', 'review-notes', 'brand-postures', 'ad-cron-jobs'],
   // Rollup rows before the year table, whose check reads both back whole.
   adspendops: ['ad-spend-months', 'ad-spend-month-syncs', 'ad-spend-report-queue',
-               'ad-spend-weeks', 'ad-spend-week-years']
+               'ad-spend-weeks', 'ad-spend-week-years'],
+  ordersops: ['orders-sync-status', 'orders-alerts', 'orders-report-queue', 'orders-report-results']
 };
 
 // readMonthV2024's kv reassembly, in SQL: a month record holding its own
@@ -780,6 +783,107 @@ const TABLES = {
       const actual = [];
       for (const r of recs) actual.push(await adspendops.getWeekYear(r.key.split(':')[2]));
       return compareLists(recs.map(r => decodeValue(r.value)), actual);
+    }
+  },
+
+  // ── Orders sync records (lib/ordersops.js) ────────────────────────────
+  // The heartbeat and the sync history it starts. Filled through the app's
+  // own saveHeartbeat, so the current lastSync becomes the first history row.
+  'orders-sync-status': {
+    ddl: ['CREATE TABLE IF NOT EXISTS orders_sync_status (id text)'],
+    async fill(sql, decodeValue) {
+      await sql.transaction([
+        sql.query('DROP TABLE IF EXISTS orders_sync_status, orders_syncs'),
+        sql.query(`CREATE TABLE orders_sync_status (
+          id          text        PRIMARY KEY,
+          ${specColumnDefs(ordersops.STATUS_SPEC)},
+          fields      text[]      NOT NULL,
+          extra       json,
+          updated_at  timestamptz NOT NULL DEFAULT now()
+        )`),
+        sql.query(`CREATE TABLE orders_syncs (
+          id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          ${specColumnDefs(ordersops.SYNC_SPEC)},
+          fields      text[]      NOT NULL,
+          extra       json,
+          recorded_at timestamptz NOT NULL DEFAULT now()
+        )`)
+      ]);
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'orders:v2:last-cron-run'");
+      if (r) await ordersops.saveHeartbeat(decodeValue(r.value));
+    },
+    async verify(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'orders:v2:last-cron-run'");
+      const cmp = compareLists([r ? decodeValue(r.value) : null], [await ordersops.getHeartbeat()]);
+      const [{ n }] = await sql.query('SELECT count(*)::int AS n FROM orders_syncs');
+      return { ok: cmp.diffs === 0, summary: `heartbeat read back: ${cmp.diffs} differ · sync history rows ${n}`, samples: cmp.samples };
+    }
+  },
+
+  'orders-alerts': {
+    allowEmpty: true,
+    ddl: [
+      `CREATE TABLE orders_alerts (
+        position integer PRIMARY KEY,
+        ${specColumnDefs(ordersops.ALERT_SPEC)},
+        fields   text[]  NOT NULL,
+        extra    json
+      )`
+    ],
+    columns: `position, ${recordColumns(ordersops.ALERT_SPEC)}`,
+    compareColumns: `position, ${recordCompareColumns(ordersops.ALERT_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, ${recordValues(ordersops.ALERT_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_array_elements(kv.value::json) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = 'orders:v2:alerts'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'orders:v2:alerts'");
+      return compareLists((r ? decodeValue(r.value) : null) || [], await ordersops.getAlerts());
+    }
+  },
+
+  'orders-report-queue': {
+    allowEmpty: true,   // nothing pending is the normal state
+    ddl: [
+      `CREATE TABLE orders_report_queue (
+        position integer PRIMARY KEY,
+        ${specColumnDefs(ordersops.QUEUE_SPEC)},
+        fields   text[]  NOT NULL,
+        extra    json
+      )`
+    ],
+    columns: `position, ${recordColumns(ordersops.QUEUE_SPEC)}`,
+    compareColumns: `position, ${recordCompareColumns(ordersops.QUEUE_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, ${recordValues(ordersops.QUEUE_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_array_elements(kv.value::json) WITH ORDINALITY AS e(v, ord)
+      WHERE kv.key = 'orders:v2:pending-reports'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'orders:v2:pending-reports'");
+      return compareLists([(r ? decodeValue(r.value) : null) || []], [await ordersops.getQueue()]);
+    }
+  },
+
+  'orders-report-results': {
+    allowEmpty: true,
+    ddl: [
+      `CREATE TABLE orders_report_results (
+        position   integer PRIMARY KEY,
+        report_key text    NOT NULL UNIQUE,
+        ${specColumnDefs(ordersops.RESULT_SPEC)},
+        fields     text[]  NOT NULL,
+        extra      json
+      )`
+    ],
+    columns: `position, report_key, ${recordColumns(ordersops.RESULT_SPEC)}`,
+    compareColumns: `position, report_key, ${recordCompareColumns(ordersops.RESULT_SPEC)}`,
+    kvRows: `SELECT (e.ord - 1)::int AS position, e.k AS report_key,
+        ${recordValues(ordersops.RESULT_SPEC, 'e.v', { aliased: true })}
+      FROM kv, json_each(kv.value::json) WITH ORDINALITY AS e(k, v, ord)
+      WHERE kv.key = 'orders:v2:report-lastresult'`,
+    async apiCheck(sql, decodeValue) {
+      const [r] = await sql.query("SELECT value FROM kv WHERE key = 'orders:v2:report-lastresult'");
+      const fromKv = (r ? decodeValue(r.value) : null) || {};
+      const fromApi = await ordersops.getResults();
+      return compareLists([...Object.entries(fromKv)], [...Object.entries(fromApi)]);
     }
   }
 };

@@ -1,6 +1,7 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
 import * as ordersSql from '../lib/orders.js';
+import * as ordersOps from '../lib/ordersops.js';
 
 export default async function handler(req, res) {
   const { action } = req.query;
@@ -763,11 +764,11 @@ async function handleRequestFlatFileReport(req, res) {
     // Clear stale lastResults entries for freshly-queued tags — a
     // previous failure shouldn't linger in the UI now that we've
     // successfully re-queued.
-    const lastResults = (await kv.get('orders:v2:report-lastresult')) || {};
+    const lastResults = (await _resultsRead()) || {};
     let lrDirty = false;
     if (!orderReport.alreadyPending && lastResults[tag]) { delete lastResults[tag]; lrDirty = true; }
     if (!updateReport.alreadyPending && lastResults[updTag]) { delete lastResults[updTag]; lrDirty = true; }
-    if (lrDirty) await kv.set('orders:v2:report-lastresult', lastResults);
+    if (lrDirty) await _resultsWrite(lastResults);
 
     return res.status(200).json({
       success: true,
@@ -793,14 +794,14 @@ async function handleRequestFlatFileReport(req, res) {
     // can render them.
     if (resultKey) {
       try {
-        const lastResults = (await kv.get('orders:v2:report-lastresult')) || {};
+        const lastResults = (await _resultsRead()) || {};
         lastResults[resultKey] = {
           status: 'FAILED',
           error: errorMsg,
           completedAt: new Date().toISOString(),
           phase: 'request'
         };
-        await kv.set('orders:v2:report-lastresult', lastResults);
+        await _resultsWrite(lastResults);
       } catch { /* best-effort */ }
     }
 
@@ -823,7 +824,7 @@ async function _requestReportForMonth({ tag, name, dataStartTime, dataEndTime, m
                                         reportType = 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL' }) {
   // If a report with this tag is already pending, reuse rather than
   // firing a duplicate at Amazon.
-  const pending = (await kv.get('orders:v2:pending-reports')) || [];
+  const pending = (await _queueRead()) || [];
   const existing = pending.find(p => p.month === tag);
   if (existing) {
     return {
@@ -884,7 +885,7 @@ async function _requestReportForMonth({ tag, name, dataStartTime, dataEndTime, m
     ...(updateOnly ? { updateOnly: true } : {}),
     ...(dependsOn ? { dependsOn } : {})
   }];
-  await kv.set('orders:v2:pending-reports', updated);
+  await _queueWrite(updated);
 
   return { reportId, tag, alreadyPending: false };
 }
@@ -961,7 +962,7 @@ async function handlePollFlatFileReport(req, res) {
 //
 // Returns { collected, stillPending, failed, remaining }.
 async function _pollPendingReports({ overwrite = false, mergeMode = false } = {}) {
-  const pending = (await kv.get('orders:v2:pending-reports')) || [];
+  const pending = (await _queueRead()) || [];
   if (pending.length === 0) {
     return { collected: [], stillPending: [], failed: [], remaining: 0 };
   }
@@ -974,7 +975,7 @@ async function _pollPendingReports({ overwrite = false, mergeMode = false } = {}
   const collected = [];
   const failed = [];
   const stillPending = [];
-  const lastResults = (await kv.get('orders:v2:report-lastresult')) || {};
+  const lastResults = (await _resultsRead()) || {};
 
   for (const p of toProcess) {
     // Ordering guarantee: an update (BY_LAST_UPDATE) report never
@@ -1152,8 +1153,8 @@ async function _pollPendingReports({ overwrite = false, mergeMode = false } = {}
   // Reconstruct queue: newly stillPending (from processed batch) +
   // untouched tail. Collected and failed are removed.
   const nextQueue = [...stillPending, ...untouchedTail];
-  await kv.set('orders:v2:pending-reports', nextQueue);
-  await kv.set('orders:v2:report-lastresult', lastResults);
+  await _queueWrite(nextQueue);
+  await _resultsWrite(lastResults);
 
   // "Last sync" summary for the dashboard blurb: the PT date range the
   // just-collected order-date reports covered and what they loaded.
@@ -1195,8 +1196,8 @@ async function handleListPendingReports(req, res) {
     if (!verify.ok) return res.status(401).json({ error: 'Invalid access token' });
 
     const [pending, lastResults] = await Promise.all([
-      kv.get('orders:v2:pending-reports'),
-      kv.get('orders:v2:report-lastresult')
+      _queueRead(),
+      _resultsRead()
     ]);
 
     return res.status(200).json({
@@ -1256,7 +1257,7 @@ async function handleDeleteV2Months(req, res) {
 
     // 3. Remove from lastResults (so the UI doesn't render stale "N
     // rows" entries for months whose bucket is now empty).
-    const lastResults = (await kv.get('orders:v2:report-lastresult')) || {};
+    const lastResults = (await _resultsRead()) || {};
     let lastResultsChanged = false;
     for (const m of months) {
       if (lastResults[m]) {
@@ -1265,7 +1266,7 @@ async function handleDeleteV2Months(req, res) {
       }
     }
     if (lastResultsChanged) {
-      await kv.set('orders:v2:report-lastresult', lastResults);
+      await _resultsWrite(lastResults);
     }
 
     return res.status(200).json({
@@ -1523,8 +1524,8 @@ async function handleGetAlerts(req, res) {
     if (!verify.ok) return res.status(401).json({ error: 'Invalid access token' });
 
     const [alertsRaw, heartbeat] = await Promise.all([
-      kv.get('orders:v2:alerts'),
-      kv.get('orders:v2:last-cron-run')
+      _alertsRead(),
+      _heartbeatRead()
     ]);
     const alerts = (Array.isArray(alertsRaw) ? alertsRaw : []).filter(a => a && !a.dismissed);
 
@@ -1553,12 +1554,12 @@ async function handleDismissAlert(req, res) {
     const id = req.body?.id;
     if (!id) return res.status(400).json({ error: 'id required in body' });
 
-    const alerts = (await kv.get('orders:v2:alerts')) || [];
+    const alerts = (await _alertsRead()) || [];
     const idx = alerts.findIndex(a => a && a.id === id);
     if (idx < 0) return res.status(404).json({ error: `Alert not found: ${id}` });
 
     alerts[idx] = { ...alerts[idx], dismissed: true, dismissedAt: new Date().toISOString() };
-    await kv.set('orders:v2:alerts', alerts);
+    await _alertsWrite(alerts);
 
     return res.status(200).json({ success: true, id });
   } catch (error) {
@@ -1573,11 +1574,11 @@ async function handleDismissAlert(req, res) {
 // doesn't exist or was already dismissed.
 async function _resolveAlert(id) {
   try {
-    const alerts = (await kv.get('orders:v2:alerts')) || [];
+    const alerts = (await _alertsRead()) || [];
     const idx = alerts.findIndex(a => a && a.id === id && !a.dismissed);
     if (idx < 0) return false;
     alerts[idx] = { ...alerts[idx], dismissed: true, resolvedAt: new Date().toISOString() };
-    await kv.set('orders:v2:alerts', alerts);
+    await _alertsWrite(alerts);
     return true;
   } catch (err) {
     console.warn('[_resolveAlert] KV write failed:', err.message);
@@ -1590,11 +1591,42 @@ async function _resolveAlert(id) {
 // so a cron that only updates requestAt doesn't clobber collectAt.
 async function _touchHeartbeat(patch) {
   try {
-    const current = (await kv.get('orders:v2:last-cron-run')) || {};
-    await kv.set('orders:v2:last-cron-run', { ...current, ...patch });
+    const current = (await _heartbeatRead()) || {};
+    await _heartbeatWrite({ ...current, ...patch });
   } catch (err) {
     console.warn('[_touchHeartbeat] KV write failed:', err.message);
   }
+}
+
+// ─── SYNC RECORD STORAGE ─────────────────────────────────────────────────────
+// The sync's own records — heartbeat, alerts, report queue, last results —
+// from tables when SQL_TABLES includes "ordersops" (lib/ordersops.js),
+// otherwise from the orders:v2:* kv records. Reads return the kv record's
+// shape (null when kv has none; the tables answer [] or {} for an empty list
+// or map, which every caller treats the same).
+function _heartbeatRead() {
+  return ordersOps.ordersOpsInSql() ? ordersOps.getHeartbeat() : kv.get('orders:v2:last-cron-run');
+}
+function _heartbeatWrite(record) {
+  return ordersOps.ordersOpsInSql() ? ordersOps.saveHeartbeat(record) : kv.set('orders:v2:last-cron-run', record);
+}
+function _alertsRead() {
+  return ordersOps.ordersOpsInSql() ? ordersOps.getAlerts() : kv.get('orders:v2:alerts');
+}
+function _alertsWrite(alerts) {
+  return ordersOps.ordersOpsInSql() ? ordersOps.replaceAlerts(alerts) : kv.set('orders:v2:alerts', alerts);
+}
+function _queueRead() {
+  return ordersOps.ordersOpsInSql() ? ordersOps.getQueue() : kv.get('orders:v2:pending-reports');
+}
+function _queueWrite(entries) {
+  return ordersOps.ordersOpsInSql() ? ordersOps.replaceQueue(entries) : kv.set('orders:v2:pending-reports', entries);
+}
+function _resultsRead() {
+  return ordersOps.ordersOpsInSql() ? ordersOps.getResults() : kv.get('orders:v2:report-lastresult');
+}
+function _resultsWrite(results) {
+  return ordersOps.ordersOpsInSql() ? ordersOps.replaceResults(results) : kv.set('orders:v2:report-lastresult', results);
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -1737,7 +1769,7 @@ async function _addAlert({ id, severity = 'error', category, message, details })
   };
 
   try {
-    const existing = (await kv.get('orders:v2:alerts')) || [];
+    const existing = (await _alertsRead()) || [];
     const filtered = existing.filter(a => a && a.id !== id);
     // Cap at 100. When trimming, drop dismissed first, then oldest.
     let combined = [...filtered, alert];
@@ -1753,7 +1785,7 @@ async function _addAlert({ id, severity = 'error', category, message, details })
       ];
       combined = trimmed.slice(-100);
     }
-    await kv.set('orders:v2:alerts', combined);
+    await _alertsWrite(combined);
   } catch (err) {
     console.error('[_addAlert] KV write failed:', err.message);
     // Fall through — still try Slack even if KV failed
