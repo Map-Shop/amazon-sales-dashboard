@@ -1,4 +1,17 @@
 import { kv } from '../lib/kv.js';
+import * as shippingSql from '../lib/shipping.js';
+
+// A month's rows as { rows } (null when kv has no record), and its
+// replacement — from the shipping_costs table when SQL_TABLES includes
+// "shipping", otherwise from the shipping:raw:YYYY-MM kv record.
+async function readMonth(month) {
+  if (shippingSql.shippingInSql()) return { rows: await shippingSql.getMonth(month) };
+  return kv.get(`shipping:raw:${month}`);
+}
+async function writeMonth(month, rows) {
+  if (shippingSql.shippingInSql()) return shippingSql.replaceMonth(month, rows);
+  return kv.set(`shipping:raw:${month}`, { rows });
+}
 
 // ─── ROUTER ──────────────────────────────────────────────────────────────────
 // ShipStation V1 API (ssapi.shipstation.com) with HTTP Basic auth.
@@ -82,7 +95,7 @@ async function handleSync(req, res) {
     const shipments = await fetchAllShipments(start, end, storeId);
     const rows = normalizeShipments(shipments);
 
-    await kv.set(`shipping:raw:${month}`, { rows });
+    await writeMonth(month, rows);
     const index = (await kv.get('shipping:index')) || [];
     if (!index.includes(month)) {
       index.push(month);
@@ -116,7 +129,7 @@ async function handleGet(req, res) {
     if (!/^\d{4}-\d{2}$/.test(month || '')) return res.status(400).json({ error: 'month=YYYY-MM required' });
 
     const [stored, lastSynced] = await Promise.all([
-      kv.get(`shipping:raw:${month}`),
+      readMonth(month),
       kv.get(`shipping:last-synced:${month}`)
     ]);
     return res.status(200).json({
@@ -140,10 +153,14 @@ async function handleGetRange(req, res) {
 
     const index = (await kv.get('shipping:index')) || [];
     const months = index.filter(m => m >= startMonth && m <= endMonth);
-    const buckets = await Promise.all(months.map(m => kv.get(`shipping:raw:${m}`)));
     const rows = [];
-    for (const b of buckets) {
-      if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
+    if (shippingSql.shippingInSql()) {
+      rows.push(...await shippingSql.getMonths(months));
+    } else {
+      const buckets = await Promise.all(months.map(m => kv.get(`shipping:raw:${m}`)));
+      for (const b of buckets) {
+        if (b && Array.isArray(b.rows)) for (const r of b.rows) rows.push(r);
+      }
     }
     return res.status(200).json({ success: true, startMonth, endMonth, months, rows });
   } catch (error) {
@@ -211,13 +228,13 @@ async function handleMigrateFromSheets(req, res) {
     let writtenRows = 0;
     const skippedMonths = [];
     for (const [month, rows] of Object.entries(byMonth)) {
-      const existing = await kv.get(`shipping:raw:${month}`);
+      const existing = await readMonth(month);
       const existingRows = (existing && Array.isArray(existing.rows)) ? existing.rows : [];
       if (existingRows.some(r => r && r.sku)) {
         skippedMonths.push(month);
         continue;
       }
-      await kv.set(`shipping:raw:${month}`, { rows });
+      await writeMonth(month, rows);
       writtenRows += rows.length;
       if (!index.includes(month)) index.push(month);
     }
@@ -311,13 +328,13 @@ async function handleUploadYearlyCsv(req, res) {
     const writtenMonths = [];
     const skippedMonths = [];
     for (const [month, rows] of Object.entries(byMonth)) {
-      const existing = await kv.get(`shipping:raw:${month}`);
+      const existing = await readMonth(month);
       const existingRows = (existing && Array.isArray(existing.rows)) ? existing.rows : [];
       if (existingRows.some(rw => rw && rw.sku)) {
         skippedMonths.push(month);
         continue;
       }
-      await kv.set(`shipping:raw:${month}`, { rows });
+      await writeMonth(month, rows);
       writtenRows += rows.length;
       writtenMonths.push(month);
       if (!index.includes(month)) index.push(month);
@@ -390,11 +407,11 @@ async function handleDeleteSheetsRows(req, res) {
     const { month } = req.body || {};
     if (!/^\d{4}-\d{2}$/.test(month || '')) return res.status(400).json({ error: 'month=YYYY-MM required' });
 
-    const stored = await kv.get(`shipping:raw:${month}`);
+    const stored = await readMonth(month);
     const rows = (stored && Array.isArray(stored.rows)) ? stored.rows : [];
     const before = rows.length;
     const kept = rows.filter(r => r && typeof r.sku === 'string' && r.sku.length > 0);
-    await kv.set(`shipping:raw:${month}`, { rows: kept });
+    await writeMonth(month, kept);
     return res.status(200).json({
       success: true, month,
       before: { rows: before, totalCost: round2(rows.reduce((s, r) => s + (r.cost || 0), 0)) },
