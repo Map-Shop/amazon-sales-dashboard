@@ -6,9 +6,13 @@
 //   node tools/to-sql.mjs <table|all> --fill
 // Tables: orders, shipping, sessions, pricechanges, changelog, products,
 // mappings, adspend, transactions (three tables, filled together). The
-// target is the dev database (DATABASE_URL_DEV in .env.local), e.g. to
-// rebuild the tables after resetting the Neon dev branch from production.
-// Nothing here prints a credential.
+// target is the dev database (DATABASE_URL_DEV in .env.local). Nothing here
+// prints a credential.
+//
+// Production's kv data records were deleted once the tables were live, so a
+// dev branch reset from production already has the tables and needs no
+// fill; a fill refuses any table whose kv records are gone rather than
+// rebuild it empty.
 //
 // --fill DROPS and recreates each table from the kv records, in one
 // transaction. Production was filled this way once, just before it switched
@@ -488,6 +492,15 @@ for (const name of names) {
   const t = TABLES[name];
   const table = t.ddl[0].match(/CREATE TABLE (\w+)/)[1];
   if (fill) {
+    // Never rebuild a table from nothing. Production's kv data records were
+    // deleted after the switch, so a dev branch reset from production has the
+    // tables but no records to fill them from.
+    const [{ n: sourceRows }] = await sql.query(`SELECT count(*)::int AS n FROM (${t.kvRows}) src`);
+    if (sourceRows === 0) {
+      console.log(`${name}: no kv records to fill from — table left as it is`);
+      allOk = false;
+      continue;
+    }
     await sql.transaction([
       sql.query(`DROP TABLE IF EXISTS ${table}`),
       ...t.ddl.map(d => sql.query(d)),
