@@ -1100,11 +1100,19 @@ const MAX_REPORT_DAYS = 31;
 //
 // Only the monthly review reaches anywhere near these. The weekly and the
 // bi-weekly never ask for anything older than about 36 days.
-const REPORT_RETENTION_DAYS = { sp: 95, sb: 60 };
+//
+// spSearchTerm is SHORTER than the campaign report it is derived from, and
+// Amazon does not say so: asked for 2026-08-01..08-31 on 23 October it
+// returned the 13 days from the 19th and reported success. 23 October minus
+// 65 days is 19 August. A clipped report reads as a quiet, incomplete month,
+// which is why every pull now records the range it actually came back with.
+const REPORT_RETENTION_DAYS = { sp: 95, sb: 60, spSearchTerm: 65 };
 
-// The oldest date a report of this type can still cover.
-function reportRetentionStart(product, nowInstant) {
-  const days = REPORT_RETENTION_DAYS[product];
+// The oldest date a report of this type can still cover. `key` is an ad
+// product for the campaign reports, or a reportTypeId where that type keeps
+// its own, shorter history.
+function reportRetentionStart(key, nowInstant) {
+  const days = REPORT_RETENTION_DAYS[key];
   if (!days) return null;
   return _addDays(_ptDate(nowInstant || new Date()), -days);
 }
@@ -2191,13 +2199,17 @@ function buildReportBody(product, start, end, columns, shape = {}) {
     throw new Error(`report window ${start}..${end} is ${daySpan(start, end)} days, ` +
                     `over Amazon's ${MAX_REPORT_DAYS}-day limit`);
   }
-  // Past retention Amazon has nothing to give, and says so as an opaque 400
-  // after the request has already cost quota. Named here instead.
-  const floor = reportRetentionStart(product);
+  // Past retention Amazon has nothing to give. For most report types it says
+  // so as an opaque 400 after the request has already cost quota; for search
+  // terms it says nothing at all and returns a short month. Named here either
+  // way, against whichever retention this report type actually has.
+  const retentionKey = (shape.reportTypeId && REPORT_RETENTION_DAYS[shape.reportTypeId])
+    ? shape.reportTypeId : product;
+  const floor = reportRetentionStart(retentionKey);
   if (floor && start < floor) {
     throw new Error(`report window ${start}..${end} starts before Amazon keeps ` +
-                    `${product.toUpperCase()} report data, which reaches back ` +
-                    `${REPORT_RETENTION_DAYS[product]} days to ${floor}`);
+                    `${retentionKey} report data, which reaches back ` +
+                    `${REPORT_RETENTION_DAYS[retentionKey]} days to ${floor}`);
   }
   // RF_COLUMNS has no Sponsored Brands set any more, so an SB report must name
   // its own columns. Caught here rather than sending `columns: undefined`.
@@ -5202,21 +5214,35 @@ function stDefaultMonth(today) {
   return ym;
 }
 
-// Months that can still be asked for: settled, and starting inside the 95 days
-// Amazon keeps. The far end of this list expires — a month that drops off it
-// is gone for good, which is the whole reason to pull early.
+// Months that can still be asked for, and how much of each Amazon still has.
+//
+// A month at the edge of retention is offered with its window clamped to the
+// floor rather than hidden: half a month is worth capturing, and the rows that
+// come back are dated, so a short month is visible rather than assumed whole.
+//
+//   clipsAt  the day this month starts losing its first days
+//   expires  the day the last of it goes
 function stPullableMonths(today) {
-  const floor = reportRetentionStart('sp', new Date(`${today}T12:00:00Z`));
+  const floor = stRetentionFloor(today);
+  const days = REPORT_RETENTION_DAYS[ST_REPORT_KEY];
   const out = [];
   let ym = today.slice(0, 7);
   for (let i = 0; i < 6; i++) {
     ym = moShiftMonth(ym, -1);
     const { start, end } = moMonthBounds(ym);
     if (!stMonthSettled(ym, today)) continue;
-    if (floor && start < floor) break;
-    out.push({ month: ym, start, end, expires: _addDays(start, REPORT_RETENTION_DAYS.sp) });
+    if (floor && end < floor) break;          // nothing of it left
+    const from = (floor && start < floor) ? floor : start;
+    out.push({
+      month: ym, start: from, end, monthStart: start, partial: from !== start,
+      clipsAt: _addDays(start, days), expires: _addDays(end, days)
+    });
   }
   return out;
+}
+
+function stRetentionFloor(today) {
+  return reportRetentionStart(ST_REPORT_KEY, new Date(`${today}T12:00:00Z`));
 }
 
 // Validates the month a caller asked for and returns its window. The refusals
@@ -5230,13 +5256,18 @@ function stResolveMonth(raw, today) {
                     `crediting sales to a click for 7 days, so this month is complete on ` +
                     `${_addDays(end, ST_SETTLE_DAYS)}.` };
   }
-  const floor = reportRetentionStart('sp', new Date(`${today}T12:00:00Z`));
-  if (floor && start < floor) {
-    return { error: `${moMonthLabel(month)} is past Amazon's ${REPORT_RETENTION_DAYS.sp}-day ` +
-                    `report retention, which now reaches back to ${floor}. That month can no ` +
+  const days = REPORT_RETENTION_DAYS[ST_REPORT_KEY];
+  const floor = stRetentionFloor(today);
+  if (floor && end < floor) {
+    return { error: `${moMonthLabel(month)} is past Amazon's ${days}-day search term ` +
+                    `retention, which now reaches back to ${floor}. That month can no ` +
                     `longer be pulled.` };
   }
-  return { month, start, end };
+  // Clamped, not refused: Amazon would return these days and silently drop the
+  // rest, so the request says what is actually being asked for and the answer
+  // can be checked against it.
+  const from = (floor && start < floor) ? floor : start;
+  return { month, start: from, end, monthStart: start, partial: from !== start };
 }
 
 const stNum = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
@@ -5365,17 +5396,28 @@ async function handleSearchTermsCollect(req, res) {
       });
     }
 
-    await searchTerms.replaceMonth(ST_PRODUCT, m.month, rows);
+    // Only the days this report actually carried are rewritten — see
+    // replaceRange. What came back is compared with what was asked for
+    // below, because Amazon reports a clipped month as a successful one.
+    const covered = await searchTerms.replaceRange(ST_PRODUCT, m.month, rows);
     const stats = await searchTerms.monthStats(ST_PRODUCT, m.month);
     await searchTerms.recordPull({
       adProduct: ST_PRODUCT, month: m.month, windowStart: m.start, windowEnd: m.end,
+      coveredStart: covered.from, coveredEnd: covered.to,
       rows: stats.rows, zeroClick: stats.zeroClick, terms: stats.terms,
       clicks: stats.clicks, cost: stats.cost, dataBytes: stats.dataBytes
     });
     const size = await searchTerms.tableBytes();
 
+    const short = covered.from && covered.from > m.monthStart;
     return res.status(200).json({
       success: true, month: m.month, window: { start: m.start, end: m.end },
+      monthStart: m.monthStart, covered, short,
+      shortNote: short
+        ? `Amazon returned ${moMonthLabel(m.month)} from ${covered.from} onward. ` +
+          `Its search term history reaches back ${REPORT_RETENTION_DAYS[ST_REPORT_KEY]} days, ` +
+          'so the earlier days are gone.'
+        : null,
       returned: Array.isArray(raw) ? raw.length : 0,
       stored: rows.length, stats, size,
       collectedAt: new Date().toISOString()

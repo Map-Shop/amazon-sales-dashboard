@@ -190,7 +190,8 @@
         stOffset = 0;
         const s = data.stats || {};
         await stFetch(`Stored ${formatCount(s.rows || 0)} rows for ${stMonthLabel(data.month)} — ` +
-                      `${stPct(s.zeroClick, s.rows)} of them never got a click.`);
+                      `${stPct(s.zeroClick, s.rows)} of them never got a click.` +
+                      (data.shortNote ? ` ${data.shortNote}` : ''));
       } catch (err) {
         console.error('[ST] collect failed:', err);
         // The download URL is short-lived, so a failed collect means re-running.
@@ -273,7 +274,7 @@
           <select data-st-pull>
             ${pullable.map(p => `<option value="${escapeHtml(p.month)}"${
               p.month === stPullMonth ? ' selected' : ''}>${escapeHtml(stMonthLabel(p.month))}${
-              stored.has(p.month) ? ' (stored)' : ''} · expires ${escapeHtml(p.expires)}</option>`).join('')}
+              stored.has(p.month) ? ' (stored)' : ''} · ${escapeHtml(stReachLabel(p))}</option>`).join('')}
           </select>
         </label>`;
     }
@@ -287,8 +288,17 @@
         `<div class="wk-stat"><span class="wk-stat-label">${label}</span>
            <span class="wk-stat-value">${value}</span>${
              hint ? `<span class="arf-muted" style="font-size: 0.7rem;">${hint}</span>` : ''}</div>`;
+      const covers = s.coveredStart && s.coveredEnd
+        ? `${s.coveredStart} to ${s.coveredEnd}` : '—';
       return `
+        ${s.partial ? `<div class="card bw-newer" style="margin-bottom: 1.25rem;">
+          <div><strong>This month is short.</strong>
+            <span class="arf-muted">Amazon had it only from ${escapeHtml(s.coveredStart)}.
+            Its search term history reaches back about 65 days, and the earlier days of
+            ${escapeHtml(stMonthLabel(s.month))} were already gone when it was pulled.</span></div>
+        </div>` : ''}
         <div class="card card-flat wk-stats">
+          ${cell('Covers', covers, s.partial ? 'short of the month' : 'the whole month')}
           ${cell('Rows', formatCount(s.rows || 0))}
           ${cell('Distinct terms', formatCount(s.terms || 0))}
           ${cell('Never clicked', stPct(s.zeroClick, s.rows), `${formatCount(s.zeroClick || 0)} rows`)}
@@ -376,7 +386,9 @@
         <div class="card card-flat arf-footer">
           <div class="arf-muted">Sponsored Products only. Rows are kept per day, because Amazon
             credits a sale to the day of the click for 7 days afterwards — so a month can be
-            pulled again later to collect the conversions that had not landed yet.</div>
+            pulled again later to collect the conversions that had not landed yet. A second pull
+            rewrites only the days it brings back, so one made after Amazon has dropped the start
+            of a month tops it up rather than trimming it.</div>
           ${pulls.length > 1
             ? `<div class="arf-muted">Stored: ${pulls.map(p =>
                 `${escapeHtml(stMonthLabel(p.month))} (${formatCount(p.rows)})`).join(' · ')}</div>`
@@ -440,6 +452,14 @@
         line += ' Amazon has not started it yet; its report queue is backed up.';
       }
       return line;
+    }
+
+    // How much of a month Amazon can still answer for. `clipsAt` is the day it
+    // starts losing its first days; `expires` the day the last of it goes.
+    function stReachLabel(p) {
+      return p.partial
+        ? `only from ${p.start} · all gone ${p.expires}`
+        : `complete until ${p.clipsAt}`;
     }
 
     function stMonthLabel(ym) {

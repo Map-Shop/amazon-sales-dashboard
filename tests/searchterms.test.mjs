@@ -35,43 +35,59 @@ console.log('\nSETTLING  — a month is complete a week after it ends');
 
 // ─── WHAT CAN STILL BE ASKED FOR ─────────────────────────────────────────────
 
-console.log('\nRETENTION  — the months Amazon will still answer for');
+console.log('\nRETENTION  \u2014 65 days of search terms, not the 95 a campaign report keeps');
+
+// Read off Amazon itself: asked for August on 23 October it returned the 19th
+// onward and called that a success. 23 October minus 65 days is 19 August.
+ok(M.REPORT_RETENTION_DAYS.spSearchTerm === 65 && M.REPORT_RETENTION_DAYS.sp === 95,
+   'the search term report has its own, shorter retention',
+   'one number for both is what let a short month through');
 
 {
   const months = M.stPullableMonths('2026-10-23');
-  const names = months.map(m => m.month);
-  ok(names.includes('2026-09') && names.includes('2026-08'),
-     'on 23 October, September and August are both reachable', names.join(', '));
-  ok(!names.includes('2026-07'),
-     'July is not — it starts before the 95-day floor',
-     'and nothing can bring it back');
-  ok(!names.includes('2026-10'), 'nor is October, which has not ended');
+  const by = Object.fromEntries(months.map(m => [m.month, m]));
 
-  const aug = months.find(m => m.month === '2026-08');
-  ok(aug.expires === '2026-11-04',
-     'August is dated with the day it falls out of reach', aug.expires);
-  ok(aug.start === '2026-08-01' && aug.end === '2026-08-31',
-     'and carries the whole calendar month as its window');
+  ok(!!by['2026-09'] && by['2026-09'].partial === false,
+     'on 23 October September is whole');
+  ok(by['2026-09'].clipsAt === '2026-11-05' && by['2026-09'].expires === '2026-12-04',
+     'and is dated with when it starts losing days and when the last of it goes',
+     `${by['2026-09'].clipsAt} / ${by['2026-09'].expires}`);
+
+  ok(!!by['2026-08'] && by['2026-08'].partial === true,
+     'August is still offered, and marked short',
+     'half a month is worth capturing, so it is clamped rather than hidden');
+  ok(by['2026-08'].start === '2026-08-19' && by['2026-08'].monthStart === '2026-08-01',
+     'clamped to the oldest day Amazon still has', by['2026-08'].start);
+  ok(by['2026-08'].expires === '2026-11-04', 'with the day the rest of it goes', by['2026-08'].expires);
+
+  ok(!by['2026-07'], 'July is gone entirely and is not offered');
+  ok(!by['2026-10'], 'and October has not finished crediting');
 }
 
 {
-  // One day later than August's expiry.
-  const names = M.stPullableMonths('2026-11-05').map(m => m.month);
-  ok(!names.includes('2026-08'), 'the day after it expires, August is gone from the list');
-  ok(names.includes('2026-09'), 'while September still is', names.join(', '));
-  ok(!names.includes('2026-10'),
-     'and October is not offered yet, four days before it finishes crediting',
-     'settling and expiry are different clocks, and a month can be outside both');
+  // Two weeks later, August has gone entirely.
+  const by = Object.fromEntries(M.stPullableMonths('2026-11-06').map(m => [m.month, m]));
+  ok(!by['2026-08'], 'after 4 November, August is no longer offered at all');
+  ok(!!by['2026-09'] && by['2026-09'].partial === true,
+     'and September has started losing its own first days',
+     'which is five weeks earlier than the 95-day number implied');
 }
 
-console.log('\nstResolveMonth  — the refusals that would otherwise cost a report request');
+console.log('\nstResolveMonth  \u2014 the refusals, and the clamp');
 
 {
   const r = M.stResolveMonth('2026-09', '2026-10-23');
-  ok(!r.error && r.start === '2026-09-01' && r.end === '2026-09-30',
-     'a settled month inside retention resolves to its calendar bounds');
+  ok(!r.error && r.start === '2026-09-01' && r.end === '2026-09-30' && r.partial === false,
+     'a month Amazon holds whole resolves to its calendar bounds');
   ok(M.stResolveMonth('', '2026-10-23').month === '2026-09',
      'no month given falls back to the most recent settled one');
+}
+
+{
+  const r = M.stResolveMonth('2026-08', '2026-10-23');
+  ok(!r.error && r.start === '2026-08-19' && r.monthStart === '2026-08-01' && r.partial === true,
+     'a month Amazon holds only part of is CLAMPED, not refused',
+     'asking for days it has already dropped is how a short month passes for a whole one');
 }
 
 {
@@ -87,12 +103,9 @@ console.log('\nstResolveMonth  — the refusals that would otherwise cost a repo
 
 {
   const r = M.stResolveMonth('2026-06', '2026-10-23');
-  ok(!!r.error && /95/.test(r.error) && /no longer be pulled/.test(r.error),
-     'a month past retention is refused in those words',
-     'the alternative is an opaque 400 from Amazon after the request has cost quota');
+  ok(!!r.error && /65/.test(r.error) && /no longer be pulled/.test(r.error),
+     'a month past retention is refused in those words, with the right number', r.error);
 }
-
-// ─── THE REPORT ──────────────────────────────────────────────────────────────
 
 console.log('\nTHE REQUEST  — what is actually asked of Amazon');
 
@@ -129,6 +142,26 @@ console.log('\nTHE REQUEST  — what is actually asked of Amazon');
   } catch (e) { threw = e.message; }
   ok(/31-day limit/.test(threw),
      'a window over 31 days is refused here rather than at Amazon', threw);
+}
+
+{
+  // Relative to today, so this holds whenever it runs: 80 days back is inside
+  // the campaign report's 95 and outside the search term report's 65.
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const shape = { groupBy: ['searchTerm'], reportTypeId: M.ST_REPORT_KEY };
+  const tryBody = (start, end, sh) => {
+    try { M.buildReportBody('sp', start, end, M.ST_REPORT_COLUMNS, sh); return ''; }
+    catch (e) { return e.message; }
+  };
+
+  ok(tryBody(daysAgo(80), daysAgo(60)) === '',
+     'a campaign report may still reach back 80 days');
+  const clipped = tryBody(daysAgo(80), daysAgo(60), shape);
+  ok(/65/.test(clipped) && /spSearchTerm/.test(clipped),
+     'the same window as a search term report is refused, naming its own retention',
+     clipped);
+  ok(tryBody(daysAgo(50), daysAgo(40), shape) === '',
+     'and 50 days back is fine for either');
 }
 
 // ─── THE ANSWER ──────────────────────────────────────────────────────────────
@@ -238,6 +271,19 @@ for (const [label, opts] of [
   ok(q.count.params[3] === null && /\$4::text IS NULL/.test(q.count.text),
      'with no term filter the parameter is null and typed in the statement',
      'an untyped null is the other half of the same Postgres refusal');
+}
+
+console.log('\nCOVERAGE  \u2014 what a pull actually brought back');
+
+{
+  const { coveredRange } = await import('../lib/searchterms.js');
+  const r = coveredRange([{ date: '2026-08-24' }, { date: '2026-08-19' }, { date: '2026-08-31' }]);
+  ok(r.from === '2026-08-19' && r.to === '2026-08-31',
+     'the first and last day present in the rows',
+     'which is what says a month came back short, since Amazon does not');
+  ok(coveredRange([]).from === null, 'no rows cover nothing');
+  ok(coveredRange([{ clicks: 1 }, { date: '2026-09-02' }]).from === '2026-09-02',
+     'a row with no date does not drag the range to nothing');
 }
 
 cleanup();
