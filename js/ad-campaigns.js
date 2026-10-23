@@ -98,7 +98,7 @@
 
     const ACO_VISIBLE = ACO_COLUMNS.filter(c => !c.hidden);
 
-    let acoData = { campaigns: [], portfolios: [], changes: [], meta: null, syncedAt: null };
+    let acoData = { campaigns: [], portfolios: [], meta: null, syncedAt: null };
     let acoFilters = {};
     let acoSearch = '';
     let acoOnlyEnabled = true;   // most of the time you only care about what's running
@@ -128,6 +128,7 @@
     function loadAdCampaigns() {
       const container = document.getElementById('adcampaigns-content');
       if (!container) return;
+      acoShowTab(acoTabSaved());
 
       if (!accessToken) {
         container.innerHTML = '<div style="padding: 4rem; text-align: center; color: var(--text-secondary);">Sign in to view campaigns.</div>';
@@ -144,7 +145,7 @@
           if (!res.ok) throw new Error(data.error || `Failed to load (${res.status})`);
           acoData = {
             campaigns: data.campaigns || [], portfolios: data.portfolios || [],
-            changes: data.changes || [], meta: data.meta || null, syncedAt: data.syncedAt || null,
+            meta: data.meta || null, syncedAt: data.syncedAt || null,
             knownBrands: data.knownBrands || []
           };
           acoRender();
@@ -232,7 +233,7 @@
         acoFlashBlock() + acoStats() + acoSyncProblems() + acoCoverageNotes() + acoCoverageBanner() + acoToolbar() +
         '<div id="aco-table-wrap"></div>' +
         '<div id="aco-save-bar" style="display: none;"></div>' +
-        acoChangesCard() + acoCoverageDetails() + '<div id="aco-diagnostic"></div>';
+        acoCoverageDetails() + '<div id="aco-diagnostic"></div>';
 
       acoRenderTable();
       acoRenderSaveBar();
@@ -1083,28 +1084,183 @@
       return `<span style="color: ${color};" title="${escapeHtml(state || '')}">${escapeHtml(acoLabel('state', state) || '—')}</span>`;
     }
 
-    function acoChangesCard() {
-      const rows = (acoData.changes || []).slice().reverse();
-      if (!rows.length) return '';
+    // ─── TABS ────────────────────────────────────────────────────────────────
+    // Campaigns (the table) and Change log. The table loads with the page
+    // either way; the log loads whenever its tab is shown. The tab is
+    // remembered per browser, as the Cadences page remembers its own.
+    function acoShowTab(tab) {
+      if (tab !== 'changes') tab = 'campaigns';
+      document.querySelectorAll('.aco-subtab').forEach(el => { el.style.display = 'none'; });
+      document.querySelectorAll('#adcampaigns-page .tab').forEach(b => b.classList.remove('active'));
+      const panel = document.getElementById(`aco-panel-${tab}`);
+      const button = document.getElementById(`aco-tab-${tab}`);
+      if (panel) panel.style.display = 'block';
+      if (button) button.classList.add('active');
+      try { localStorage.setItem('currentAcoTab', tab); } catch (e) { /* storage unavailable */ }
+      if (tab === 'changes') acoLoadChanges();
+    }
+
+    function acoTabSaved() {
+      try {
+        return localStorage.getItem('currentAcoTab') === 'changes' ? 'changes' : 'campaigns';
+      } catch (e) { return 'campaigns'; }
+    }
+
+    // ─── CHANGE LOG ──────────────────────────────────────────────────────────
+    // Every recorded change, newest first, searched on the server
+    // (/api/adcampaigns?action=changes). The controls render once; typing or
+    // picking a filter re-fetches and redraws only the results, so the search
+    // box keeps its focus.
+
+    // Where a change was made. Edits from the dashboard carry the page they
+    // came from (recorded since 2026-10-22; earlier ones say only
+    // "Dashboard"); a change with no source was found by a refresh, so it was
+    // made somewhere else — the Ads Console, say.
+    const ACO_MADE_FROM = {
+      weekly: 'Weekly review', biweekly: 'Bi-weekly review', monthly: 'Monthly review',
+      campaigns: 'Campaign Overview', dashboard: 'Dashboard', detected: 'Detected at refresh'
+    };
+    const ACO_LOG_MONEY = new Set(['dailyBudget', 'defaultBid']);
+
+    let acoLog = { q: '', field: '', madeFrom: '', from: '', to: '' };
+    let acoLogFields = [];
+    let acoLogRequest = 0;   // only the latest search's answer is drawn
+    let acoLogTimer = null;
+
+    function acoMadeFrom(r) {
+      if (r.source !== 'edit') return ACO_MADE_FROM.detected;
+      return ACO_MADE_FROM[r.origin] || ACO_MADE_FROM.dashboard;
+    }
+
+    function acoLogValue(field, value) {
+      if (value === null || value === undefined || value === '') return '—';
+      if (ACO_LOG_MONEY.has(field) && typeof value === 'number') return '$' + formatNumber(value);
+      return acoLabel(field, value);
+    }
+
+    // The day it was recorded, and for a dashboard edit the time it was made.
+    // A refresh only knows the day it noticed the change, so no time is shown.
+    function acoLogWhen(r) {
+      const day = r.ptDate || '';
+      if (r.source !== 'edit' || !r.at) return day;
+      const time = new Date(r.at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+      return `${day} · ${time}`;
+    }
+
+    function acoLoadChanges() {
+      const container = document.getElementById('aco-changes-content');
+      if (!container) return;
+      if (!accessToken) {
+        container.innerHTML = '<div style="padding: 4rem; text-align: center; color: var(--text-secondary);">Sign in to view the change log.</div>';
+        return;
+      }
+      if (!document.getElementById('aco-log-results')) {
+        container.innerHTML = acoLogControls() + '<div id="aco-log-results"></div>';
+        acoBindLogControls();
+      }
+      acoFetchChanges();
+    }
+
+    function acoLogFieldOptions() {
+      const fields = acoLogFields.includes(acoLog.field) || !acoLog.field ? acoLogFields : [...acoLogFields, acoLog.field];
+      return `<option value="">Change: any</option>` + fields.map(f =>
+        `<option value="${escapeHtml(f)}"${acoLog.field === f ? ' selected' : ''}>${escapeHtml(ACO_FIELD_LABELS[f] || f)}</option>`).join('');
+    }
+
+    function acoLogControls() {
+      const made = ['weekly', 'biweekly', 'monthly', 'campaigns', 'dashboard', 'detected'].map(k =>
+        `<option value="${k}"${acoLog.madeFrom === k ? ' selected' : ''}>${
+          escapeHtml(k === 'dashboard' ? 'Dashboard (page not recorded)' : ACO_MADE_FROM[k])}</option>`).join('');
       return `
-        <div class="card card-flat" style="margin-top: 1.5rem;">
-          <details>
-            <summary style="cursor: pointer; font-weight: 600;">Recent settings changes (${rows.length})</summary>
-            <div style="margin-top: 1rem; overflow-x: auto;">
-              <table>
-                <thead><tr><th>When</th><th>Campaign</th><th>Field</th><th>From</th><th>To</th></tr></thead>
-                <tbody>${rows.slice(0, 50).map(r => `
-                  <tr>
-                    <td>${escapeHtml(r.ptDate || '')}</td>
-                    <td>${escapeHtml(r.name || r.campaignId)}</td>
-                    <td>${escapeHtml(ACO_FIELD_LABELS[r.field] || r.field)}</td>
-                    <td>${escapeHtml(r.from === null || r.from === undefined ? '—' : r.from)}</td>
-                    <td>${escapeHtml(r.to === null || r.to === undefined ? '—' : r.to)}</td>
-                  </tr>`).join('')}
-                </tbody>
-              </table>
-            </div>
-          </details>
+        <div class="catalog-toolbar" style="flex-wrap: wrap; gap: 0.75rem;">
+          <div class="aco-filter-row">
+            <input type="search" id="aco-log-q" placeholder="Search campaign name or ID…" value="${escapeHtml(acoLog.q)}">
+            <select class="catalog-filter-select" id="aco-log-field">${acoLogFieldOptions()}</select>
+            <select class="catalog-filter-select" id="aco-log-made">
+              <option value="">Made from: anywhere</option>${made}
+            </select>
+            <label class="aco-log-date">From <input type="date" id="aco-log-from" value="${escapeHtml(acoLog.from)}"></label>
+            <label class="aco-log-date">To <input type="date" id="aco-log-to" value="${escapeHtml(acoLog.to)}"></label>
+          </div>
+          <div class="aco-toolbar-actions">
+            <button class="btn btn-secondary" id="aco-log-clear" type="button">Clear</button>
+          </div>
+        </div>`;
+    }
+
+    function acoBindLogControls() {
+      const searchBox = document.getElementById('aco-log-q');
+      searchBox.addEventListener('input', e => {
+        acoLog.q = e.target.value;
+        clearTimeout(acoLogTimer);
+        acoLogTimer = setTimeout(acoFetchChanges, 250);
+      });
+      [['aco-log-field', 'field'], ['aco-log-made', 'madeFrom'], ['aco-log-from', 'from'], ['aco-log-to', 'to']].forEach(([id, key]) => {
+        document.getElementById(id).addEventListener('change', e => { acoLog[key] = e.target.value; acoFetchChanges(); });
+      });
+      document.getElementById('aco-log-clear').addEventListener('click', () => {
+        acoLog = { q: '', field: '', madeFrom: '', from: '', to: '' };
+        document.getElementById('aco-changes-content').innerHTML = acoLogControls() + '<div id="aco-log-results"></div>';
+        acoBindLogControls();
+        acoFetchChanges();
+      });
+    }
+
+    function acoFetchChanges() {
+      const results = document.getElementById('aco-log-results');
+      if (!results || !accessToken) return;
+      const request = ++acoLogRequest;
+      const params = new URLSearchParams({ action: 'changes' });
+      for (const [key, value] of Object.entries(acoLog)) if (value.trim()) params.set(key, value.trim());
+      if (!results.innerHTML) results.innerHTML = '<div style="padding: 3rem; text-align: center; color: var(--text-secondary);">Loading the change log…</div>';
+
+      fetch(`/api/adcampaigns?${params}`, { headers: { Authorization: `Bearer ${accessToken}` } })
+        .then(async res => {
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.error || `Failed to load (${res.status})`);
+          if (request !== acoLogRequest) return;
+          acoLogFields = data.fields || [];
+          const fieldSelect = document.getElementById('aco-log-field');
+          if (fieldSelect) fieldSelect.innerHTML = acoLogFieldOptions();
+          acoRenderChanges(data);
+        })
+        .catch(err => {
+          if (request !== acoLogRequest) return;
+          console.error('[ACO] change log failed:', err);
+          results.innerHTML = `<div style="padding: 3rem; text-align: center; color: var(--error);">Error: ${escapeHtml(err.message)}</div>`;
+        });
+    }
+
+    function acoRenderChanges(data) {
+      const results = document.getElementById('aco-log-results');
+      if (!results) return;
+      const rows = data.rows || [];
+      const searching = Object.values(acoLog).some(v => v.trim());
+      if (!rows.length) {
+        results.innerHTML = `<div style="padding: 3rem; text-align: center; color: var(--text-secondary);">${
+          searching ? 'No changes match.' : 'No changes recorded yet.'}</div>`;
+        return;
+      }
+      const count = data.total > rows.length
+        ? `Showing the newest ${rows.length} of ${data.total} changes. Narrow the search to see older ones.`
+        : `${data.total} change${data.total === 1 ? '' : 's'}`;
+      results.innerHTML = `
+        <div style="color: var(--text-secondary); font-size: 0.8125rem; margin-bottom: 0.75rem;">${escapeHtml(count)}</div>
+        <div class="card card-flat" style="overflow-x: auto;">
+          <table>
+            <thead><tr><th>When</th><th>Campaign</th><th>Type</th><th>Change</th><th>From</th><th>To</th><th>Made from</th></tr></thead>
+            <tbody>${rows.map(r => `
+              <tr>
+                <td style="white-space: nowrap;">${escapeHtml(acoLogWhen(r))}</td>
+                <td title="${escapeHtml(r.campaignId || '')}">${escapeHtml(r.name || r.campaignId || '')}</td>
+                <td>${escapeHtml(r.adProduct || '')}</td>
+                <td>${escapeHtml(ACO_FIELD_LABELS[r.field] || r.field || '')}</td>
+                <td>${escapeHtml(acoLogValue(r.field, r.from))}</td>
+                <td>${escapeHtml(acoLogValue(r.field, r.to))}</td>
+                <td style="white-space: nowrap;">${escapeHtml(acoMadeFrom(r))}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
         </div>`;
     }
 

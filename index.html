@@ -1924,6 +1924,10 @@
       <div class="page-header">
         <div class="page-header-top">
           <h2 class="section-title">Campaign Overview</h2>
+          <div class="tabs">
+            <button class="tab active" id="aco-tab-campaigns" onclick="acoShowTab('campaigns')">Campaigns</button>
+            <button class="tab" id="aco-tab-changes" onclick="acoShowTab('changes')">Change log</button>
+          </div>
           <div style="display: flex; align-items: center; gap: 1rem;">
             <div id="adcampaigns-blurb" class="header-data-blurb"></div>
             <button class="btn btn-primary" id="aco-refresh-btn" onclick="acoRefresh(false)">Refresh from Amazon</button>
@@ -1931,16 +1935,23 @@
         </div>
       </div>
 
-      <div style="color: var(--text-secondary); font-size: 0.8125rem; margin-bottom: 1rem;">
-        Grouped by Amazon portfolio. Campaign settings only &mdash; not joined to SKU or profitability data.
-        <span style="margin-left: 0.75rem;">
-          <a id="aco-probe-btn" onclick="acoProbe()" style="cursor: pointer; text-decoration: underline;">Raw API probe</a>
-          &nbsp;&middot;&nbsp;
-          <a id="aco-dry-btn" onclick="acoRefresh(true)" style="cursor: pointer; text-decoration: underline;">Dry run</a>
-        </span>
+      <div id="aco-panel-campaigns" class="aco-subtab">
+        <div style="color: var(--text-secondary); font-size: 0.8125rem; margin-bottom: 1rem;">
+          Grouped by Amazon portfolio. Campaign settings only &mdash; not joined to SKU or profitability data.
+          <span style="margin-left: 0.75rem;">
+            <a id="aco-probe-btn" onclick="acoProbe()" style="cursor: pointer; text-decoration: underline;">Raw API probe</a>
+            &nbsp;&middot;&nbsp;
+            <a id="aco-dry-btn" onclick="acoRefresh(true)" style="cursor: pointer; text-decoration: underline;">Dry run</a>
+          </span>
+        </div>
+
+        <div id="adcampaigns-content"></div>
       </div>
 
-      <div id="adcampaigns-content"></div>
+      <!-- Every recorded campaign change, searchable (js/ad-campaigns.js). -->
+      <div id="aco-panel-changes" class="aco-subtab" style="display: none;">
+        <div id="aco-changes-content"></div>
+      </div>
     </div>
   </div> <!-- End main-content -->
 
