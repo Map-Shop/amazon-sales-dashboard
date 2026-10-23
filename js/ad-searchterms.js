@@ -219,21 +219,28 @@
       return n && n.title ? n.title : null;
     }
 
-    // A search term that is really an ASIN, shown as what it is.
+    // The search term is what was typed or where the ad ran — that is the
+    // fact, so it stays plain. The product name is an annotation on it and is
+    // set back, never the other way round.
     function stTermLabel(term) {
-      const name = stAsinName(term);
-      return name
-        ? `${escapeHtml(name)} <span class="arf-muted">${escapeHtml(term)}</span>`
-        : escapeHtml(term || '—');
+      return escapeHtml(term || '—');
     }
 
-    // A targeting expression, which carries its ASIN inside quotes.
+    // The name alone, for the column beside the term.
+    function stProductCell(term) {
+      const name = stAsinName(term);
+      return name ? `<span class="arf-muted">${escapeHtml(name)}</span>` : '';
+    }
+
+    // A targeting expression, which carries its ASIN inside quotes. One cell
+    // rather than two: the breakdown is already wide, and the same rule holds
+    // — the expression first, the name set back behind it.
     function stMatchedLabel(matched) {
       const s = String(matched || '—');
       const m = s.match(/asin="([^"]+)"/i);
       const name = m ? stAsinName(m[1]) : null;
       return name
-        ? `${escapeHtml(name)} <span class="arf-muted">${escapeHtml(m[1])}</span>`
+        ? `${escapeHtml(s)} <span class="arf-muted">${escapeHtml(name)}</span>`
         : escapeHtml(s);
     }
 
@@ -487,6 +494,7 @@
 
     const ST_TERM_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
+      { key: 'product', label: 'Product' },
       { key: 'types', label: 'Matched in' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
@@ -543,6 +551,7 @@
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${
           r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
+        <td>${stProductCell(r.searchTerm)}</td>
         <td>${escapeHtml(r.types || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
@@ -655,7 +664,7 @@
       const matched = r.keyword || r.targeting || '—';
       const type = r.matchType ? ` <span class="arf-muted">${escapeHtml(r.matchType.toLowerCase())}</span>` : '';
       return `<tr>
-        <td class="arf-name">${stTermLabel(r.searchTerm)}</td>
+        <td class="arf-name">${stTermLabel(r.searchTerm)} ${stProductCell(r.searchTerm)}</td>
         <td>${escapeHtml(matched)}${type}</td>
         <td>${escapeHtml(r.campaign || '—')}${
           r.campaignType ? ` <span class="arf-muted">${escapeHtml(r.campaignType)}</span>` : ''}</td>
