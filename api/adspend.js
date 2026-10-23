@@ -5,6 +5,7 @@ import * as adspendSql from '../lib/adspend.js';
 import * as adHistory from '../lib/adhistory.js';
 import * as reviews from '../lib/adreviews.js';
 import * as spendOps from '../lib/adspendops.js';
+import * as searchTerms from '../lib/searchterms.js';
 
 // An ad type's month as { rows } (null when kv has no record), and its
 // replacement — the ad_spend_rows table when SQL_TABLES includes
@@ -133,6 +134,11 @@ export default async function handler(req, res) {
     if (action === 'monthly-status')       return handleMonthlyStatus(req, res);
     if (action === 'monthly-collect')      return handleMonthlyCollect(req, res);
     if (action === 'monthly-get')          return handleMonthlyGet(req, res);
+    // Search terms — see the section at the bottom.
+    if (action === 'searchterms-request')  return handleSearchTermsRequest(req, res);
+    if (action === 'searchterms-status')   return handleSearchTermsStatus(req, res);
+    if (action === 'searchterms-collect')  return handleSearchTermsCollect(req, res);
+    if (action === 'searchterms-get')      return handleSearchTermsGet(req, res);
     // Weekly history — the continuous series, see the section at the bottom.
     if (action === 'weeks-get')            return handleWeeksGet(req, res);
     if (action === 'weeks-rebuild')        return handleWeeksRebuild(req, res);
@@ -1181,6 +1187,29 @@ async function handleWeeklyRequest(req, res) {
 }
 
 // ─── WEEKLY STATUS ───────────────────────────────────────────────────────────
+// Polls a set of {key, reportId} and says, per report, whether it is done,
+// failed, or still generating. An error reaching Amazon is none of the three:
+// it reports as ERROR so the caller keeps polling rather than treating a
+// network blip as a dead report.
+async function reportStatuses(accessToken, reports, label) {
+  const out = [];
+  for (const { key, reportId } of reports) {
+    try {
+      const status = await withAdsRetry(() => getReportStatus(accessToken, reportId));
+      const norm = (status.status || '').toUpperCase();
+      out.push({
+        key, reportId, status: norm,
+        done: norm === 'COMPLETED' || norm === 'SUCCESS',
+        failed: norm === 'FAILURE' || norm === 'FAILED' || norm === 'CANCELLED'
+      });
+    } catch (err) {
+      console.error(`[${label} STATUS] ${key} failed:`, err.message);
+      out.push({ key, reportId, status: 'ERROR', done: false, failed: false, error: err.message });
+    }
+  }
+  return out;
+}
+
 async function handleWeeklyStatus(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
@@ -1190,21 +1219,7 @@ async function handleWeeklyStatus(req, res) {
     if (parsed.error) return res.status(400).json({ error: parsed.error });
 
     const accessToken = await getAdsAccessToken();
-    const statuses = [];
-    for (const { key, reportId } of parsed.reports) {
-      try {
-        const status = await withAdsRetry(() => getReportStatus(accessToken, reportId));
-        const norm = (status.status || '').toUpperCase();
-        statuses.push({
-          key, reportId, status: norm,
-          done: norm === 'COMPLETED' || norm === 'SUCCESS',
-          failed: norm === 'FAILURE' || norm === 'FAILED' || norm === 'CANCELLED'
-        });
-      } catch (err) {
-        console.error(`[REDFLAGS STATUS] ${key} failed:`, err.message);
-        statuses.push({ key, reportId, status: 'ERROR', done: false, failed: false, error: err.message });
-      }
-    }
+    const statuses = await reportStatuses(accessToken, parsed.reports, 'REDFLAGS');
 
     return res.status(200).json({
       success: true, statuses,
@@ -2170,7 +2185,7 @@ function missingAdsCredentials() {
     .filter(k => !process.env[k]);
 }
 
-function buildReportBody(product, start, end, columns) {
+function buildReportBody(product, start, end, columns, shape = {}) {
   if (daySpan(start, end) > MAX_REPORT_DAYS) {
     // Caught here rather than at Amazon, where it surfaces as an opaque 4xx.
     throw new Error(`report window ${start}..${end} is ${daySpan(start, end)} days, ` +
@@ -2190,16 +2205,20 @@ function buildReportBody(product, start, end, columns) {
   if (!Array.isArray(cols) || !cols.length) {
     throw new Error(`no column set for ${product} reports \u2014 pass one explicitly`);
   }
+  // `shape` names a different report than the per-campaign one. The two
+  // guards above apply whatever is being asked for, which is the reason to
+  // pass through here rather than build a body somewhere else.
   return {
-    name: `Ads ${product.toUpperCase()} ${start}..${end}`,
+    name: `${shape.name || `Ads ${product.toUpperCase()}`} ${start}..${end}`,
     startDate: start,
     endDate: end,
     configuration: {
       adProduct: product === 'sp' ? 'SPONSORED_PRODUCTS' : 'SPONSORED_BRANDS',
-      groupBy: ['campaign'],
+      groupBy: shape.groupBy || ['campaign'],
       columns: cols,
-      reportTypeId: product === 'sp' ? 'spCampaigns' : 'sbCampaigns',
-      timeUnit: 'DAILY',
+      reportTypeId: shape.reportTypeId ||
+                    (product === 'sp' ? 'spCampaigns' : 'sbCampaigns'),
+      timeUnit: shape.timeUnit || 'DAILY',
       format: 'GZIP_JSON'
     }
   };
@@ -5137,6 +5156,271 @@ async function whIngestWeeklyRun({ rows, census, window }) {
   }
 }
 
+// ─── SEARCH TERMS ────────────────────────────────────────────────────────────
+// Phase 1: pull one calendar month of Sponsored Products search terms, store
+// it, and show it. Nothing is judged here and nothing is written to Amazon —
+// the negative and graduation lists are a later phase, and they will be built
+// from the stored rows rather than from a fresh report.
+//
+// Every row Amazon returns is kept, including the terms that drew impressions
+// and never a click. Those are most of the report on an Auto- and Broad-heavy
+// account, and whether they earn their space is exactly what the first pull is
+// meant to answer, so the collect reports the split rather than guessing it.
+
+const ST_PRODUCT = 'SP';
+const ST_REPORT_KEY = 'spSearchTerm';
+
+// Amazon's column names for this report type. A name it does not recognise
+// comes back as a 400 naming the column, which rfInvalidColumns pulls out.
+const ST_REPORT_COLUMNS = [
+  'date', 'campaignId', 'campaignName', 'adGroupId', 'adGroupName',
+  'keywordId', 'keyword', 'searchTerm', 'matchType', 'targeting',
+  'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'
+];
+
+// Sponsored Products credits a purchase to the click for 7 days, so a month is
+// only complete a week after it ends. The 8th day is the same margin the
+// bi-weekly window uses.
+const ST_SETTLE_DAYS = 8;
+
+// The month number is range-checked, not just counted: "2026-13" would
+// otherwise pass, and the date arithmetic below turns it into an invalid date
+// string that throws several calls later.
+const ST_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+function stMonthSettled(ym, today) {
+  return _addDays(moMonthBounds(ym).end, ST_SETTLE_DAYS) <= today;
+}
+
+// The most recent month whose conversions have all landed.
+function stDefaultMonth(today) {
+  let ym = today.slice(0, 7);
+  for (let i = 0; i < 4; i++) {
+    ym = moShiftMonth(ym, -1);
+    if (stMonthSettled(ym, today)) return ym;
+  }
+  return ym;
+}
+
+// Months that can still be asked for: settled, and starting inside the 95 days
+// Amazon keeps. The far end of this list expires — a month that drops off it
+// is gone for good, which is the whole reason to pull early.
+function stPullableMonths(today) {
+  const floor = reportRetentionStart('sp', new Date(`${today}T12:00:00Z`));
+  const out = [];
+  let ym = today.slice(0, 7);
+  for (let i = 0; i < 6; i++) {
+    ym = moShiftMonth(ym, -1);
+    const { start, end } = moMonthBounds(ym);
+    if (!stMonthSettled(ym, today)) continue;
+    if (floor && start < floor) break;
+    out.push({ month: ym, start, end, expires: _addDays(start, REPORT_RETENTION_DAYS.sp) });
+  }
+  return out;
+}
+
+// Validates the month a caller asked for and returns its window. The refusals
+// are the two that cost a report request to discover at Amazon.
+function stResolveMonth(raw, today) {
+  const month = String(raw || '').trim() || stDefaultMonth(today);
+  if (!ST_MONTH_RE.test(month)) return { error: `month must be YYYY-MM, got "${raw}"` };
+  const { start, end } = moMonthBounds(month);
+  if (!stMonthSettled(month, today)) {
+    return { error: `${moMonthLabel(month)} has not settled yet. Sponsored Products keeps ` +
+                    `crediting sales to a click for 7 days, so this month is complete on ` +
+                    `${_addDays(end, ST_SETTLE_DAYS)}.` };
+  }
+  const floor = reportRetentionStart('sp', new Date(`${today}T12:00:00Z`));
+  if (floor && start < floor) {
+    return { error: `${moMonthLabel(month)} is past Amazon's ${REPORT_RETENTION_DAYS.sp}-day ` +
+                    `report retention, which now reaches back to ${floor}. That month can no ` +
+                    `longer be pulled.` };
+  }
+  return { month, start, end };
+}
+
+const stNum = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
+const stText = (v) => (v === null || v === undefined || v === '' ? null : String(v));
+
+// Amazon's rows in the stored shape. A row without a usable date is dropped
+// rather than stored at the wrong grain — daily rows are the entire point of
+// this table, and a row that cannot say which day it belongs to would quietly
+// double-count in every window built from it.
+function stNormalizeRows(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const r of raw) {
+    const date = String(r.date || '').substring(0, 10);
+    if (!DATE_RE.test(date)) continue;
+    out.push({
+      date,
+      campaignId: stText(r.campaignId), campaign: stText(r.campaignName),
+      adGroupId: stText(r.adGroupId), adGroup: stText(r.adGroupName),
+      keywordId: stText(r.keywordId), keyword: stText(r.keyword),
+      targeting: stText(r.targeting), matchType: stText(r.matchType),
+      searchTerm: stText(r.searchTerm),
+      impressions: stNum(r.impressions), clicks: stNum(r.clicks), cost: stNum(r.cost),
+      purchases7d: stNum(r.purchases7d), sales7d: stNum(r.sales7d)
+    });
+  }
+  return out;
+}
+
+async function handleSearchTermsRequest(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
+    }
+
+    const m = stResolveMonth(req.query.month, _ptDate(new Date()));
+    if (m.error) return res.status(400).json({ error: m.error });
+
+    const accessToken = await getAdsAccessToken();
+    try {
+      const body = buildReportBody('sp', m.start, m.end, ST_REPORT_COLUMNS, {
+        name: 'Search terms', groupBy: ['searchTerm'], reportTypeId: ST_REPORT_KEY
+      });
+      const reportId = await withAdsRetry(() => requestReport(accessToken, body));
+      return res.status(200).json({
+        success: true, month: m.month, window: { start: m.start, end: m.end },
+        reports: [{ key: ST_REPORT_KEY, reportId }],
+        requestedAt: new Date().toISOString()
+      });
+    } catch (err) {
+      // The same 425 recovery the cadences use: Amazon names the report
+      // already generating, and adopting it beats leaving it orphaned.
+      const adopted = /\(425\)/.test(err.message) ? rfDuplicateReportId(err.message) : null;
+      if (adopted) {
+        return res.status(200).json({
+          success: true, month: m.month, window: { start: m.start, end: m.end },
+          reports: [{ key: ST_REPORT_KEY, reportId: adopted, adopted: true }],
+          requestedAt: new Date().toISOString()
+        });
+      }
+      console.error('[SEARCHTERMS REQUEST] failed:', err.message);
+      return res.status(502).json({
+        error: err.message, invalidColumns: rfInvalidColumns(err.message)
+      });
+    }
+  } catch (error) {
+    console.error('[SEARCHTERMS REQUEST] Error:', error);
+    return res.status(500).json({ error: 'Search term request failed: ' + error.message });
+  }
+}
+
+async function handleSearchTermsStatus(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const parsed = parseReportsParam(req.query.reports, [ST_REPORT_KEY]);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const accessToken = await getAdsAccessToken();
+    const statuses = await reportStatuses(accessToken, parsed.reports, 'SEARCHTERMS');
+    return res.status(200).json({
+      success: true, statuses,
+      allDone: statuses.every(s => s.done || s.failed),
+      checkedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS STATUS] Error:', error);
+    return res.status(500).json({ error: 'Search term status failed: ' + error.message });
+  }
+}
+
+async function handleSearchTermsCollect(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const parsed = parseReportsParam(req.query.reports, [ST_REPORT_KEY]);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    // The month is required on collect: it decides which stored month this
+    // replaces, and defaulting that would let a late collect overwrite the
+    // wrong one.
+    if (!ST_MONTH_RE.test(String(req.query.month || ''))) {
+      return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
+    }
+    const m = stResolveMonth(req.query.month, _ptDate(new Date()));
+    if (m.error) return res.status(400).json({ error: m.error });
+
+    const accessToken = await getAdsAccessToken();
+    const { reportId } = parsed.reports[0];
+    const status = await withAdsRetry(() => getReportStatus(accessToken, reportId));
+    const url = status.url || status.location;
+    if (!url) {
+      return res.status(409).json({ error: `Report not ready (${status.status || 'unknown'}).` });
+    }
+
+    const raw = await withAdsRetry(() => downloadReport(url));
+    const rows = stNormalizeRows(raw);
+    if (!rows.length) {
+      return res.status(502).json({
+        error: `The report downloaded but held no usable rows (${Array.isArray(raw) ? raw.length : 0} returned).`
+      });
+    }
+
+    await searchTerms.replaceMonth(ST_PRODUCT, m.month, rows);
+    const stats = await searchTerms.monthStats(ST_PRODUCT, m.month);
+    await searchTerms.recordPull({
+      adProduct: ST_PRODUCT, month: m.month, windowStart: m.start, windowEnd: m.end,
+      rows: stats.rows, zeroClick: stats.zeroClick, terms: stats.terms,
+      clicks: stats.clicks, cost: stats.cost, dataBytes: stats.dataBytes
+    });
+    const size = await searchTerms.tableBytes();
+
+    return res.status(200).json({
+      success: true, month: m.month, window: { start: m.start, end: m.end },
+      returned: Array.isArray(raw) ? raw.length : 0,
+      stored: rows.length, stats, size,
+      collectedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS COLLECT] Error:', error);
+    return res.status(500).json({ error: 'Search term collect failed: ' + error.message });
+  }
+}
+
+async function handleSearchTermsGet(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+
+    const today = _ptDate(new Date());
+    const pulls = await searchTerms.listPulls();
+    const pullable = stPullableMonths(today);
+    if (!pulls.length) {
+      return res.status(200).json({
+        success: true, empty: true, pullable, suggested: stDefaultMonth(today)
+      });
+    }
+
+    const month = ST_MONTH_RE.test(String(req.query.month || ''))
+      ? String(req.query.month) : pulls[0].month;
+    const page = await searchTerms.getMonth({
+      adProduct: ST_PRODUCT, month,
+      sort: req.query.sort, dir: req.query.dir,
+      limit: req.query.limit, offset: req.query.offset,
+      q: String(req.query.q || '').trim(), minClicks: req.query.minClicks
+    });
+    const pull = pulls.find(p => p.month === month) || null;
+    const size = await searchTerms.tableBytes();
+
+    return res.status(200).json({
+      success: true, month, pulls, pullable, size, pull,
+      rows: page.rows, total: page.total
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS GET] Error:', error);
+    return res.status(500).json({ error: 'Search term load failed: ' + error.message });
+  }
+}
+
 export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          rfPortfolioFlags, rfPortfolioTotals, rfAttachNotes, rfNoteKey,
          rfNormalizeRows, resolveWindow, rfSegment, rfInvalidColumns,
@@ -5155,4 +5439,6 @@ export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          reportRetentionStart, REPORT_RETENTION_DAYS,
          MO_CONFIG, MO_REPORT_KEYS, MO_SPEC_DEVIATIONS, TARGET_ACOS,
          BW_CONFIG, BW_POSTURES, BW_REPORT_KEYS, BW_SPEC_DEVIATIONS,
-         BW_INCREASES, BW_DECREASES };
+         BW_INCREASES, BW_DECREASES,
+         stNormalizeRows, stResolveMonth, stDefaultMonth, stMonthSettled,
+         stPullableMonths, ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS };
