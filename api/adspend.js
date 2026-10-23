@@ -5455,6 +5455,12 @@ async function stFetchAsinNames(asins) {
   const res = await sp.callAPI({
     operation: 'searchCatalogItems',
     endpoint: 'catalogItems',
+    // Pinned. Left to itself the client picks the OLDEST version that has the
+    // operation, which is 2020-12-01 — and that one searches by keywords only.
+    // Asking it for identifiers there comes back as "Missing required
+    // 'identifiers' or 'keywords'", which reads like our parameter was lost
+    // rather than like the wrong endpoint answered.
+    options: { version: '2022-04-01' },
     query: {
       identifiers: asins, identifiersType: 'ASIN',
       marketplaceIds: [marketplaceId], includedData: ['summaries']
