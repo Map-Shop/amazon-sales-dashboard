@@ -32,6 +32,8 @@
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
     let stDetail = null;       // { term, rows, loading, error } for the open term
+    let stNames = {};          // ASIN -> { title, brand, found } for what is on screen
+    let stNaming = false;
 
     function loadAdSearchTerms() {
       const container = document.getElementById('adsearchterms-content');
@@ -66,6 +68,7 @@
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
         stData = data;
+        stNames = data.names || {};
         if (data.empty) {
           stPullMonth = stPullMonth || data.suggested || '';
           stRenderIdle(data);
@@ -208,6 +211,54 @@
       }
     }
 
+    // An ASIN is unreadable; the product it belongs to is not. Your own come
+    // from the catalog, everyone else's from Amazon's, and both are cached —
+    // so this reads a stored name and never waits on a lookup.
+    function stAsinName(asin) {
+      const n = stNames[String(asin || '').toUpperCase()];
+      return n && n.title ? n.title : null;
+    }
+
+    // A search term that is really an ASIN, shown as what it is.
+    function stTermLabel(term) {
+      const name = stAsinName(term);
+      return name
+        ? `${escapeHtml(name)} <span class="arf-muted">${escapeHtml(term)}</span>`
+        : escapeHtml(term || '—');
+    }
+
+    // A targeting expression, which carries its ASIN inside quotes.
+    function stMatchedLabel(matched) {
+      const s = String(matched || '—');
+      const m = s.match(/asin="([^"]+)"/i);
+      const name = m ? stAsinName(m[1]) : null;
+      return name
+        ? `${escapeHtml(name)} <span class="arf-muted">${escapeHtml(m[1])}</span>`
+        : escapeHtml(s);
+    }
+
+    async function stNameAsins() {
+      if (stNaming || !accessToken || !stMonth) return;
+      stNaming = true;
+      stSetStatus('Naming ASINs — your catalog first, then Amazon\'s…');
+      try {
+        const res = await fetch(`/api/adspend?action=searchterms-names&month=${encodeURIComponent(stMonth)}`, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Naming failed (${res.status})`);
+        const done = `${formatCount(data.counts.named)} of ${formatCount(data.counts.asins)} ASINs named`;
+        stNaming = false;
+        await stFetch(data.error
+          ? `${done}. Amazon's catalog refused the rest: ${data.error}`
+          : (data.remaining ? `${done} — press again for the next batch.` : `${done}.`));
+      } catch (err) {
+        console.error('[ST] naming failed:', err);
+        stNaming = false;
+        stSetStatus('', err.message);
+      }
+    }
+
     // ── RENDER ───────────────────────────────────────────────────────────────
 
     function stRenderIdle(data) {
@@ -284,6 +335,7 @@
             </select>
           </label>` : ''}
           <span class="wk-spacer"></span>
+          ${stNameButton(data)}
           ${stMonthPicker(data)}
         </div>
         ${stPortfolio && terms ? `
@@ -349,6 +401,24 @@
           ? `${formatCount(r.negateTerms)} <span class="arf-muted">${stMoney(r.negateCost)}</span>`
           : '<span class="arf-muted">—</span>'}</td>
       </tr>`;
+    }
+
+    // Naming is a press rather than something a page load does: it calls
+    // Amazon for ASINs that are not yours, and a page should never wait on
+    // that. It says how much is left so the next press has a reason.
+    function stNameButton(data) {
+      const a = data.asins || {};
+      if (!a.asins) return '';
+      const left = a.asins - a.named;
+      if (!left) {
+        return `<span class="arf-muted">all ${formatCount(a.asins)} ASINs named</span>`;
+      }
+      return `
+        <label class="wk-field">
+          <span>ASIN names</span>
+          <button class="arf-btn" data-st-name${stNaming ? ' disabled' : ''}>${
+            stNaming ? 'Naming…' : `Name ${formatCount(left)} ASINs`}</button>
+        </label>`;
     }
 
     // The pull control, shown both on the idle page and beside a stored month.
@@ -471,7 +541,7 @@
       return `<tr${open ? ' class="st-open"' : ''}>
         <td class="arf-name">
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
-            term || '—'}</button>${
+            stTermLabel(r.searchTerm)}</button>${
           r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
         <td>${escapeHtml(r.types || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
@@ -513,7 +583,7 @@
                 elsewhere ? ' <span class="arf-muted">· another product</span>' : ''}</td>
               <td>${escapeHtml(d.campaign || '—')}</td>
               <td>${escapeHtml(d.campaignType || '—')}</td>
-              <td>${escapeHtml(d.matched || '—')}</td>
+              <td>${stMatchedLabel(d.matched)}</td>
               <td class="arf-r">${formatCount(d.clicks || 0)}</td>
               <td class="arf-r">${stMoney(d.cost)}</td>
               <td class="arf-r arf-em">${formatCount(d.orders || 0)}</td>
@@ -544,6 +614,7 @@
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
         stDetail = { term, rows: data.detail || [] };
+        stNames = { ...stNames, ...(data.names || {}) };
       } catch (err) {
         console.error('[ST] term detail failed:', err);
         stDetail = { term, rows: [], error: err.message };
@@ -584,7 +655,7 @@
       const matched = r.keyword || r.targeting || '—';
       const type = r.matchType ? ` <span class="arf-muted">${escapeHtml(r.matchType.toLowerCase())}</span>` : '';
       return `<tr>
-        <td class="arf-name">${escapeHtml(r.searchTerm || '—')}</td>
+        <td class="arf-name">${stTermLabel(r.searchTerm)}</td>
         <td>${escapeHtml(matched)}${type}</td>
         <td>${escapeHtml(r.campaign || '—')}${
           r.campaignType ? ` <span class="arf-muted">${escapeHtml(r.campaignType)}</span>` : ''}</td>
@@ -654,6 +725,7 @@
           stOffset = 0;
           return stFetch();
         }
+        if (e.target.closest('[data-st-name]')) return stNameAsins();
         const expand = e.target.closest('[data-st-expand]');
         if (expand) return stExpand(expand.dataset.stExpand);
         const sort = e.target.closest('[data-st-sort]');

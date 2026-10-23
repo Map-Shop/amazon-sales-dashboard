@@ -6,6 +6,8 @@ import * as adHistory from '../lib/adhistory.js';
 import * as reviews from '../lib/adreviews.js';
 import * as spendOps from '../lib/adspendops.js';
 import * as searchTerms from '../lib/searchterms.js';
+import * as asinNames from '../lib/asinnames.js';
+import SellingPartner from 'amazon-sp-api';
 
 // An ad type's month as { rows } (null when kv has no record), and its
 // replacement — the ad_spend_rows table when SQL_TABLES includes
@@ -138,6 +140,7 @@ export default async function handler(req, res) {
     if (action === 'searchterms-request')  return handleSearchTermsRequest(req, res);
     if (action === 'searchterms-status')   return handleSearchTermsStatus(req, res);
     if (action === 'searchterms-collect')  return handleSearchTermsCollect(req, res);
+    if (action === 'searchterms-names')    return handleSearchTermsNames(req, res);
     if (action === 'searchterms-get')      return handleSearchTermsGet(req, res);
     // Weekly history — the continuous series, see the section at the bottom.
     if (action === 'weeks-get')            return handleWeeksGet(req, res);
@@ -5428,6 +5431,108 @@ async function handleSearchTermsCollect(req, res) {
   }
 }
 
+// Amazon's Catalog Items API takes up to 20 identifiers in one search, which
+// is what makes naming hundreds of ASINs practical inside a function's minute:
+// 20 at a time rather than one call each.
+const ST_NAME_BATCH = 20;
+// Enough batches to clear a month's backlog in a few presses, with room to
+// spare in the 60 seconds the function has.
+const ST_NAME_BATCHES = 5;
+
+async function stFetchAsinNames(asins) {
+  const marketplaceId = process.env.AMAZON_MARKETPLACE_ID || 'ATVPDKIKX0DER';
+  const sp = new SellingPartner({
+    region: 'na',
+    refresh_token: process.env.AMAZON_REFRESH_TOKEN,
+    credentials: {
+      SELLING_PARTNER_APP_CLIENT_ID: process.env.AMAZON_LWA_CLIENT_ID,
+      SELLING_PARTNER_APP_CLIENT_SECRET: process.env.AMAZON_LWA_CLIENT_SECRET
+    }
+  });
+
+  const found = [];
+  const seen = new Set();
+  const res = await sp.callAPI({
+    operation: 'searchCatalogItems',
+    endpoint: 'catalogItems',
+    query: {
+      identifiers: asins, identifiersType: 'ASIN',
+      marketplaceIds: [marketplaceId], includedData: ['summaries']
+    }
+  });
+  for (const item of (res && res.items) || []) {
+    const s = (item.summaries || [])[0] || {};
+    const asin = String(item.asin || '').toUpperCase();
+    if (!asin) continue;
+    seen.add(asin);
+    found.push({ asin, title: s.itemName || null, brand: s.brand || null, source: 'spapi', found: true });
+  }
+  // An ASIN Amazon did not return is recorded as looked-up-and-missing, so it
+  // is not asked for again on every page load. Suppressed listings and other
+  // marketplaces both land here.
+  for (const a of asins) {
+    const up = String(a).toUpperCase();
+    if (!seen.has(up)) found.push({ asin: up, title: null, brand: null, source: 'spapi', found: false });
+  }
+  return found;
+}
+
+// Names the ASINs that turn up as search terms: your own catalog first, for
+// free, then Amazon's catalog for everyone else's, most expensive first.
+async function handleSearchTermsNames(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+    if (!ST_MONTH_RE.test(String(req.query.month || ''))) {
+      return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
+    }
+    const month = String(req.query.month);
+
+    const fromCatalog = await asinNames.fillFromCatalog();
+    let looked = 0;
+    let failure = null;
+    for (let i = 0; i < ST_NAME_BATCHES; i++) {
+      const batch = await asinNames.unresolved(month, { adProduct: ST_PRODUCT, limit: ST_NAME_BATCH });
+      if (!batch.length) break;
+      try {
+        if (i) await sleep(600);   // the catalog search allows about two a second
+        await asinNames.record(await stFetchAsinNames(batch));
+        looked += batch.length;
+      } catch (err) {
+        // The commonest cause is the Selling Partner app not holding the role
+        // that grants catalog access. Said plainly, once, rather than retried.
+        console.error('[SEARCHTERMS NAMES] catalog lookup failed:', err.message);
+        failure = err.message;
+        break;
+      }
+    }
+
+    const counts = await asinNames.counts(month, { adProduct: ST_PRODUCT });
+    return res.status(200).json({
+      success: true, month, fromCatalog, looked, counts,
+      remaining: counts.asins - counts.named,
+      error: failure
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS NAMES] Error:', error);
+    return res.status(500).json({ error: 'Naming ASINs failed: ' + error.message });
+  }
+}
+
+// The ASINs mentioned by a set of search terms and targeting expressions,
+// with whatever names are already known. Nothing is fetched here — naming is
+// a deliberate press, so a page load never waits on Amazon.
+async function stNamesFor(values) {
+  const asins = [];
+  for (const v of values || []) {
+    const s = String(v || '');
+    if (asinNames.looksLikeAsin(s)) asins.push(s);
+    const m = s.match(/asin="([^"]+)"/i);
+    if (m) asins.push(m[1]);
+  }
+  return asins.length ? asinNames.lookup(asins) : {};
+}
+
 async function handleSearchTermsGet(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
@@ -5446,7 +5551,10 @@ async function handleSearchTermsGet(req, res) {
       ? String(req.query.month) : pulls[0].month;
     const pull = pulls.find(p => p.month === month) || null;
     const size = await searchTerms.tableBytes();
-    const base = { success: true, month, pulls, pullable, size, pull };
+    const base = {
+      success: true, month, pulls, pullable, size, pull,
+      asins: await asinNames.counts(month, { adProduct: ST_PRODUCT })
+    };
 
     // Three depths of the same month: the products, the terms inside one, and
     // the raw daily rows underneath. A product is where a decision is made —
@@ -5467,9 +5575,10 @@ async function handleSearchTermsGet(req, res) {
     if (view === 'term') {
       const term = String(req.query.term || '');
       if (!term) return res.status(400).json({ error: 'term parameter required' });
+      const detail = await searchTerms.termDetail({ adProduct: ST_PRODUCT, month, searchTerm: term });
       return res.status(200).json({
-        ...base, view, term,
-        detail: await searchTerms.termDetail({ adProduct: ST_PRODUCT, month, searchTerm: term })
+        ...base, view, term, detail,
+        names: await stNamesFor([term, ...detail.map(d => d.matched)])
       });
     }
 
@@ -5487,7 +5596,10 @@ async function handleSearchTermsGet(req, res) {
         })
       : await searchTerms.getMonth(common);
 
-    return res.status(200).json({ ...base, view, rows: page.rows, total: page.total });
+    return res.status(200).json({
+      ...base, view, rows: page.rows, total: page.total,
+      names: await stNamesFor(page.rows.map(r => r.searchTerm))
+    });
   } catch (error) {
     console.error('[SEARCHTERMS GET] Error:', error);
     return res.status(500).json({ error: 'Search term load failed: ' + error.message });
