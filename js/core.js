@@ -211,10 +211,6 @@ if (pageName === 'salesvolume' && accessToken) {
         loadSalesVolumeData();
       }
       
-      if (pageName === 'integrations' && accessToken) {
-        loadCredentialStatus(); // Load credential status
-      }
-      
       if (pageName === 'listing' && accessToken) {
         loadChangeLogASINs(); // Load ASINs for dropdown
         loadChangeLog(); // Load change log table
@@ -240,6 +236,12 @@ if (pageName === 'salesvolume' && accessToken) {
       // series built from data the other cadences already fetched.
       if (pageName === 'adweekly' && accessToken) {
         loadAdWeekly();
+      }
+
+      // Reads stored months only. Pulling one is the slowest report Amazon
+      // makes, so it is always a deliberate click.
+      if (pageName === 'adsearchterms' && accessToken) {
+        loadAdSearchTerms();
       }
 
       // Reads the stored snapshot only — refreshing from Amazon is explicit.

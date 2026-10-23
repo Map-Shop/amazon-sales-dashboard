@@ -28,6 +28,7 @@ const files = [...html.matchAll(/<script src="(js\/[^"]+)"><\/script>/g)].map(m 
 
 // The ad pages this suite is scoped to. Everything else is inventory.
 const AD_PAGES = ['js/ad-glossary.js', 'js/ad-redflags.js', 'js/ad-biweekly.js', 'js/ad-monthly.js',
+                  'js/ad-searchterms.js',
                   'js/ad-weekly.js', 'js/ad-campaigns.js'];
 
 console.log('\nSCRIPT INVENTORY');

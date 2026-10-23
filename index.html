@@ -40,12 +40,12 @@
     <a class="nav-item" onclick="showPage('adredflags')">Weekly Red Flags</a>
     <a class="nav-item" onclick="showPage('adbiweekly')">Bi-Weekly Budgets</a>
     <a class="nav-item" onclick="showPage('admonthly')">Monthly Review</a>
+    <a class="nav-item" onclick="showPage('adsearchterms')">Search Terms</a>
 
     <div class="nav-group-label">Tools</div>
     <a class="nav-item" onclick="showPage('catalog')">Product Catalog</a>
     <a class="nav-item" onclick="showPage('mapping')">Campaign Mapping</a>
     <a class="nav-item" onclick="showPage('upload')">Data Upload</a>
-    <a class="nav-item" onclick="showPage('integrations')">Integrations</a>
 
     <div class="sidebar-footer">
       <div id="authSection">
@@ -1332,207 +1332,6 @@
       </div>
     </div>
 
-    <!-- INTEGRATIONS PAGE (PHASE 4) -->
-    <!-- INTEGRATIONS PAGE (PHASE 4) -->
-    <div id="integrations-page" class="page">
-      <h2 class="section-title" style="margin-bottom: 2rem;">Integrations</h2>
-      
-      <!-- Amazon SP-API -->
-      <div class="card" style="margin-bottom: 1.5rem;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-          <h3 style="font-size: 1.25rem; font-weight: 600;">Amazon SP-API</h3>
-          <div style="display: flex; align-items: center; gap: 0.5rem;">
-            <span id="amazon-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary);"></span>
-            <span id="amazon-status-text" style="color: var(--text-secondary); font-size: 0.875rem;">Not configured</span>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>LWA Client ID</label>
-          <div class="credential-input-group">
-            <input type="password" id="AMAZON_LWA_CLIENT_ID" placeholder="Enter LWA Client ID" readonly autocomplete="off">
-            <span id="AMAZON_LWA_CLIENT_ID-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('AMAZON_LWA_CLIENT_ID')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('AMAZON_LWA_CLIENT_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('AMAZON_LWA_CLIENT_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>LWA Client Secret</label>
-          <div class="credential-input-group">
-            <input type="password" id="AMAZON_LWA_CLIENT_SECRET" placeholder="Enter LWA Client Secret" readonly autocomplete="off">
-            <span id="AMAZON_LWA_CLIENT_SECRET-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('AMAZON_LWA_CLIENT_SECRET')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('AMAZON_LWA_CLIENT_SECRET')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('AMAZON_LWA_CLIENT_SECRET')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Refresh Token</label>
-          <div class="credential-input-group">
-            <input type="password" id="AMAZON_REFRESH_TOKEN" placeholder="Enter Refresh Token" readonly autocomplete="off">
-            <span id="AMAZON_REFRESH_TOKEN-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('AMAZON_REFRESH_TOKEN')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('AMAZON_REFRESH_TOKEN')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('AMAZON_REFRESH_TOKEN')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Seller ID</label>
-          <div class="credential-input-group">
-            <input type="password" id="AMAZON_SELLER_ID" placeholder="Enter Seller ID" readonly autocomplete="off">
-            <span id="AMAZON_SELLER_ID-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('AMAZON_SELLER_ID')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('AMAZON_SELLER_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('AMAZON_SELLER_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Marketplace ID</label>
-          <div class="credential-input-group">
-            <input type="text" id="AMAZON_MARKETPLACE_ID" placeholder="ATVPDKIKX0DER" readonly autocomplete="off">
-            <span id="AMAZON_MARKETPLACE_ID-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="copyToClipboard('AMAZON_MARKETPLACE_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('AMAZON_MARKETPLACE_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Amazon Advertising API -->
-      <div class="card" style="margin-bottom: 1.5rem;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-          <h3 style="font-size: 1.25rem; font-weight: 600;">Amazon Advertising API</h3>
-          <div style="display: flex; align-items: center; gap: 0.5rem;">
-            <span id="adv-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary);"></span>
-            <span id="adv-status-text" style="color: var(--text-secondary); font-size: 0.875rem;">Not configured</span>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Client ID</label>
-          <div class="credential-input-group">
-            <input type="password" id="ADV_CLIENT_ID" placeholder="Enter Client ID" readonly autocomplete="off">
-            <span id="ADV_CLIENT_ID-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('ADV_CLIENT_ID')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('ADV_CLIENT_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('ADV_CLIENT_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Client Secret</label>
-          <div class="credential-input-group">
-            <input type="password" id="ADV_CLIENT_SECRET" placeholder="Enter Client Secret" readonly autocomplete="off">
-            <span id="ADV_CLIENT_SECRET-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('ADV_CLIENT_SECRET')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('ADV_CLIENT_SECRET')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('ADV_CLIENT_SECRET')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Refresh Token</label>
-          <div class="credential-input-group">
-            <input type="password" id="ADV_REFRESH_TOKEN" placeholder="Enter Refresh Token" readonly autocomplete="off">
-            <span id="ADV_REFRESH_TOKEN-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('ADV_REFRESH_TOKEN')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('ADV_REFRESH_TOKEN')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('ADV_REFRESH_TOKEN')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Profile ID</label>
-          <div class="credential-input-group">
-            <input type="password" id="ADV_PROFILE_ID" placeholder="Enter Profile ID" readonly autocomplete="off">
-            <span id="ADV_PROFILE_ID-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('ADV_PROFILE_ID')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('ADV_PROFILE_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('ADV_PROFILE_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-      </div>
-      
-      <!-- ShipStation -->
-      <div class="card" style="margin-bottom: 1.5rem;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-          <h3 style="font-size: 1.25rem; font-weight: 600;">ShipStation</h3>
-          <div style="display: flex; align-items: center; gap: 0.5rem;">
-            <span id="shipstation-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary);"></span>
-            <span id="shipstation-status-text" style="color: var(--text-secondary); font-size: 0.875rem;">Not configured</span>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>API Key</label>
-          <div class="credential-input-group">
-            <input type="password" id="SHIPSTATION_API_KEY" placeholder="Enter API Key" readonly autocomplete="off">
-            <span id="SHIPSTATION_API_KEY-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('SHIPSTATION_API_KEY')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('SHIPSTATION_API_KEY')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('SHIPSTATION_API_KEY')" title="Edit">✏️</button>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>API Secret</label>
-          <div class="credential-input-group">
-            <input type="password" id="SHIPSTATION_API_SECRET" placeholder="Enter API Secret" readonly autocomplete="off">
-            <span id="SHIPSTATION_API_SECRET-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('SHIPSTATION_API_SECRET')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('SHIPSTATION_API_SECRET')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('SHIPSTATION_API_SECRET')" title="Edit">✏️</button>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Anthropic API -->
-      <div class="card" style="margin-bottom: 1.5rem;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-          <h3 style="font-size: 1.25rem; font-weight: 600;">Anthropic API</h3>
-          <div style="display: flex; align-items: center; gap: 0.5rem;">
-            <span id="anthropic-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--text-secondary);"></span>
-            <span id="anthropic-status-text" style="color: var(--text-secondary); font-size: 0.875rem;">Not configured</span>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>API Key</label>
-          <div class="credential-input-group">
-            <input type="password" id="ANTHROPIC_API_KEY" placeholder="Enter API Key" readonly autocomplete="off">
-            <span id="ANTHROPIC_API_KEY-vercel" class="vercel-indicator" title="Vercel">○</span>
-            <button class="btn-icon" onclick="toggleReveal('ANTHROPIC_API_KEY')" title="Reveal">🔍</button>
-            <button class="btn-icon" onclick="copyToClipboard('ANTHROPIC_API_KEY')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('ANTHROPIC_API_KEY')" title="Edit">✏️</button>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Google OAuth -->
-      <div class="card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-          <h3 style="font-size: 1.25rem; font-weight: 600;">Google OAuth</h3>
-          <div style="display: flex; align-items: center; gap: 0.5rem;">
-            <span id="google-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--success);"></span>
-            <span id="google-status-text" style="color: var(--success); font-size: 0.875rem;">Connected</span>
-          </div>
-        </div>
-        
-        <div class="credential-row">
-          <label>Client ID</label>
-          <div class="credential-input-group">
-            <input type="text" id="GOOGLE_CLIENT_ID" placeholder="Using default client" readonly autocomplete="off">
-            <span id="GOOGLE_CLIENT_ID-vercel" class="vercel-indicator" title="Vercel">●</span>
-            <button class="btn-icon" onclick="copyToClipboard('GOOGLE_CLIENT_ID')" title="Copy">📋</button>
-            <button class="btn-icon" onclick="enableEdit('GOOGLE_CLIENT_ID')" title="Edit">✏️</button>
-          </div>
-        </div>
-      </div>
-    </div>
     <!-- LISTING OPTIMIZATION PAGE (PHASE 4) -->
     <div id="listing-page" class="page">
       <div class="page-header">
@@ -2094,6 +1893,22 @@
       <div id="admonthly-content"></div>
     </div>
 
+    <!-- SEARCH TERMS PAGE -->
+    <div id="adsearchterms-page" class="page">
+      <div class="page-header">
+        <div class="page-header-top">
+          <h2 class="section-title">Search Terms</h2>
+          <div style="display: flex; align-items: center; gap: 1rem;">
+            <div id="adsearchterms-blurb" class="header-data-blurb"></div>
+            <button class="btn btn-primary" id="st-run-btn" onclick="stButtonClick()">Pull a month</button>
+          </div>
+        </div>
+        <div id="st-status" style="display: none; font-size: 0.8125rem; color: var(--text-secondary); margin-top: 0.5rem;"></div>
+      </div>
+
+      <div id="adsearchterms-content"></div>
+    </div>
+
     <!-- WEEKLY TRENDS PAGE -->
     <div id="adweekly-page" class="page">
       <div class="page-header">
@@ -2141,7 +1956,6 @@
   <script src="js/brand-product.js"></script>
   <script src="js/catalog.js"></script>
   <script src="js/overview-upstash.js"></script>
-  <script src="js/credentials.js"></script>
   <script src="js/listings.js"></script>
   <script src="js/sessions.js"></script>
   <script src="js/sales-volume.js"></script>
@@ -2150,6 +1964,7 @@
   <script src="js/ad-biweekly.js"></script>
   <script src="js/ad-monthly.js"></script>
   <script src="js/ad-weekly.js"></script>
+  <script src="js/ad-searchterms.js"></script>
   <script src="js/ad-campaigns.js"></script>
 </body>
 </html>

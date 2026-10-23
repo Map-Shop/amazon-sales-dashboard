@@ -316,9 +316,6 @@
         case 'mapping':
           if (typeof loadMappingData === 'function') loadMappingData();
           break;
-        case 'integrations':
-          if (typeof loadCredentialStatus === 'function') loadCredentialStatus();
-          break;
         case 'adredflags':
           if (typeof loadAdRedFlags === 'function') loadAdRedFlags();
           break;

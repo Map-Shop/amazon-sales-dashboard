@@ -1416,61 +1416,6 @@
     .signed-in-btn:hover .sign-out-label  { opacity: 1; }
     
     
-    /* ==================== INTEGRATIONS PAGE ==================== */
-    
-    .credential-row {
-      margin-bottom: 1.25rem;
-    }
-    
-    .credential-row label {
-      display: block;
-      font-size: 0.875rem;
-      font-weight: 500;
-      color: var(--text-secondary);
-      margin-bottom: 0.5rem;
-    }
-    
-    .credential-input-group {
-      display: flex;
-      gap: 0.5rem;
-      align-items: center;
-    }
-    
-    .credential-input-group input {
-      flex: 1;
-      padding: 0.75rem;
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-family: 'Roboto Mono', monospace;
-      font-size: 0.875rem;
-    }
-    
-    .credential-input-group input:read-only {
-      cursor: not-allowed;
-      opacity: 0.7;
-    }
-    
-    .credential-input-group input:not(:read-only) {
-      border-color: var(--accent-orange);
-    }
-    
-    .credential-status {
-      font-size: 0.75rem;
-      font-weight: 500;
-      color: var(--text-secondary);
-      min-width: 120px;
-      white-space: nowrap;
-    }
-    
-    .vercel-indicator {
-      font-size: 0.875rem;
-      color: var(--text-secondary);
-      margin-left: 0.5rem;
-      cursor: help;
-    }
-    
     .listing-tab {
       display: none;
     }
