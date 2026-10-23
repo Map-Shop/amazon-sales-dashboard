@@ -366,7 +366,7 @@
     function stProductTermTable(data) {
       const rows = data.rows || [];
       if (!rows.length) {
-        return '<div class="card arf-section"><p class="arf-none">No terms match these filters.</p></div>';
+        return '<div class="arf-section"><p class="arf-none">No terms match these filters.</p></div>';
       }
       const cols = [
         { key: 'searchTerm', label: 'Search term', sortable: true },
@@ -386,7 +386,7 @@
           c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
       }).join('');
       return `
-        <div class="card arf-section">
+        <div class="arf-section">
           <h4>${escapeHtml(stPortfolio ? stPortfolio.name : 'Product')}</h4>
           <p class="arf-blurb">
             What each search term did <strong>for this product</strong>, one row per way the
@@ -484,10 +484,10 @@
     function stProductTable(data) {
       const rows = data.products || [];
       if (!rows.length) {
-        return '<div class="card arf-section"><p class="arf-none">No products in this month.</p></div>';
+        return '<div class="arf-section"><p class="arf-none">No products in this month.</p></div>';
       }
       return `
-        <div class="card arf-section">
+        <div class="arf-section">
           <h4>By product</h4>
           <p class="arf-blurb">
             Every search term this month, grouped by the product that paid for it. A term matched
@@ -585,7 +585,7 @@
         ? `${s.coveredStart} to ${s.coveredEnd}` : '—';
       return `
         <h4 class="st-storage-head">Stored data</h4>
-        ${s.partial ? `<div class="card bw-newer" style="margin-bottom: 1.25rem;">
+        ${s.partial ? `<div class="bw-newer" style="margin-bottom: 1.25rem;">
           <div><strong>This month is short.</strong>
             <span class="arf-muted">Amazon had it only from ${escapeHtml(s.coveredStart)}.
             Its search term history reaches back about 65 days, and the earlier days of
@@ -630,7 +630,7 @@
     function stTermTable(data) {
       const rows = data.rows || [];
       if (!rows.length) {
-        return '<div class="card arf-section"><p class="arf-none">No terms match these filters.</p></div>';
+        return '<div class="arf-section"><p class="arf-none">No terms match these filters.</p></div>';
       }
       const head = ST_TERM_COLS.map(c => {
         const cls = c.right ? ' class="arf-r"' : '';
@@ -640,7 +640,7 @@
           c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
       }).join('');
       return `
-        <div class="card arf-section">
+        <div class="arf-section">
           <h4>Terms · all products</h4>
           <p class="arf-blurb">
             One row per search term for the month, across the whole account, however many
@@ -762,7 +762,7 @@
       if (data.view === 'terms') return stTermTable(data);
       const rows = data.rows || [];
       if (!rows.length) {
-        return '<div class="card arf-section"><p class="arf-none">No rows match these filters.</p></div>';
+        return '<div class="arf-section"><p class="arf-none">No rows match these filters.</p></div>';
       }
       const head = ST_COLS.map(c => {
         const cls = c.right ? ' class="arf-r"' : '';
@@ -772,7 +772,7 @@
           c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
       }).join('');
       return `
-        <div class="card arf-section">
+        <div class="arf-section">
           <h4>Search terms</h4>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
