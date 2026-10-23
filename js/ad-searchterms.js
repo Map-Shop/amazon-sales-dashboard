@@ -478,10 +478,9 @@
 
     // ── PRODUCTS ─────────────────────────────────────────────────────────────
     // A portfolio is one product, the same unit the weekly checks judge by.
-    // Terms with nothing to show are counted two ways on purpose: all of them,
-    // and the few with enough clicks for the silence to mean anything. The
-    // first is mostly one-click terms and says little; the second is the list
-    // worth acting on.
+    // Counts and money only: which terms returned nothing is a fact, whether
+    // that makes one worth negating is a judgement, and this page does not
+    // make judgements.
     function stProductTable(data) {
       const rows = data.products || [];
       if (!rows.length) {
@@ -492,9 +491,8 @@
           <h4>By product</h4>
           <p class="arf-blurb">
             Every search term this month, grouped by the product that paid for it. A term matched
-            by three campaigns counts once. "No orders" counts terms that returned nothing this
-            month — mostly single-click terms, where silence is not yet evidence. "Worth negating"
-            applies the monthly rule: ${ST_NEGATE_CLICKS} clicks or more and still nothing.
+            by three campaigns counts once. "No orders" counts the terms with no orders this
+            month, and what they cost.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
@@ -503,7 +501,7 @@
                 <th class="arf-r">Terms</th><th class="arf-r">Clicks</th>
                 <th class="arf-r">Spend</th><th class="arf-r">Orders</th>
                 <th class="arf-r">Sales</th><th class="arf-r">ACoS</th>
-                <th class="arf-r">No orders</th><th class="arf-r">Worth negating</th>
+                <th class="arf-r">No orders</th>
               </tr></thead>
               <tbody>${rows.map(stProductRow).join('')}</tbody>
             </table>
@@ -524,12 +522,8 @@
         <td class="arf-r arf-em">${stMoney(r.cost)}</td>
         <td class="arf-r">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
-        <td class="arf-r ${r.acos !== null && r.acos > 0.5 ? 'arf-down' : ''}">${
-          r.acos === null ? '—' : Math.round(r.acos * 100) + '%'}</td>
+        <td class="arf-r">${r.acos === null ? '—' : Math.round(r.acos * 100) + '%'}</td>
         <td class="arf-r">${formatCount(r.deadTerms || 0)} <span class="arf-muted">${stMoney(r.deadCost)}</span></td>
-        <td class="arf-r arf-em">${r.negateTerms
-          ? `${formatCount(r.negateTerms)} <span class="arf-muted">${stMoney(r.negateCost)}</span>`
-          : '<span class="arf-muted">—</span>'}</td>
       </tr>`;
     }
 
@@ -622,8 +616,6 @@
       { key: 'sales', label: 'Sales', sortable: true, right: true }
     ];
 
-    const ST_NEGATE_CLICKS = 15;
-
     const ST_TERM_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
       { key: 'product', label: 'Product' },
@@ -649,16 +641,13 @@
       }).join('');
       return `
         <div class="card arf-section">
-          <h4>Terms${stPortfolio ? ` · ${escapeHtml(stPortfolio.name)}` : ''}</h4>
+          <h4>Terms · all products</h4>
           <p class="arf-blurb">
-            One row per search term for the month, however many campaigns matched it. Open a
-            term to see each campaign and target separately — an exact keyword earning its
-            place and an auto close-match that is not are two different facts, and this row
-            adds them together. <strong>exact</strong> means the term is already targeted as
-            its own keyword; one of those with clicks and no orders is a candidate to stop
-            targeting rather than to block. <strong>N products</strong> means that many of
-            your own products bid on the same search, and the breakdown shows all of them
-            even while you are looking at one.
+            One row per search term for the month, across the whole account, however many
+            campaigns matched it. Open a term to see each campaign and target that matched it
+            separately. <strong>exact</strong> means the term is also targeted as its own exact
+            keyword. <strong>N products</strong> is how many of your products bid on the same
+            search.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
@@ -857,18 +846,25 @@
           stView = view.dataset.stView;
           stOffset = 0;
           stDetail = null;
-          if (stView === 'products') stPortfolio = null;
+          // A drill-down belongs to the Products tab. Carrying it into Terms
+          // labelled account-wide numbers with one product's name.
+          stPortfolio = null;
           return stFetch();
         }
         const product = e.target.closest('[data-st-product]');
         if (product) {
+          // Stays on the Products tab: opening a product is a drill-down into
+          // it, not a jump to the account-wide term list. Sending this to
+          // 'terms' is what made a product show everyone's numbers.
           stPortfolio = { id: product.dataset.stProduct, name: product.dataset.stProductName };
-          stView = 'terms';
+          stView = 'products';
+          stDetail = null;
           stOffset = 0;
           return stFetch();
         }
         if (e.target.closest('[data-st-clear-portfolio]')) {
           stPortfolio = null;
+          stDetail = null;
           stOffset = 0;
           return stFetch();
         }
