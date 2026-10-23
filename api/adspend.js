@@ -5566,13 +5566,39 @@ async function handleSearchTermsGet(req, res) {
     // the raw daily rows underneath. A product is where a decision is made —
     // a cluster of terms with nothing to show for itself is one question about
     // that product, not fifty about terms.
-    const view = ['products', 'terms', 'rows', 'term'].includes(String(req.query.view))
-      ? String(req.query.view) : 'products';
+    const view = ['products', 'product-terms', 'terms', 'rows', 'term', 'term-products']
+      .includes(String(req.query.view)) ? String(req.query.view) : 'products';
 
     if (view === 'products') {
       return res.status(200).json({
         ...base, view, products: await searchTerms.byProduct({ adProduct: ST_PRODUCT, month })
       });
+    }
+
+    // Inside one product: a row per way this product matched a term, which is
+    // the thing that would be acted on there.
+    if (view === 'product-terms') {
+      const portfolio = String(req.query.portfolio || '').trim();
+      if (!portfolio) return res.status(400).json({ error: 'portfolio parameter required' });
+      const page = await searchTerms.byProductTerm({
+        adProduct: ST_PRODUCT, month, portfolioId: portfolio,
+        sort: req.query.sort, dir: req.query.dir,
+        limit: req.query.limit, offset: req.query.offset,
+        q: String(req.query.q || '').trim(), minClicks: req.query.minClicks,
+        onlyDead: String(req.query.onlyDead) === '1'
+      });
+      return res.status(200).json({
+        ...base, view, portfolio, rows: page.rows, total: page.total,
+        names: await stNamesFor([...page.rows.map(r => r.searchTerm), ...page.rows.map(r => r.matched)])
+      });
+    }
+
+    // What one term costs everywhere, for a row opened inside a product.
+    if (view === 'term-products') {
+      const term = String(req.query.term || '');
+      if (!term) return res.status(400).json({ error: 'term parameter required' });
+      const spread = await searchTerms.termByProduct({ adProduct: ST_PRODUCT, month, searchTerm: term });
+      return res.status(200).json({ ...base, view, term, ...spread });
     }
 
     // One term, broken out by campaign and target. Account-wide on purpose,
@@ -5594,12 +5620,10 @@ async function handleSearchTermsGet(req, res) {
       limit: req.query.limit, offset: req.query.offset,
       q: String(req.query.q || '').trim(), minClicks: req.query.minClicks
     };
+    // No portfolio here: looking inside a product is its own view, with its
+    // own table, because the question is a different one.
     const page = view === 'terms'
-      ? await searchTerms.byTerm({
-          ...common,
-          portfolioId: String(req.query.portfolio || '').trim() || null,
-          onlyDead: String(req.query.onlyDead) === '1'
-        })
+      ? await searchTerms.byTerm({ ...common, onlyDead: String(req.query.onlyDead) === '1' })
       : await searchTerms.getMonth(common);
 
     return res.status(200).json({

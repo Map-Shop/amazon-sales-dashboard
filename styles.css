@@ -2297,3 +2297,27 @@
       color: var(--accent-yellow);
       border-color: var(--accent-yellow);
     }
+
+    /* Search Terms: the breadcrumb back out of one product, the first row of
+       a term's group, and the account-wide total inside an opened term. */
+    .st-crumb {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: 0.75rem 0 1rem;
+    }
+
+    .arf-table tr.st-group > td { border-top: 1px solid var(--border); }
+
+    .st-detail-table tr.st-total > td {
+      color: var(--text-primary);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .st-storage-head {
+      margin: 2rem 0 0.75rem;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+    }

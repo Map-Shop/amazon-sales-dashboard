@@ -35,6 +35,14 @@
     let stNames = {};          // ASIN -> { title, brand, found } for what is on screen
     let stNaming = false;
 
+    // The Products tab has two states: the rollup, and one product's terms.
+    // They are different tables answering different questions, so they are
+    // different views on the wire too.
+    function stWhich() {
+      if (stView === 'products') return stPortfolio ? 'product-terms' : 'products';
+      return stView;
+    }
+
     function loadAdSearchTerms() {
       const container = document.getElementById('adsearchterms-content');
       if (!container) return;
@@ -54,7 +62,7 @@
     async function stFetch(after) {
       try {
         const qs = new URLSearchParams({
-          view: stView, sort: stSort, dir: stDir,
+          view: stWhich(), sort: stSort, dir: stDir,
           limit: String(ST_PAGE_SIZE), offset: String(stOffset),
           minClicks: String(stMinClicks)
         });
@@ -295,18 +303,30 @@
       const pull = data.pull || {};
       stSetBlurb(`${stMonthLabel(data.month)} · ${formatCount(pull.rows || 0)} rows · pulled ${
         pull.collectedAt ? _svTimeAgo(pull.collectedAt) : 'just now'}`);
-      const body = data.view === 'products' ? stProductTable(data) : stTable(data);
+      const body = data.view === 'products' ? stProductTable(data)
+                 : data.view === 'product-terms' ? stProductTermTable(data)
+                 : stTable(data);
       container.innerHTML =
-        stControls(data) + stStats(data) + body + stFooter(data);
+        stControls(data) + body + stStats(data) + stFooter(data);
+      stPullControl(data);
       stBindActions();
     }
 
     function stControls(data) {
       const months = (data.pulls || []).map(p => p.month);
       const tab = (key, label) =>
-        `<button class="arf-btn${stView === key ? ' arf-btn-go' : ''}" data-st-view="${key}">${label}</button>`;
-      const terms = data.view !== 'products';
+        `<button class="tab${stView === key ? ' active' : ''}" data-st-view="${key}">${label}</button>`;
+      // Filters belong to the two term tables; the product rollup has none.
+      const filtering = data.view === 'terms' || data.view === 'product-terms';
       return `
+        <div class="tabs">
+          ${tab('products', 'Products')}${tab('terms', 'Terms')}${tab('rows', 'Daily rows')}
+        </div>
+        ${stPortfolio && data.view === 'product-terms' ? `
+        <div class="st-crumb">
+          <button class="arf-btn" data-st-clear-portfolio>&larr; All products</button>
+          <strong>${escapeHtml(stPortfolio.name)}</strong>
+        </div>` : ''}
         <div class="card card-flat wk-controls">
           <label class="wk-field">
             <span>Stored month</span>
@@ -315,13 +335,7 @@
                 m === data.month ? ' selected' : ''}>${escapeHtml(stMonthLabel(m))}</option>`).join('')}
             </select>
           </label>
-          <label class="wk-field">
-            <span>View</span>
-            <span class="bw-filter" style="margin: 0;">
-              ${tab('products', 'Products')}${tab('terms', 'Terms')}${tab('rows', 'Daily rows')}
-            </span>
-          </label>
-          ${terms ? `
+          ${filtering ? `
           <label class="wk-field">
             <span>Search term contains</span>
             <input type="search" data-st-q value="${escapeHtml(stQuery)}" placeholder="any">
@@ -332,8 +346,7 @@
               ${[0, 1, 5, 15].map(n => `<option value="${n}"${
                 stMinClicks === n ? ' selected' : ''}>${n === 0 ? 'none' : n}</option>`).join('')}
             </select>
-          </label>` : ''}
-          ${data.view === 'terms' ? `
+          </label>
           <label class="wk-field">
             <span>Orders</span>
             <select data-st-dead>
@@ -343,14 +356,124 @@
           </label>` : ''}
           <span class="wk-spacer"></span>
           ${stNameButton(data)}
-          ${stMonthPicker(data)}
-        </div>
-        ${stPortfolio && terms ? `
-        <div class="bw-filter" style="margin-bottom: 1rem;">
-          <span class="arf-muted">Showing one product:</span>
-          <strong>${escapeHtml(stPortfolio.name)}</strong>
-          <button class="arf-btn" data-st-clear-portfolio>All products</button>
-        </div>` : ''}`;
+        </div>`;
+    }
+
+    // ── ONE PRODUCT'S TERMS ──────────────────────────────────────────────────
+    // A row per way this product matched a term. Rows for one term sit
+    // together, ordered by what that term costs this product, then down the
+    // funnel — Auto found it, Broad widened it, Exact targets it.
+    function stProductTermTable(data) {
+      const rows = data.rows || [];
+      if (!rows.length) {
+        return '<div class="card arf-section"><p class="arf-none">No terms match these filters.</p></div>';
+      }
+      const cols = [
+        { key: 'searchTerm', label: 'Search term', sortable: true },
+        { key: 'product', label: 'Product' },
+        { key: 'type', label: 'Stage' },
+        { key: 'matched', label: 'Matched by' },
+        { key: 'clicks', label: 'Clicks', sortable: true, right: true },
+        { key: 'cost', label: 'Spend', sortable: true, right: true },
+        { key: 'orders', label: 'Orders', sortable: true, right: true },
+        { key: 'sales', label: 'Sales', sortable: true, right: true }
+      ];
+      const head = cols.map(c => {
+        const cls = c.right ? ' class="arf-r"' : '';
+        if (!c.sortable) return `<th${cls}>${c.label}</th>`;
+        const active = stSort === c.key;
+        return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
+          c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
+      }).join('');
+      return `
+        <div class="card arf-section">
+          <h4>${escapeHtml(stPortfolio ? stPortfolio.name : 'Product')}</h4>
+          <p class="arf-blurb">
+            What each search term did <strong>for this product</strong>, one row per way the
+            product matched it. Sorting and filtering work on the term's total here, so a
+            term's rows stay together. Open one to see what the whole term costs across the
+            account and which other products are paying for the same search.
+          </p>
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table">
+              <thead><tr>${head}</tr></thead>
+              <tbody>${rows.map((r, i) => stProductTermRow(r, rows[i - 1])).join('')}</tbody>
+            </table>
+          </div>
+          ${stPager(data)}
+        </div>`;
+    }
+
+    function stProductTermRow(r, prev) {
+      // The term is printed once per group; the rows under it are its matches.
+      const first = !prev || prev.searchTerm !== r.searchTerm;
+      const open = !!stDetail && stDetail.term === r.searchTerm;
+      const term = escapeHtml(r.searchTerm || '');
+      const spread = r.products > 1
+        ? ` <span class="bw-tag st-contested" title="${r.products} of your products bid on this search">${
+            r.products} products</span>` : '';
+      return `<tr${first ? ' class="st-group"' : ''}>
+        <td class="arf-name">${first ? `
+          <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
+            stTermLabel(r.searchTerm)}</button>${spread}` : ''}</td>
+        <td>${first ? stProductCell(r.searchTerm) : ''}</td>
+        <td>${escapeHtml(r.campaignType || '—')}</td>
+        <td>${stMatchedLabel(r.matched)}</td>
+        <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
+        <td class="arf-r">${stMoney(r.cost)}</td>
+        <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
+        <td class="arf-r">${stMoney(r.sales)}</td>
+      </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
+    }
+
+    // The breakdown goes under the LAST match row of a term, so it does not
+    // split the group it belongs to.
+    function stIsLastOfTerm(r) {
+      const rows = (stData && stData.rows) || [];
+      const last = rows.filter(x => x.searchTerm === r.searchTerm).pop();
+      return last === r;
+    }
+
+    // What the opened term costs everywhere: its own total first, then every
+    // other product paying for the same search.
+    function stSpreadRow() {
+      if (stDetail.loading) {
+        return '<tr class="st-detail"><td colspan="8"><span class="loading"></span></td></tr>';
+      }
+      if (stDetail.error) {
+        return `<tr class="st-detail"><td colspan="8"><span class="arf-warn">${
+          escapeHtml(stDetail.error)}</span></td></tr>`;
+      }
+      const total = stDetail.total || {};
+      const here = stPortfolio ? stPortfolio.id : null;
+      const others = (stDetail.products || []).filter(p => p.portfolioId !== here);
+      return `<tr class="st-detail"><td colspan="8">
+        <table class="table-fill arf-table st-detail-table">
+          <thead><tr>
+            <th>Across the account</th>
+            <th class="arf-r">Clicks</th><th class="arf-r">Spend</th>
+            <th class="arf-r">Orders</th><th class="arf-r">Sales</th>
+          </tr></thead>
+          <tbody>
+            <tr class="st-total">
+              <td class="arf-name">The whole search term</td>
+              <td class="arf-r arf-em">${formatCount(total.clicks || 0)}</td>
+              <td class="arf-r arf-em">${stMoney(total.cost)}</td>
+              <td class="arf-r arf-em">${formatCount(total.orders || 0)}</td>
+              <td class="arf-r arf-em">${stMoney(total.sales)}</td>
+            </tr>
+            ${others.length ? others.map(p => `
+            <tr class="st-elsewhere">
+              <td class="arf-name">${escapeHtml(p.portfolio || '—')}</td>
+              <td class="arf-r">${formatCount(p.clicks || 0)}</td>
+              <td class="arf-r">${stMoney(p.cost)}</td>
+              <td class="arf-r">${formatCount(p.orders || 0)}</td>
+              <td class="arf-r">${stMoney(p.sales)}</td>
+            </tr>`).join('')
+            : '<tr><td colspan="5"><span class="arf-muted">No other product bids on this search.</span></td></tr>'}
+          </tbody>
+        </table>
+      </td></tr>`;
     }
 
     // ── PRODUCTS ─────────────────────────────────────────────────────────────
@@ -428,6 +551,14 @@
         </label>`;
     }
 
+    // The month to pull sits beside the button that pulls it, in the header.
+    // It is about getting data rather than reading it, so it does not belong
+    // among the filters.
+    function stPullControl(data) {
+      const el = document.getElementById('st-pull-month');
+      if (el) el.innerHTML = stMonthPicker(data);
+    }
+
     // The pull control, shown both on the idle page and beside a stored month.
     function stMonthPicker(data) {
       const pullable = data.pullable || [];
@@ -459,6 +590,7 @@
       const covers = s.coveredStart && s.coveredEnd
         ? `${s.coveredStart} to ${s.coveredEnd}` : '—';
       return `
+        <h4 class="st-storage-head">Stored data</h4>
         ${s.partial ? `<div class="card bw-newer" style="margin-bottom: 1.25rem;">
           <div><strong>This month is short.</strong>
             <span class="arf-muted">Amazon had it only from ${escapeHtml(s.coveredStart)}.
@@ -616,13 +748,19 @@
       stDetail = { term, loading: true };
       stRender(stData);
       try {
-        const qs = new URLSearchParams({ view: 'term', term, month: stMonth });
+        // Inside a product the question is "what does this cost everywhere";
+        // across the account it is "which campaigns matched it".
+        const inProduct = stWhich() === 'product-terms';
+        const qs = new URLSearchParams({
+          view: inProduct ? 'term-products' : 'term', term, month: stMonth
+        });
         const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
-        stDetail = { term, rows: data.detail || [] };
+        stDetail = { term, rows: data.detail || [],
+                     total: data.total || null, products: data.products || null };
         stNames = { ...stNames, ...(data.names || {}) };
       } catch (err) {
         console.error('[ST] term detail failed:', err);
