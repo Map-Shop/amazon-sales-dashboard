@@ -2266,3 +2266,34 @@
       flex-wrap: wrap;
       margin-bottom: 0.75rem;
     }
+
+    /* A search term opened to its breakdown: one line per campaign and
+       target, with the lines belonging to another product kept visible but
+       set back, since they are context rather than the thing being judged. */
+    .st-expand {
+      font-family: inherit !important;
+      text-align: left;
+      max-width: 22rem;
+      white-space: normal;
+    }
+
+    .arf-table tr.st-open > td { border-bottom: none; }
+
+    .st-detail > td {
+      padding: 0 0 0.75rem 1.5rem !important;
+      background: var(--bg-primary);
+    }
+
+    .st-detail-table { margin: 0; font-size: 0.75rem; }
+
+    .st-detail-table th {
+      font-size: 0.65rem;
+      background: transparent;
+    }
+
+    .st-elsewhere > td { opacity: 0.6; }
+
+    .st-contested {
+      color: var(--accent-yellow);
+      border-color: var(--accent-yellow);
+    }

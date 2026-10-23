@@ -31,6 +31,7 @@
     let stView = 'products';   // products | terms | rows
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
+    let stDetail = null;       // { term, rows, loading, error } for the open term
 
     function loadAdSearchTerms() {
       const container = document.getElementById('adsearchterms-content');
@@ -416,8 +417,7 @@
 
     const ST_TERM_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
-      { key: 'matched', label: 'Matched by' },
-      { key: 'types', label: 'Campaign types' },
+      { key: 'types', label: 'Matched in' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
@@ -441,9 +441,14 @@
         <div class="card arf-section">
           <h4>Terms${stPortfolio ? ` · ${escapeHtml(stPortfolio.name)}` : ''}</h4>
           <p class="arf-blurb">
-            One row per search term for the month, however many campaigns matched it. A term
-            already targeted as its own exact keyword is marked; one of those with clicks and
-            no orders is a candidate to stop targeting rather than to block.
+            One row per search term for the month, however many campaigns matched it. Open a
+            term to see each campaign and target separately — an exact keyword earning its
+            place and an auto close-match that is not are two different facts, and this row
+            adds them together. <strong>exact</strong> means the term is already targeted as
+            its own keyword; one of those with clicks and no orders is a candidate to stop
+            targeting rather than to block. <strong>N products</strong> means that many of
+            your own products bid on the same search, and the breakdown shows all of them
+            even while you are looking at one.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
@@ -456,17 +461,94 @@
     }
 
     function stTermRow(r) {
-      return `<tr>
-        <td class="arf-name">${escapeHtml(r.searchTerm || '—')}${
-          r.targetedExact ? ' <span class="bw-tag bw-adjusted">exact</span>' : ''}</td>
-        <td>${escapeHtml(String(r.matched || '—').slice(0, 60))}</td>
+      const open = !!stDetail && stDetail.term === r.searchTerm;
+      const term = escapeHtml(r.searchTerm || '');
+      // Contested by more than one of your own products. Counted across the
+      // whole account even here, where the list may be narrowed to one.
+      const spread = r.products > 1
+        ? ` <span class="bw-tag st-contested" title="${r.products} of your products bid on this search">${
+            r.products} products</span>` : '';
+      return `<tr${open ? ' class="st-open"' : ''}>
+        <td class="arf-name">
+          <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
+            term || '—'}</button>${
+          r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
         <td>${escapeHtml(r.types || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
         <td class="arf-r">${r.acos === null || r.acos === undefined ? '—' : Math.round(r.acos * 100) + '%'}</td>
-      </tr>`;
+      </tr>${open ? stTermDetailRow() : ''}`;
+    }
+
+    // One line per campaign and target: an exact keyword earning its place and
+    // an auto close-match that is not are two different facts, and the term row
+    // adds them together.
+    function stTermDetailRow() {
+      const cols = ST_TERM_COLS.length;
+      if (stDetail.loading) {
+        return `<tr class="st-detail"><td colspan="${cols}"><span class="loading"></span></td></tr>`;
+      }
+      if (stDetail.error) {
+        return `<tr class="st-detail"><td colspan="${cols}"><span class="arf-warn">${
+          escapeHtml(stDetail.error)}</span></td></tr>`;
+      }
+      const rows = stDetail.rows || [];
+      if (!rows.length) {
+        return `<tr class="st-detail"><td colspan="${cols}"><span class="arf-muted">Nothing matched.</span></td></tr>`;
+      }
+      const here = stPortfolio ? stPortfolio.id : null;
+      return `<tr class="st-detail"><td colspan="${cols}">
+        <table class="table-fill arf-table st-detail-table">
+          <thead><tr>
+            <th>Product</th><th>Campaign</th><th>Type</th><th>Matched by</th>
+            <th class="arf-r">Clicks</th><th class="arf-r">Spend</th>
+            <th class="arf-r">Orders</th><th class="arf-r">Sales</th>
+          </tr></thead>
+          <tbody>${rows.map(d => {
+            const elsewhere = here && d.portfolioId !== here;
+            return `<tr${elsewhere ? ' class="st-elsewhere"' : ''}>
+              <td class="arf-name">${escapeHtml(d.portfolio || '—')}${
+                elsewhere ? ' <span class="arf-muted">· another product</span>' : ''}</td>
+              <td>${escapeHtml(d.campaign || '—')}</td>
+              <td>${escapeHtml(d.campaignType || '—')}</td>
+              <td>${escapeHtml(d.matched || '—')}</td>
+              <td class="arf-r">${formatCount(d.clicks || 0)}</td>
+              <td class="arf-r">${stMoney(d.cost)}</td>
+              <td class="arf-r arf-em">${formatCount(d.orders || 0)}</td>
+              <td class="arf-r">${stMoney(d.sales)}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+      </td></tr>`;
+    }
+
+    // Opens one term at a time. The list itself is not re-fetched — only the
+    // breakdown is — so opening a term cannot shuffle the page under you.
+    async function stExpand(term) {
+      // Re-rendering needs the list that is already on screen. Without it the
+      // open term would be left stuck on its spinner.
+      if (!stData) return;
+      if (stDetail && stDetail.term === term) {
+        stDetail = null;
+        return stRender(stData);
+      }
+      stDetail = { term, loading: true };
+      stRender(stData);
+      try {
+        const qs = new URLSearchParams({ view: 'term', term, month: stMonth });
+        const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
+        stDetail = { term, rows: data.detail || [] };
+      } catch (err) {
+        console.error('[ST] term detail failed:', err);
+        stDetail = { term, rows: [], error: err.message };
+      }
+      stRender(stData);
     }
 
     function stTable(data) {
@@ -556,6 +638,7 @@
         if (view) {
           stView = view.dataset.stView;
           stOffset = 0;
+          stDetail = null;
           if (stView === 'products') stPortfolio = null;
           return stFetch();
         }
@@ -571,6 +654,8 @@
           stOffset = 0;
           return stFetch();
         }
+        const expand = e.target.closest('[data-st-expand]');
+        if (expand) return stExpand(expand.dataset.stExpand);
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;

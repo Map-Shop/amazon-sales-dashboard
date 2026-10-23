@@ -5452,12 +5452,24 @@ async function handleSearchTermsGet(req, res) {
     // the raw daily rows underneath. A product is where a decision is made —
     // a cluster of terms with nothing to show for itself is one question about
     // that product, not fifty about terms.
-    const view = ['products', 'terms', 'rows'].includes(String(req.query.view))
+    const view = ['products', 'terms', 'rows', 'term'].includes(String(req.query.view))
       ? String(req.query.view) : 'products';
 
     if (view === 'products') {
       return res.status(200).json({
         ...base, view, products: await searchTerms.byProduct({ adProduct: ST_PRODUCT, month })
+      });
+    }
+
+    // One term, broken out by campaign and target. Account-wide on purpose,
+    // so a term being chased by another product shows up while you are
+    // looking at this one.
+    if (view === 'term') {
+      const term = String(req.query.term || '');
+      if (!term) return res.status(400).json({ error: 'term parameter required' });
+      return res.status(200).json({
+        ...base, view, term,
+        detail: await searchTerms.termDetail({ adProduct: ST_PRODUCT, month, searchTerm: term })
       });
     }
 
