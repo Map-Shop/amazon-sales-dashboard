@@ -1123,6 +1123,7 @@
     const ACO_LOG_MONEY = new Set(['dailyBudget', 'defaultBid']);
 
     let acoLog = { q: '', field: '', madeFrom: '', from: '', to: '' };
+    let acoLogPage = 1;      // 25 to a page (the server's page size); a new search starts at 1
     let acoLogFields = [];
     let acoLogRequest = 0;   // only the latest search's answer is drawn
     let acoLogTimer = null;
@@ -1192,14 +1193,16 @@
       const searchBox = document.getElementById('aco-log-q');
       searchBox.addEventListener('input', e => {
         acoLog.q = e.target.value;
+        acoLogPage = 1;
         clearTimeout(acoLogTimer);
         acoLogTimer = setTimeout(acoFetchChanges, 250);
       });
       [['aco-log-field', 'field'], ['aco-log-made', 'madeFrom'], ['aco-log-from', 'from'], ['aco-log-to', 'to']].forEach(([id, key]) => {
-        document.getElementById(id).addEventListener('change', e => { acoLog[key] = e.target.value; acoFetchChanges(); });
+        document.getElementById(id).addEventListener('change', e => { acoLog[key] = e.target.value; acoLogPage = 1; acoFetchChanges(); });
       });
       document.getElementById('aco-log-clear').addEventListener('click', () => {
         acoLog = { q: '', field: '', madeFrom: '', from: '', to: '' };
+        acoLogPage = 1;
         document.getElementById('aco-changes-content').innerHTML = acoLogControls() + '<div id="aco-log-results"></div>';
         acoBindLogControls();
         acoFetchChanges();
@@ -1212,6 +1215,7 @@
       const request = ++acoLogRequest;
       const params = new URLSearchParams({ action: 'changes' });
       for (const [key, value] of Object.entries(acoLog)) if (value.trim()) params.set(key, value.trim());
+      if (acoLogPage > 1) params.set('page', String(acoLogPage));
       if (!results.innerHTML) results.innerHTML = '<div style="padding: 3rem; text-align: center; color: var(--text-secondary);">Loading the change log…</div>';
 
       fetch(`/api/adcampaigns?${params}`, { headers: { Authorization: `Bearer ${accessToken}` } })
@@ -1219,6 +1223,9 @@
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.error || `Failed to load (${res.status})`);
           if (request !== acoLogRequest) return;
+          // Past the last page (the log or the matches shrank): show the last one.
+          const lastPage = Math.max(1, Math.ceil((data.total || 0) / (data.limit || 25)));
+          if (acoLogPage > lastPage) { acoLogPage = lastPage; acoFetchChanges(); return; }
           acoLogFields = data.fields || [];
           const fieldSelect = document.getElementById('aco-log-field');
           if (fieldSelect) fieldSelect.innerHTML = acoLogFieldOptions();
@@ -1241,13 +1248,23 @@
           searching ? 'No changes match.' : 'No changes recorded yet.'}</div>`;
         return;
       }
-      const count = data.total > rows.length
-        ? `Showing the newest ${rows.length} of ${data.total} changes. Narrow the search to see older ones.`
+      const first = (data.offset || 0) + 1;
+      const pages = Math.max(1, Math.ceil(data.total / (data.limit || 25)));
+      const count = pages > 1
+        ? `Showing ${first}–${first + rows.length - 1} of ${data.total} changes`
         : `${data.total} change${data.total === 1 ? '' : 's'}`;
+      const pager = pages > 1 ? `
+        <div class="aco-log-pager">
+          <button class="btn btn-secondary" type="button" data-aco-log-page="${acoLogPage - 1}"${acoLogPage <= 1 ? ' disabled' : ''}>‹ Previous</button>
+          <span>Page ${acoLogPage} of ${pages}</span>
+          <button class="btn btn-secondary" type="button" data-aco-log-page="${acoLogPage + 1}"${acoLogPage >= pages ? ' disabled' : ''}>Next ›</button>
+        </div>` : '';
       results.innerHTML = `
-        <div style="color: var(--text-secondary); font-size: 0.8125rem; margin-bottom: 0.75rem;">${escapeHtml(count)}</div>
+        <div class="aco-log-summary">
+          <span>${escapeHtml(count)}</span>${pager}
+        </div>
         <div class="card card-flat" style="overflow-x: auto;">
-          <table>
+          <table style="width: 100%;">
             <thead><tr><th>When</th><th>Campaign</th><th>Type</th><th>Change</th><th>From</th><th>To</th><th>Made from</th></tr></thead>
             <tbody>${rows.map(r => `
               <tr>
@@ -1261,7 +1278,16 @@
               </tr>`).join('')}
             </tbody>
           </table>
-        </div>`;
+        </div>
+        ${pager ? `<div class="aco-log-summary aco-log-summary-bottom">${pager}</div>` : ''}`;
+      results.querySelectorAll('[data-aco-log-page]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          acoLogPage = Number(btn.dataset.acoLogPage);
+          // From the pager under the table, go back up to where the page starts.
+          if (btn.closest('.aco-log-summary-bottom')) results.scrollIntoView({ block: 'start' });
+          acoFetchChanges();
+        });
+      });
     }
 
     // ─── CONTROLS ────────────────────────────────────────────────────────────

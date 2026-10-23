@@ -8,8 +8,9 @@ import * as census from '../lib/adcensus.js';
 //   GET ?action=get      — read the stored snapshot (never calls Amazon)
 //   GET ?action=refresh  — fetch from Amazon, diff, store. ?dry=1 computes
 //                          everything and returns it WITHOUT writing.
-//   GET ?action=changes  — the change log, searched (the Change log tab):
-//                          &q= &field= &madeFrom= &from= &to= (never calls Amazon)
+//   GET ?action=changes  — the change log, searched, one page (the Change log
+//                          tab): &q= &field= &madeFrom= &from= &to= &page=
+//                          (never calls Amazon)
 //   GET ?action=probe    — raw, unmapped Amazon responses for every endpoint
 //  POST ?action=update   — edit one campaign. Brand is dashboard-local; the
 //                          other fields are written to Amazon.
@@ -296,11 +297,12 @@ async function handleRefresh(req, res) {
 }
 
 // ─── CHANGE LOG ──────────────────────────────────────────────────────────────
-// The Change log tab: every recorded change matching the search, newest first,
-// up to AC_CHANGE_LOG_LIMIT, with the total that matched. The search runs in
-// SQL (lib/adhistory.js searchChanges). The kv log is the capped 200 and has
-// no origins, so there the same filters run over it here.
-const AC_CHANGE_LOG_LIMIT = 500;
+// The Change log tab: the recorded changes matching the search, newest first,
+// one page of AC_CHANGE_LOG_PAGE at a time (&page=, from 1), with the total
+// that matched. The search runs in SQL (lib/adhistory.js searchChanges). The
+// kv log is the capped 200 and has no origins, so there the same filters run
+// over it here.
+const AC_CHANGE_LOG_PAGE = 25;
 
 async function handleChanges(req, res) {
   try {
@@ -312,9 +314,11 @@ async function handleChanges(req, res) {
     if (!isDate(q.from) || !isDate(q.to)) {
       return res.status(400).json({ error: 'from and to must be YYYY-MM-DD' });
     }
+    const page = Math.max(1, parseInt(q.page, 10) || 1);
     const search = {
       text: acStr(q.q), field: acStr(q.field), madeFrom: acStr(q.madeFrom),
-      from: q.from || '', to: q.to || '', limit: AC_CHANGE_LOG_LIMIT
+      from: q.from || '', to: q.to || '',
+      limit: AC_CHANGE_LOG_PAGE, offset: (page - 1) * AC_CHANGE_LOG_PAGE
     };
     if (census.censusInSql()) return res.status(200).json(await adHistory.searchChanges(search));
 
@@ -328,9 +332,10 @@ async function handleChanges(req, res) {
       (!search.from || (r.ptDate || '') >= search.from) &&
       (!search.to || (r.ptDate || '') <= search.to));
     return res.status(200).json({
-      rows: matched.slice(0, search.limit).map(r => ({ ...r, origin: null })),
+      rows: matched.slice(search.offset, search.offset + search.limit).map(r => ({ ...r, origin: null })),
       total: matched.length,
       limit: search.limit,
+      offset: search.offset,
       fields: [...new Set(all.map(r => r.field).filter(Boolean))].sort()
     });
   } catch (error) {

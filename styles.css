@@ -1569,6 +1569,39 @@
       color: var(--text-primary);
     }
 
+    /* Change log tab: the count and the pager, above and below the table. */
+    .aco-log-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      color: var(--text-secondary);
+      font-size: 0.8125rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .aco-log-summary-bottom {
+      justify-content: flex-end;
+      margin: 0.75rem 0 0;
+    }
+
+    .aco-log-pager {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .aco-log-pager .btn {
+      padding: 0.4rem 0.75rem;
+      font-size: 0.8125rem;
+    }
+
+    .aco-log-pager .btn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
     .aco-toolbar-actions {
       display: flex;
       gap: 0.5rem;
