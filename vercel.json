@@ -53,6 +53,10 @@
       "schedule": "0 12 * * *"
     },
     {
+      "path": "/api/adcampaigns?action=cron-refresh",
+      "schedule": "0 6 * * *"
+    },
+    {
       "path": "/api/adspend?action=cron-monthly-request",
       "schedule": "0 9 15 * *"
     },

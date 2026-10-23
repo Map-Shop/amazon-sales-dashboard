@@ -11,8 +11,9 @@ import * as census from '../lib/adcensus.js';
 //   GET ?action=probe    — raw, unmapped Amazon responses for every endpoint
 //  POST ?action=update   — edit one campaign. Brand is dashboard-local; the
 //                          other fields are written to Amazon.
+//   GET ?action=cron-refresh — refresh, run every morning by vercel.json
 //
-// All three are auth-gated. Nothing here is cron-driven yet.
+// All but cron-refresh are auth-gated; like the other cron actions, it is not.
 //
 // WHY THIS FILE EXISTS. The red-flag capped check asked the v3 *reporting* API
 // for campaignBudgetAmount and got nothing back, three fixes running. A daily
@@ -234,6 +235,7 @@ export default async function handler(req, res) {
     if (action === 'get')     return handleGet(req, res);
     if (action === 'refresh') return handleRefresh(req, res);
     if (action === 'probe')   return handleProbe(req, res);
+    if (action === 'cron-refresh') return handleCronRefresh(req, res);
   }
 
   return res.status(405).json({ error: 'Method not allowed' });
@@ -286,6 +288,30 @@ async function handleRefresh(req, res) {
     return res.status(200).json(result);
   } catch (error) {
     console.error('[ADCAMPAIGNS REFRESH] Error:', error);
+    return res.status(500).json({ error: 'Refresh failed: ' + error.message });
+  }
+}
+
+// ─── DAILY REFRESH (cron) ────────────────────────────────────────────────────
+// The same refresh, every morning, so changes made outside the dashboard (in
+// the Ads Console, say) reach the change history within a day rather than at
+// the next manual refresh or review. Reads from Amazon only; the snapshot's
+// usual guard still refuses a sudden drop in the campaign count, and the
+// outcome is recorded in the sync status as for any refresh.
+async function handleCronRefresh(req, res) {
+  try {
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
+    }
+
+    const result = await acRunSync({});
+    console.log(`[ADCAMPAIGNS CRON] ${result.success ? 'refreshed' : 'aborted'}: ` +
+      `${result.counts.sp} SP, ${result.counts.sb} SB, ${result.counts.portfolios} portfolios, ` +
+      `${result.changes.length} changes${result.error ? ` — ${result.error}` : ''}`);
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('[ADCAMPAIGNS CRON] Error:', error);
     return res.status(500).json({ error: 'Refresh failed: ' + error.message });
   }
 }

@@ -374,6 +374,17 @@ ok(minuteOfDay(moRequest[0].schedule) !== minuteOfDay(request[0].schedule),
 ok(Math.abs(minuteOfDay(moRequest[0].schedule) - minuteOfDay(request[0].schedule)) >= 60,
    'and are at least an hour apart, which is longer than either takes');
 
+// The daily campaign refresh (adcampaigns cron-refresh) also writes the
+// census, every day, so it must keep clear of both request slots for the same
+// reason.
+const dailyRefresh = (vercel.crons || []).filter(c => /adcampaigns\?action=cron-refresh/.test(c.path));
+ok(dailyRefresh.length === 1, 'one daily campaign refresh', `found ${dailyRefresh.length}`);
+for (const [name, slot] of [['Tuesday', request[0]], ['monthly', moRequest[0]]]) {
+  ok(Math.abs(minuteOfDay(dailyRefresh[0].schedule) - minuteOfDay(slot.schedule)) >= 60,
+     `the daily campaign refresh is at least an hour from the ${name} request`,
+     `${dailyRefresh[0].schedule} vs ${slot.schedule}`);
+}
+
 cleanup();
 console.log(fails === 0 ? '\nschedule: all assertions pass\n' : `\nschedule: ${fails} FAILED\n`);
 process.exit(fails === 0 ? 0 : 1);
