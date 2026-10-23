@@ -316,14 +316,21 @@
         case 'mapping':
           if (typeof loadMappingData === 'function') loadMappingData();
           break;
-        case 'adredflags':
-          if (typeof loadAdRedFlags === 'function') loadAdRedFlags();
+        case 'adcadences':
+          // Whichever cadence tab is open, and only that one.
+          if (typeof showCadenceTab === 'function') {
+            const open = document.querySelector('#adcadences-page .tab.active');
+            showCadenceTab(open ? open.id.replace('cad-tab-', '') : 'weekly');
+          }
           break;
         case 'adcampaigns':
           if (typeof loadAdCampaigns === 'function') loadAdCampaigns();
           break;
-        case 'adbiweekly':
-          if (typeof loadAdBiweekly === 'function') loadAdBiweekly();
+        case 'adweekly':
+          if (typeof loadAdWeekly === 'function') loadAdWeekly();
+          break;
+        case 'adsearchterms':
+          if (typeof loadAdSearchTerms === 'function') loadAdSearchTerms();
           break;
         // upload page has no data fetch
       }

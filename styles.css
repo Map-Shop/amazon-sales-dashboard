@@ -2203,3 +2203,15 @@
       white-space: pre-line;
       pointer-events: none;
     }
+
+    /* A cadence tab's own controls: the freshness blurb on the left, the run
+       button on the right. The page header above it carries the title and the
+       tabs, so this row holds no heading of its own. */
+    .cad-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.75rem;
+    }

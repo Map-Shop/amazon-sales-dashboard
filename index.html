@@ -37,9 +37,7 @@
     <div class="nav-group-label">Ad Admin</div>
     <a class="nav-item" onclick="showPage('adcampaigns')">Campaign Overview</a>
     <a class="nav-item" onclick="showPage('adweekly')">Weekly Trends</a>
-    <a class="nav-item" onclick="showPage('adredflags')">Weekly Red Flags</a>
-    <a class="nav-item" onclick="showPage('adbiweekly')">Bi-Weekly Budgets</a>
-    <a class="nav-item" onclick="showPage('admonthly')">Monthly Review</a>
+    <a class="nav-item" onclick="showPage('adcadences')">Cadences</a>
     <a class="nav-item" onclick="showPage('adsearchterms')">Search Terms</a>
 
     <div class="nav-group-label">Tools</div>
@@ -1845,52 +1843,49 @@
         </div>
     </div>
 
-    <!-- AD RED FLAGS PAGE -->
-    <div id="adredflags-page" class="page">
+    <!-- CADENCES PAGE -->
+    <!-- The three review rhythms as tabs of one page. Each panel keeps the
+         ids its module already binds to - the blurb, the run button, the
+         status line and the content div - so ad-redflags.js, ad-biweekly.js
+         and ad-monthly.js needed no changes to move in here. -->
+    <div id="adcadences-page" class="page">
       <div class="page-header">
         <div class="page-header-top">
-          <h2 class="section-title">Weekly Red Flags</h2>
-          <div style="display: flex; align-items: center; gap: 1rem;">
-            <div id="adredflags-blurb" class="header-data-blurb"></div>
-            <button class="btn btn-primary" id="arf-run-btn" onclick="arfButtonClick()">Run weekly check</button>
+          <h2 class="section-title">Cadences</h2>
+          <div class="tabs">
+            <button class="tab active" id="cad-tab-weekly" onclick="showCadenceTab('weekly')">Weekly Red Flags</button>
+            <button class="tab" id="cad-tab-biweekly" onclick="showCadenceTab('biweekly')">Bi-Weekly Budgets</button>
+            <button class="tab" id="cad-tab-monthly" onclick="showCadenceTab('monthly')">Monthly Review</button>
           </div>
+        </div>
+      </div>
+
+      <div id="cad-weekly" class="cad-subtab">
+        <div class="cad-bar">
+          <div id="adredflags-blurb" class="header-data-blurb"></div>
+          <button class="btn btn-primary" id="arf-run-btn" onclick="arfButtonClick()">Run weekly check</button>
         </div>
         <div id="arf-status" style="display: none; font-size: 0.8125rem; color: var(--text-secondary); margin-top: 0.5rem;"></div>
+        <div id="adredflags-content"></div>
       </div>
 
-      <div id="adredflags-content"></div>
-    </div>
-
-    <!-- BI-WEEKLY BUDGETS PAGE -->
-    <div id="adbiweekly-page" class="page">
-      <div class="page-header">
-        <div class="page-header-top">
-          <h2 class="section-title">Bi-Weekly Budgets</h2>
-          <div style="display: flex; align-items: center; gap: 1rem;">
-            <div id="adbiweekly-blurb" class="header-data-blurb"></div>
-            <button class="btn btn-primary" id="bw-run-btn" onclick="bwButtonClick()">Run bi-weekly</button>
-          </div>
+      <div id="cad-biweekly" class="cad-subtab" style="display: none;">
+        <div class="cad-bar">
+          <div id="adbiweekly-blurb" class="header-data-blurb"></div>
+          <button class="btn btn-primary" id="bw-run-btn" onclick="bwButtonClick()">Run bi-weekly</button>
         </div>
         <div id="bw-status" style="display: none; font-size: 0.8125rem; color: var(--text-secondary); margin-top: 0.5rem;"></div>
+        <div id="adbiweekly-content"></div>
       </div>
 
-      <div id="adbiweekly-content"></div>
-    </div>
-
-    <!-- MONTHLY REVIEW PAGE -->
-    <div id="admonthly-page" class="page">
-      <div class="page-header">
-        <div class="page-header-top">
-          <h2 class="section-title">Monthly Review</h2>
-          <div style="display: flex; align-items: center; gap: 1rem;">
-            <div id="admonthly-blurb" class="header-data-blurb"></div>
-            <button class="btn btn-primary" id="mo-run-btn" onclick="moButtonClick()">Run monthly</button>
-          </div>
+      <div id="cad-monthly" class="cad-subtab" style="display: none;">
+        <div class="cad-bar">
+          <div id="admonthly-blurb" class="header-data-blurb"></div>
+          <button class="btn btn-primary" id="mo-run-btn" onclick="moButtonClick()">Run monthly</button>
         </div>
         <div id="mo-status" style="display: none; font-size: 0.8125rem; color: var(--text-secondary); margin-top: 0.5rem;"></div>
+        <div id="admonthly-content"></div>
       </div>
-
-      <div id="admonthly-content"></div>
     </div>
 
     <!-- SEARCH TERMS PAGE -->

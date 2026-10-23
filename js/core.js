@@ -170,7 +170,28 @@
     }
 
     // Page navigation
+    // The three cadences used to be pages of their own. A saved page name or
+    // an old link still arrives here, so it is translated rather than left to
+    // fail on a missing element.
+    const LEGACY_PAGES = {
+      adredflags: ['adcadences', 'weekly'],
+      adbiweekly: ['adcadences', 'biweekly'],
+      admonthly: ['adcadences', 'monthly']
+    };
+
     function showPage(pageName) {
+      const legacy = LEGACY_PAGES[pageName];
+      if (legacy) {
+        cadenceTabSave(legacy[1]);
+        pageName = legacy[0];
+      }
+      // A page name with no page is a bug, but blanking the app over it is
+      // worse than ignoring it.
+      if (!document.getElementById(`${pageName}-page`)) {
+        console.warn('[NAV] no page for', pageName);
+        return;
+      }
+
       // Hide all pages
       document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
       
@@ -216,20 +237,10 @@ if (pageName === 'salesvolume' && accessToken) {
         loadChangeLog(); // Load change log table
       }
 
-      // Renders the cached result only — never auto-starts a report run.
-      if (pageName === 'adredflags' && accessToken) {
-        loadAdRedFlags();
-      }
-
-      // Same: the cached run, never an automatic one. This cadence writes.
-      if (pageName === 'adbiweekly' && accessToken) {
-        loadAdBiweekly();
-      }
-
-      // Same again. Monthly's only write is the brand posture, and that is a
-      // deliberate click rather than anything a page load does.
-      if (pageName === 'admonthly' && accessToken) {
-        loadAdMonthly();
+      // The three cadences are tabs of one page; the tab decides which one
+      // loads. Each renders a cached result and never auto-starts a run.
+      if (pageName === 'adcadences' && accessToken) {
+        showCadenceTab(cadenceTabSaved());
       }
 
       // Pure read. Weekly Trends requests no reports of its own; it reads a
@@ -295,6 +306,41 @@ if (pageName === 'salesvolume' && accessToken) {
       alert('Reset to default Client ID! Please sign in again.');
     }
     
+    // ── CADENCE TABS ─────────────────────────────────────────────────────────
+    // Weekly Red Flags, Bi-Weekly Budgets and Monthly Review share one page.
+    // Each module still owns its own controls and content; this only decides
+    // which panel is visible and which loader runs.
+    const CADENCE_TABS = {
+      weekly:   () => (typeof loadAdRedFlags === 'function') && loadAdRedFlags(),
+      biweekly: () => (typeof loadAdBiweekly === 'function') && loadAdBiweekly(),
+      monthly:  () => (typeof loadAdMonthly === 'function') && loadAdMonthly()
+    };
+
+    function cadenceTabSave(tab) {
+      try { localStorage.setItem('currentCadenceTab', tab); } catch (e) { /* quota */ }
+    }
+
+    function cadenceTabSaved() {
+      try {
+        const saved = localStorage.getItem('currentCadenceTab');
+        return CADENCE_TABS[saved] ? saved : 'weekly';
+      } catch (e) { return 'weekly'; }
+    }
+
+    function showCadenceTab(tab) {
+      if (!CADENCE_TABS[tab]) tab = 'weekly';
+      document.querySelectorAll('.cad-subtab').forEach(el => { el.style.display = 'none'; });
+      document.querySelectorAll('#adcadences-page .tab').forEach(b => b.classList.remove('active'));
+      const panel = document.getElementById(`cad-${tab}`);
+      const button = document.getElementById(`cad-tab-${tab}`);
+      if (panel) panel.style.display = 'block';
+      if (button) button.classList.add('active');
+      cadenceTabSave(tab);
+      // Loading is the tab's business, not the page's: each cadence reads its
+      // own stored run, and the two that are not on screen should not.
+      if (accessToken) CADENCE_TABS[tab]();
+    }
+
     // Tab switching (Upload "data-tab" + Campaign Mapping "data-mapping-tab")
     // via event delegation on document, so it doesn't matter what order the
     // JS files load or how the DOM is structured. Each handler scopes its
