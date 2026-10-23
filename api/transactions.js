@@ -1,6 +1,7 @@
 import SellingPartner from 'amazon-sp-api';
 import { kv } from '../lib/kv.js';
 import * as txSql from '../lib/transactions.js';
+import * as txRows from '../lib/transactionrows.js';
 import * as stamps from '../lib/stamps.js';
 import * as profit from '../lib/profitability.js';
 // The profitability statement's other inputs, read the way their own
@@ -131,8 +132,11 @@ function txSyncedWrite(month, at) {
 // shape so months synced before chunking still work.
 //
 // The derivation into report-ready rows happens at request time (the
-// profit-* actions, lib/profitability.js), so mapping changes don't require
-// a re-sync.
+// profit-* actions, lib/profitability.js). With SQL_TABLES including
+// "transactionrows" it happens once per transaction instead, as a sync
+// stores the month, and is redone automatically when the derivation code or
+// the fee mappings change (lib/transactionrows.js). Either way mapping
+// changes don't require a re-sync.
 export default async function handler(req, res) {
   const { action } = req.query;
   if (!action) return res.status(400).json({ error: 'Action parameter required' });
@@ -204,8 +208,8 @@ async function handleSync(req, res) {
 // api_path (so it works regardless of whether the bundled amazon-sp-api
 // version recognizes the operation). Stores the raw transactions array
 // under a separate KV namespace so v0 and v2024 can coexist during the
-// migration. No dedup or derivation here — that lives client-side so
-// mapping iteration doesn't require a re-sync.
+// migration. No dedup here; the derivation runs per request, or as the
+// month is stored with "transactionrows" (storeRawMonthV2024).
 async function handleSyncV2024(req, res) {
   try {
     const month = req.query.month || previousMonthISO();
@@ -270,7 +274,10 @@ async function storeRawMonthV2024(month, transactions) {
   const chunks = chunkTransactions(transactions, V2024_CHUNK_TARGET_BYTES);
 
   if (txSql.transactionsInSql()) {
-    await txSql.replaceRawMonth(month, transactions);
+    // With "transactionrows" the month's statement rows are stored in the
+    // same write, derived with the current fee mappings.
+    const feeMappings = txRows.rowsInSql() ? ((await readMap('fee').catch(() => null)) || {}) : null;
+    await txSql.replaceRawMonth(month, transactions, feeMappings);
     return chunks;
   }
 
@@ -399,19 +406,10 @@ async function handleGetRangeV2024(req, res) {
 
 // The months in [startMonth, endMonth] with API or uploaded data, their
 // transactions concatenated in month order, and the uploaded rows of months
-// with no API data. Read by get-range-v2024 and the profit-* actions.
+// with no API data. Read by get-range-v2024 and, without "transactionrows",
+// the profit-* actions.
 async function readRangeV2024(startMonth, endMonth) {
-  // Union the SP-API index and the imported (CSV-uploaded) index so a
-  // month present only in imported rows still shows up in the read.
-  const { rawIndex, importedIndex } = await readMonthIndexes();
-  const monthSet = new Set();
-  for (const m of (rawIndex || [])) {
-    if (m >= startMonth && m <= endMonth) monthSet.add(m);
-  }
-  for (const m of (importedIndex || [])) {
-    if (m >= startMonth && m <= endMonth) monthSet.add(m);
-  }
-  const months = [...monthSet].sort();
+  const months = await readRangeMonths(startMonth, endMonth);
 
   // Raw and imported reads run in parallel — each independent month
   // hits two keys at most, so the join here is fast.
@@ -444,6 +442,40 @@ async function readRangeV2024(startMonth, endMonth) {
   return { months, transactions, importedRows };
 }
 
+// The months in [startMonth, endMonth] with API or uploaded data, ascending.
+async function readRangeMonths(startMonth, endMonth) {
+  // Union the SP-API index and the imported (CSV-uploaded) index so a
+  // month present only in imported rows still shows up in the read.
+  const { rawIndex, importedIndex } = await readMonthIndexes();
+  const monthSet = new Set();
+  for (const m of (rawIndex || [])) {
+    if (m >= startMonth && m <= endMonth) monthSet.add(m);
+  }
+  for (const m of (importedIndex || [])) {
+    if (m >= startMonth && m <= endMonth) monthSet.add(m);
+  }
+  return [...monthSet].sort();
+}
+
+// readRangeV2024's result with the transactions as their stored rows
+// (lib/transactionrows.js): the window [startDate, endDate]'s rows after
+// the dedup over [startMonth, endMonth], as inputs.derived, in place of
+// every raw record. The months and the uploaded rows are readRangeV2024's:
+// uploaded rows only for months with no API transactions.
+async function readRangeDerived(startMonth, endMonth, startDate, endDate, feeMappings) {
+  const [months, { derived, monthCounts }] = await Promise.all([
+    readRangeMonths(startMonth, endMonth),
+    txRows.loadDerived({ startMonth, endMonth, startDate, endDate, feeMappings })
+  ]);
+  const buckets = await Promise.all(months.filter(m => !monthCounts[m]).map(m => readImportedMonth(m)));
+  const importedRows = [];
+  for (const b of buckets) {
+    if (!b || !Array.isArray(b.rows)) continue;
+    for (const r of b.rows) importedRows.push(r);
+  }
+  return { months, transactions: [], importedRows, derived };
+}
+
 // ─── PROFITABILITY ───────────────────────────────────────────────────────────
 // The Profitability statement, its 12-month charts, and Brand & Product,
 // computed by lib/profitability.js from the same reads the page used to
@@ -454,15 +486,17 @@ async function readRangeV2024(startMonth, endMonth) {
 // widened by the dedup lookback, plus the catalog, ad spend, mappings, and
 // shipping. The page treated ad spend, mappings, and shipping as optional (a
 // failed fetch read as empty) and the latest sync time as best-effort; so
-// does this.
+// does this. With "transactionrows" the transactions come as their stored
+// rows, read once the fee mappings are known.
 async function loadProfitInputs(startDate, endDate) {
   const startMonth = startDate.slice(0, 7);
   const endMonth   = endDate.slice(0, 7);
   const widenedStart = profit.shiftMonth(startMonth, -profit.V2024_LOOKBACK_MONTHS);
   const optional = (read, empty) => read.catch(() => empty);
+  const rowsStored = txRows.rowsInSql();
 
-  const [tx, products, spAd, sbAd, prodMap, brandMap, feeMap, shipping] = await Promise.all([
-    readRangeV2024(widenedStart, endMonth),
+  const [rawTx, products, spAd, sbAd, prodMap, brandMap, feeMap, shipping] = await Promise.all([
+    rowsStored ? null : readRangeV2024(widenedStart, endMonth),
     readProducts(),
     optional(readAdRange('sp', startMonth, endMonth), { rows: [] }),
     optional(readAdRange('sb', startMonth, endMonth), { rows: [] }),
@@ -471,6 +505,9 @@ async function loadProfitInputs(startDate, endDate) {
     optional(readMap('fee'), null),
     optional(readShippingRange(startMonth, endMonth), { rows: [] })
   ]);
+  const tx = rowsStored
+    ? await readRangeDerived(widenedStart, endMonth, startDate, endDate, feeMap || {})
+    : rawTx;
 
   const latestSyncedMonth = tx.months.length > 0 ? tx.months[tx.months.length - 1] : null;
   let lastSynced = null;
