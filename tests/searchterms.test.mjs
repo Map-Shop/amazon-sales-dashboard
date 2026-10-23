@@ -174,6 +174,72 @@ const raw = (o = {}) => ({
 ok(M.stNormalizeRows(null).length === 0 && M.stNormalizeRows({}).length === 0,
    'anything that is not a list of rows reads as no rows');
 
+// ─── THE QUERIES ─────────────────────────────────────────────────────────────
+// Built without a database, so the statements can be checked here rather than
+// in production. Postgres refuses a statement carrying a parameter it never
+// mentions — it cannot infer a type for one — and the page's count query used
+// to be handed the two paging parameters it has no use for:
+//   "could not determine data type of parameter $3"
+
+console.log('\nTHE QUERIES  — every parameter is referenced, and every reference is supplied');
+
+const { monthQueries } = await import('../lib/searchterms.js');
+
+// $1, $2 … actually written in the statement.
+const refs = (text) => new Set([...text.matchAll(/\$(\d+)/g)].map(m => Number(m[1])));
+
+function checkStatement(label, { text, params }) {
+  const used = refs(text);
+  const highest = Math.max(0, ...used);
+  const unmentioned = params.map((_, i) => i + 1).filter(n => !used.has(n));
+  const missing = [...used].filter(n => n > params.length);
+  ok(unmentioned.length === 0,
+     `${label}: every parameter it is given is used`,
+     unmentioned.length ? `$${unmentioned.join(', $')} never appear in the statement` : '');
+  ok(missing.length === 0,
+     `${label}: every parameter it uses is given`,
+     missing.length ? `$${missing.join(', $')} beyond the ${params.length} supplied` : '');
+  ok(highest === params.length,
+     `${label}: the numbering has no gaps`, `highest $${highest}, ${params.length} params`);
+}
+
+for (const [label, opts] of [
+  ['default', { month: '2026-09' }],
+  ['with a term filter', { month: '2026-09', q: 'laminated' }],
+  ['with a click floor', { month: '2026-09', minClicks: 15 }],
+  ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
+  ['paged', { month: '2026-09', limit: 50, offset: 400 }]
+]) {
+  const q = monthQueries(opts);
+  checkStatement(`rows, ${label}`, q.rows);
+  checkStatement(`count, ${label}`, q.count);
+}
+
+{
+  const q = monthQueries({ month: '2026-09', q: 'laminated', minClicks: 5, limit: 50, offset: 100 });
+  ok(q.count.params.length === 4 && q.rows.params.length === 6,
+     'the count statement takes the filters only, and the rows statement those plus paging');
+  ok(q.count.params.every((v, i) => v === q.rows.params[i]),
+     'and the two agree on the filters, so a page and its total describe the same rows');
+  ok(q.rows.params[4] === 50 && q.rows.params[5] === 100, 'the page size and offset are passed, not interpolated');
+}
+
+{
+  const injected = monthQueries({ month: '2026-09', sort: 'cost; DROP TABLE search_terms --' });
+  ok(/ORDER BY cost DESC/.test(injected.rows.text) && !/DROP/.test(injected.rows.text),
+     'a sort key outside the whitelist falls back to spend',
+     'the column name is interpolated, so this is the one place that must not take free text');
+  ok(/ORDER BY clicks ASC/.test(monthQueries({ month: '2026-09', sort: 'clicks', dir: 'asc' }).rows.text),
+     'and a known one is used as asked');
+}
+
+{
+  const q = monthQueries({ month: '2026-09' });
+  ok(q.count.params[3] === null && /\$4::text IS NULL/.test(q.count.text),
+     'with no term filter the parameter is null and typed in the statement',
+     'an untyped null is the other half of the same Postgres refusal');
+}
+
 cleanup();
 console.log(fails === 0 ? '\nsearchterms: all assertions pass\n' : `\nsearchterms: ${fails} FAILED\n`);
 process.exit(fails === 0 ? 0 : 1);
