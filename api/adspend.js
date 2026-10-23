@@ -5444,19 +5444,38 @@ async function handleSearchTermsGet(req, res) {
 
     const month = ST_MONTH_RE.test(String(req.query.month || ''))
       ? String(req.query.month) : pulls[0].month;
-    const page = await searchTerms.getMonth({
+    const pull = pulls.find(p => p.month === month) || null;
+    const size = await searchTerms.tableBytes();
+    const base = { success: true, month, pulls, pullable, size, pull };
+
+    // Three depths of the same month: the products, the terms inside one, and
+    // the raw daily rows underneath. A product is where a decision is made —
+    // a cluster of terms with nothing to show for itself is one question about
+    // that product, not fifty about terms.
+    const view = ['products', 'terms', 'rows'].includes(String(req.query.view))
+      ? String(req.query.view) : 'products';
+
+    if (view === 'products') {
+      return res.status(200).json({
+        ...base, view, products: await searchTerms.byProduct({ adProduct: ST_PRODUCT, month })
+      });
+    }
+
+    const common = {
       adProduct: ST_PRODUCT, month,
       sort: req.query.sort, dir: req.query.dir,
       limit: req.query.limit, offset: req.query.offset,
       q: String(req.query.q || '').trim(), minClicks: req.query.minClicks
-    });
-    const pull = pulls.find(p => p.month === month) || null;
-    const size = await searchTerms.tableBytes();
+    };
+    const page = view === 'terms'
+      ? await searchTerms.byTerm({
+          ...common,
+          portfolioId: String(req.query.portfolio || '').trim() || null,
+          onlyDead: String(req.query.onlyDead) === '1'
+        })
+      : await searchTerms.getMonth(common);
 
-    return res.status(200).json({
-      success: true, month, pulls, pullable, size, pull,
-      rows: page.rows, total: page.total
-    });
+    return res.status(200).json({ ...base, view, rows: page.rows, total: page.total });
   } catch (error) {
     console.error('[SEARCHTERMS GET] Error:', error);
     return res.status(500).json({ error: 'Search term load failed: ' + error.message });

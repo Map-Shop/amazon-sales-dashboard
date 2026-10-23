@@ -28,6 +28,9 @@
     let stQuery = '';
     let stMinClicks = 0;
     let stOffset = 0;
+    let stView = 'products';   // products | terms | rows
+    let stPortfolio = null;    // { id, name } when drilled into one product
+    let stOnlyDead = false;
 
     function loadAdSearchTerms() {
       const container = document.getElementById('adsearchterms-content');
@@ -48,11 +51,14 @@
     async function stFetch(after) {
       try {
         const qs = new URLSearchParams({
-          sort: stSort, dir: stDir, limit: String(ST_PAGE_SIZE), offset: String(stOffset),
+          view: stView, sort: stSort, dir: stDir,
+          limit: String(ST_PAGE_SIZE), offset: String(stOffset),
           minClicks: String(stMinClicks)
         });
         if (stMonth) qs.set('month', stMonth);
         if (stQuery) qs.set('q', stQuery);
+        if (stPortfolio) qs.set('portfolio', stPortfolio.id);
+        if (stOnlyDead) qs.set('onlyDead', '1');
         const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -213,9 +219,10 @@
             What shoppers actually typed, a calendar month at a time, kept day by day.
             Nothing has been pulled yet.
             <div style="margin-top: 1rem;">
-              Pick a month and pull it. Amazon keeps 95 days of Sponsored Products
-              reporting, so the months below are everything still reachable — once one
-              drops off that list it cannot be recovered.
+              Pick a month and pull it. Amazon keeps about 65 days of search term history
+              — less than the 95 days its campaign reports keep — so the months below are
+              everything still reachable, and one that drops off that list cannot be
+              recovered.
             </div>
           </div>
           <div style="margin-top: 1.5rem;">${stMonthPicker(data)}</div>
@@ -229,13 +236,17 @@
       const pull = data.pull || {};
       stSetBlurb(`${stMonthLabel(data.month)} · ${formatCount(pull.rows || 0)} rows · pulled ${
         pull.collectedAt ? _svTimeAgo(pull.collectedAt) : 'just now'}`);
+      const body = data.view === 'products' ? stProductTable(data) : stTable(data);
       container.innerHTML =
-        stControls(data) + stStats(data) + stTable(data) + stFooter(data);
+        stControls(data) + stStats(data) + body + stFooter(data);
       stBindActions();
     }
 
     function stControls(data) {
       const months = (data.pulls || []).map(p => p.month);
+      const tab = (key, label) =>
+        `<button class="arf-btn${stView === key ? ' arf-btn-go' : ''}" data-st-view="${key}">${label}</button>`;
+      const terms = data.view !== 'products';
       return `
         <div class="card card-flat wk-controls">
           <label class="wk-field">
@@ -246,6 +257,13 @@
             </select>
           </label>
           <label class="wk-field">
+            <span>View</span>
+            <span class="bw-filter" style="margin: 0;">
+              ${tab('products', 'Products')}${tab('terms', 'Terms')}${tab('rows', 'Daily rows')}
+            </span>
+          </label>
+          ${terms ? `
+          <label class="wk-field">
             <span>Search term contains</span>
             <input type="search" data-st-q value="${escapeHtml(stQuery)}" placeholder="any">
           </label>
@@ -255,10 +273,81 @@
               ${[0, 1, 5, 15].map(n => `<option value="${n}"${
                 stMinClicks === n ? ' selected' : ''}>${n === 0 ? 'none' : n}</option>`).join('')}
             </select>
-          </label>
+          </label>` : ''}
+          ${data.view === 'terms' ? `
+          <label class="wk-field">
+            <span>Orders</span>
+            <select data-st-dead>
+              <option value="0"${stOnlyDead ? '' : ' selected'}>any</option>
+              <option value="1"${stOnlyDead ? ' selected' : ''}>none yet</option>
+            </select>
+          </label>` : ''}
           <span class="wk-spacer"></span>
           ${stMonthPicker(data)}
+        </div>
+        ${stPortfolio && terms ? `
+        <div class="bw-filter" style="margin-bottom: 1rem;">
+          <span class="arf-muted">Showing one product:</span>
+          <strong>${escapeHtml(stPortfolio.name)}</strong>
+          <button class="arf-btn" data-st-clear-portfolio>All products</button>
+        </div>` : ''}`;
+    }
+
+    // ── PRODUCTS ─────────────────────────────────────────────────────────────
+    // A portfolio is one product, the same unit the weekly checks judge by.
+    // Terms with nothing to show are counted two ways on purpose: all of them,
+    // and the few with enough clicks for the silence to mean anything. The
+    // first is mostly one-click terms and says little; the second is the list
+    // worth acting on.
+    function stProductTable(data) {
+      const rows = data.products || [];
+      if (!rows.length) {
+        return '<div class="card arf-section"><p class="arf-none">No products in this month.</p></div>';
+      }
+      return `
+        <div class="card arf-section">
+          <h4>By product</h4>
+          <p class="arf-blurb">
+            Every search term this month, grouped by the product that paid for it. A term matched
+            by three campaigns counts once. "No orders" counts terms that returned nothing this
+            month — mostly single-click terms, where silence is not yet evidence. "Worth negating"
+            applies the monthly rule: ${ST_NEGATE_CLICKS} clicks or more and still nothing.
+          </p>
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table">
+              <thead><tr>
+                <th>Product</th><th>Brand</th>
+                <th class="arf-r">Terms</th><th class="arf-r">Clicks</th>
+                <th class="arf-r">Spend</th><th class="arf-r">Orders</th>
+                <th class="arf-r">Sales</th><th class="arf-r">ACoS</th>
+                <th class="arf-r">No orders</th><th class="arf-r">Worth negating</th>
+              </tr></thead>
+              <tbody>${rows.map(stProductRow).join('')}</tbody>
+            </table>
+          </div>
         </div>`;
+    }
+
+    function stProductRow(r) {
+      const id = r.portfolioId ? escapeHtml(r.portfolioId) : '';
+      const name = escapeHtml(r.portfolio || '(no portfolio)');
+      return `<tr>
+        <td class="arf-name">${id
+          ? `<button class="arf-btn" data-st-product="${id}" data-st-product-name="${name}">${name}</button>`
+          : name}</td>
+        <td>${escapeHtml(r.brand || '—')}</td>
+        <td class="arf-r">${formatCount(r.terms || 0)}</td>
+        <td class="arf-r">${formatCount(r.clicks || 0)}</td>
+        <td class="arf-r arf-em">${stMoney(r.cost)}</td>
+        <td class="arf-r">${formatCount(r.orders || 0)}</td>
+        <td class="arf-r">${stMoney(r.sales)}</td>
+        <td class="arf-r ${r.acos !== null && r.acos > 0.5 ? 'arf-down' : ''}">${
+          r.acos === null ? '—' : Math.round(r.acos * 100) + '%'}</td>
+        <td class="arf-r">${formatCount(r.deadTerms || 0)} <span class="arf-muted">${stMoney(r.deadCost)}</span></td>
+        <td class="arf-r arf-em">${r.negateTerms
+          ? `${formatCount(r.negateTerms)} <span class="arf-muted">${stMoney(r.negateCost)}</span>`
+          : '<span class="arf-muted">—</span>'}</td>
+      </tr>`;
     }
 
     // The pull control, shown both on the idle page and beside a stored month.
@@ -266,7 +355,8 @@
       const pullable = data.pullable || [];
       const stored = new Set((data.pulls || []).map(p => p.month));
       if (!pullable.length) {
-        return '<span class="arf-muted">No month is both settled and inside Amazon\'s 95 days.</span>';
+        return '<span class="arf-muted">No month is both settled and still inside Amazon\'s ' +
+               'search term history.</span>';
       }
       return `
         <label class="wk-field">
@@ -322,7 +412,65 @@
       { key: 'sales', label: 'Sales', sortable: true, right: true }
     ];
 
+    const ST_NEGATE_CLICKS = 15;
+
+    const ST_TERM_COLS = [
+      { key: 'searchTerm', label: 'Search term', sortable: true },
+      { key: 'matched', label: 'Matched by' },
+      { key: 'types', label: 'Campaign types' },
+      { key: 'clicks', label: 'Clicks', sortable: true, right: true },
+      { key: 'cost', label: 'Spend', sortable: true, right: true },
+      { key: 'orders', label: 'Orders', sortable: true, right: true },
+      { key: 'sales', label: 'Sales', sortable: true, right: true },
+      { key: 'acos', label: 'ACoS', right: true }
+    ];
+
+    function stTermTable(data) {
+      const rows = data.rows || [];
+      if (!rows.length) {
+        return '<div class="card arf-section"><p class="arf-none">No terms match these filters.</p></div>';
+      }
+      const head = ST_TERM_COLS.map(c => {
+        const cls = c.right ? ' class="arf-r"' : '';
+        if (!c.sortable) return `<th${cls}>${c.label}</th>`;
+        const active = stSort === c.key;
+        return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
+          c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
+      }).join('');
+      return `
+        <div class="card arf-section">
+          <h4>Terms${stPortfolio ? ` · ${escapeHtml(stPortfolio.name)}` : ''}</h4>
+          <p class="arf-blurb">
+            One row per search term for the month, however many campaigns matched it. A term
+            already targeted as its own exact keyword is marked; one of those with clicks and
+            no orders is a candidate to stop targeting rather than to block.
+          </p>
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table">
+              <thead><tr>${head}</tr></thead>
+              <tbody>${rows.map(stTermRow).join('')}</tbody>
+            </table>
+          </div>
+          ${stPager(data)}
+        </div>`;
+    }
+
+    function stTermRow(r) {
+      return `<tr>
+        <td class="arf-name">${escapeHtml(r.searchTerm || '—')}${
+          r.targetedExact ? ' <span class="bw-tag bw-adjusted">exact</span>' : ''}</td>
+        <td>${escapeHtml(String(r.matched || '—').slice(0, 60))}</td>
+        <td>${escapeHtml(r.types || '—')}</td>
+        <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
+        <td class="arf-r">${stMoney(r.cost)}</td>
+        <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
+        <td class="arf-r">${stMoney(r.sales)}</td>
+        <td class="arf-r">${r.acos === null || r.acos === undefined ? '—' : Math.round(r.acos * 100) + '%'}</td>
+      </tr>`;
+    }
+
     function stTable(data) {
+      if (data.view === 'terms') return stTermTable(data);
       const rows = data.rows || [];
       if (!rows.length) {
         return '<div class="card arf-section"><p class="arf-none">No rows match these filters.</p></div>';
@@ -404,6 +552,25 @@
       if (!el) return;
 
       el.addEventListener('click', e => {
+        const view = e.target.closest('[data-st-view]');
+        if (view) {
+          stView = view.dataset.stView;
+          stOffset = 0;
+          if (stView === 'products') stPortfolio = null;
+          return stFetch();
+        }
+        const product = e.target.closest('[data-st-product]');
+        if (product) {
+          stPortfolio = { id: product.dataset.stProduct, name: product.dataset.stProductName };
+          stView = 'terms';
+          stOffset = 0;
+          return stFetch();
+        }
+        if (e.target.closest('[data-st-clear-portfolio]')) {
+          stPortfolio = null;
+          stOffset = 0;
+          return stFetch();
+        }
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;
@@ -427,6 +594,8 @@
         if (pull) { stPullMonth = pull.value; return stSetBusy(false); }
         const clicks = e.target.closest('[data-st-clicks]');
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
+        const dead = e.target.closest('[data-st-dead]');
+        if (dead) { stOnlyDead = dead.value === '1'; stOffset = 0; return stFetch(); }
       });
 
       // Typing filters on Enter rather than per keystroke: each one is a query
