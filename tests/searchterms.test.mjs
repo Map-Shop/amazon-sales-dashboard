@@ -273,6 +273,29 @@ for (const [label, opts] of [
      'an untyped null is the other half of the same Postgres refusal');
 }
 
+console.log('\nTHE BREAKDOWN  \u2014 one term, by product');
+
+{
+  const { termDetailQuery } = await import('../lib/searchterms.js');
+  const d = termDetailQuery({ month: '2026-09', searchTerm: 'new world map' });
+  ok(d.params.length === 3 && d.params[2] === 'new world map',
+     'the term is a parameter, not interpolated');
+  ok(/ORDER BY lower\(coalesce\(p\.name/.test(d.text),
+     'the lines are ordered by product name, not by spend',
+     'the breakdown is read product by product, and spend order scattered each one');
+  // Auto discovers, Broad widens, Exact targets, ASIN catches on a page.
+  const rank = ['Auto', 'Broad', 'Phrase', 'Exact', 'ASIN'].map(t => d.text.indexOf(`'${t}'`));
+  ok(rank.every(i => i > 0) && rank.every((v, i) => i === 0 || v > rank[i - 1]),
+     'then by campaign type in funnel order rather than alphabetically',
+     'alphabetical would read ASIN, Auto, Broad, Exact — the funnel backwards at the front');
+  ok(d.text.indexOf('lower(coalesce(p.name') < d.text.indexOf('CASE c.campaign_type') &&
+     d.text.indexOf('CASE c.campaign_type') < d.text.indexOf('sum(t.cost) DESC'),
+     'and biggest line first inside a type');
+  ok(!/portfolio_id = \$/.test(d.text),
+     'and it is never narrowed to one product',
+     'the other products paying for the same search are the point of it');
+}
+
 console.log('\nCOVERAGE  \u2014 what a pull actually brought back');
 
 {
