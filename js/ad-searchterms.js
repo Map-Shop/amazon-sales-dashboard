@@ -240,16 +240,10 @@
       return name ? `<span class="arf-muted">${escapeHtml(name)}</span>` : '';
     }
 
-    // A targeting expression, which carries its ASIN inside quotes. One cell
-    // rather than two: the breakdown is already wide, and the same rule holds
-    // — the expression first, the name set back behind it.
+    // The keyword or targeting expression exactly as Amazon reports it. The
+    // product name lives in its own column, so it is not repeated here.
     function stMatchedLabel(matched) {
-      const s = String(matched || '—');
-      const m = s.match(/asin="([^"]+)"/i);
-      const name = m ? stAsinName(m[1]) : null;
-      return name
-        ? `${escapeHtml(s)} <span class="arf-muted">${escapeHtml(name)}</span>`
-        : escapeHtml(s);
+      return escapeHtml(String(matched || '—'));
     }
 
     async function stNameAsins() {
@@ -370,13 +364,14 @@
       }
       const cols = [
         { key: 'searchTerm', label: 'Search term', sortable: true },
-        { key: 'product', label: 'Product' },
         { key: 'type', label: 'Stage' },
         { key: 'matched', label: 'Matched by' },
         { key: 'clicks', label: 'Clicks', sortable: true, right: true },
         { key: 'cost', label: 'Spend', sortable: true, right: true },
         { key: 'orders', label: 'Orders', sortable: true, right: true },
-        { key: 'sales', label: 'Sales', sortable: true, right: true }
+        { key: 'sales', label: 'Sales', sortable: true, right: true },
+        // Reference rather than data, so it sits after the numbers.
+        { key: 'product', label: 'Product' }
       ];
       const head = cols.map(c => {
         const cls = c.right ? ' class="arf-r"' : '';
@@ -416,13 +411,13 @@
         <td class="arf-name">${first ? `
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${spread}` : ''}</td>
-        <td>${first ? stProductCell(r.searchTerm) : ''}</td>
         <td>${escapeHtml(r.campaignType || '—')}</td>
         <td>${stMatchedLabel(r.matched)}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
+        <td>${first ? stProductCell(r.searchTerm) : ''}</td>
       </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
     }
 
@@ -618,13 +613,14 @@
 
     const ST_TERM_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
-      { key: 'product', label: 'Product' },
       { key: 'types', label: 'Matched in' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
       { key: 'sales', label: 'Sales', sortable: true, right: true },
-      { key: 'acos', label: 'ACoS', right: true }
+      { key: 'acos', label: 'ACoS', right: true },
+      // Reference rather than data, so it sits after the numbers.
+      { key: 'product', label: 'Product' }
     ];
 
     function stTermTable(data) {
@@ -672,13 +668,13 @@
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${
           r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
-        <td>${stProductCell(r.searchTerm)}</td>
         <td>${escapeHtml(r.types || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
         <td class="arf-r">${r.acos === null || r.acos === undefined ? '—' : Math.round(r.acos * 100) + '%'}</td>
+        <td>${stProductCell(r.searchTerm)}</td>
       </tr>${open ? stTermDetailRow() : ''}`;
     }
 

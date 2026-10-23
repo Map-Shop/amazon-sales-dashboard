@@ -1259,7 +1259,8 @@
     .main-content:has(#mapping-page.active),
     .main-content:has(#listing-page.active),
     .main-content:has(#adredflags-page.active),
-    .main-content:has(#adcampaigns-page.active) {
+    .main-content:has(#adcampaigns-page.active),
+    .main-content:has(#adsearchterms-page.active) {
       max-width: none;
       margin: 0;
     }
