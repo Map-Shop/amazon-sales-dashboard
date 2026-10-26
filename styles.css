@@ -2305,9 +2305,31 @@
       opacity: 0.75;
     }
 
+    /* How many of your products bid on the same search: worth knowing, not
+       worth shouting, so it sits beside the term as quiet text. */
     .st-contested {
-      color: var(--accent-yellow);
-      border-color: var(--accent-yellow);
+      margin-left: 0.4rem;
+      font-size: 0.7rem;
+      color: var(--text-secondary);
+      opacity: 0.7;
+      white-space: nowrap;
+    }
+
+    /* Product names run long — Amazon catalogue titles pass 150 characters —
+       so the column holds one width and wraps, rather than stretching the
+       table or pushing the figures off to the right. */
+    .arf-table th.st-col-product,
+    .arf-table td.st-col-product {
+      width: 16rem;
+      min-width: 16rem;
+      max-width: 16rem;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .arf-table td.st-col-product .arf-btn {
+      white-space: normal;
+      text-align: left;
     }
 
     /* Search Terms: the breadcrumb back out of one product, the first row of

@@ -428,7 +428,7 @@
       { key: 'sales', label: 'Sales', sortable: true, right: true },
       { key: 'roas', label: 'ROAS', sortable: true, right: true },
       // Reference rather than data, so it sits after the numbers.
-      { key: 'product', label: 'Product' }
+      { key: 'product', label: 'Product', cls: 'st-col-product' }
     ];
 
     function stProductTermTable(data) {
@@ -437,7 +437,8 @@
         return '<div class="arf-section"><p class="arf-none">No terms match these filters.</p></div>';
       }
       const head = ST_PRODUCT_TERM_COLS.map(c => {
-        const cls = c.right ? ' class="arf-r"' : '';
+        const names = [c.right && 'arf-r', c.cls].filter(Boolean).join(' ');
+        const cls = names ? ` class="${names}"` : '';
         if (!c.sortable) return `<th${cls}>${c.label}</th>`;
         const active = stSort === c.key;
         return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
@@ -468,7 +469,7 @@
       const open = !!stDetail && stDetail.term === r.searchTerm;
       const term = escapeHtml(r.searchTerm || '');
       const spread = r.products > 1
-        ? ` <span class="bw-tag st-contested" title="${r.products} of your products bid on this search">${
+        ? ` <span class="st-contested" title="${r.products} of your products bid on this search">${
             r.products} products</span>` : '';
       return `<tr${first ? ' class="st-group"' : ''}>
         <td class="arf-name">${first ? `
@@ -481,7 +482,7 @@
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
         <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
-        <td>${first ? stProductCell(r.searchTerm) : ''}</td>
+        <td class="st-col-product">${first ? stProductCell(r.searchTerm) : ''}</td>
       </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
     }
 
@@ -544,7 +545,7 @@
     // first. A ratio that cannot be worked out — no spend, no sales — always
     // sorts last, whichever way the column is turned.
     const ST_PRODUCT_COLS = [
-      { key: 'name', label: 'Product', text: true, of: r => r.portfolio || '' },
+      { key: 'name', label: 'Product', text: true, cls: 'st-col-product', of: r => r.portfolio || '' },
       { key: 'brand', label: 'Brand', text: true, of: r => r.brand || '' },
       { key: 'terms', label: 'Terms', of: r => r.terms },
       { key: 'clicks', label: 'Clicks', of: r => r.clicks },
@@ -588,7 +589,8 @@
       const rows = stProductRowsShown(all);
       const head = ST_PRODUCT_COLS.map(c => {
         const active = stProdSort === c.key;
-        return `<th${c.text ? '' : ' class="arf-r"'}><button class="arf-btn${
+        const names = [!c.text && 'arf-r', c.cls].filter(Boolean).join(' ');
+        return `<th${names ? ` class="${names}"` : ''}><button class="arf-btn${
           active ? ' arf-btn-go' : ''}" data-st-psort="${c.key}">${c.label}${
           active ? (stProdDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
       }).join('');
@@ -621,7 +623,7 @@
       const id = r.portfolioId ? escapeHtml(r.portfolioId) : '';
       const name = escapeHtml(r.portfolio || '(no portfolio)');
       return `<tr>
-        <td class="arf-name">${id
+        <td class="arf-name st-col-product">${id
           ? `<button class="arf-btn" data-st-product="${id}" data-st-product-name="${name}">${name}</button>`
           : name}</td>
         <td>${escapeHtml(r.brand || '—')}</td>
@@ -736,7 +738,7 @@
       { key: 'acos', label: 'ACoS', right: true },
       { key: 'roas', label: 'ROAS', sortable: true, right: true },
       // Reference rather than data, so it sits after the numbers.
-      { key: 'product', label: 'Product' }
+      { key: 'product', label: 'Product', cls: 'st-col-product' }
     ];
 
     function stTermTable(data) {
@@ -745,7 +747,8 @@
         return '<div class="arf-section"><p class="arf-none">No terms match these filters.</p></div>';
       }
       const head = ST_TERM_COLS.map(c => {
-        const cls = c.right ? ' class="arf-r"' : '';
+        const names = [c.right && 'arf-r', c.cls].filter(Boolean).join(' ');
+        const cls = names ? ` class="${names}"` : '';
         if (!c.sortable) return `<th${cls}>${c.label}</th>`;
         const active = stSort === c.key;
         return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
@@ -757,9 +760,7 @@
           <p class="arf-blurb">
             One row per search term for the month, across the whole account, however many
             campaigns matched it. Open a term to see each campaign and target that matched it
-            separately. <strong>exact</strong> means the term is also targeted as its own exact
-            keyword. <strong>N products</strong> is how many of your products bid on the same
-            search.
+            separately. "N products" is how many of your products bid on the same search.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
@@ -777,13 +778,12 @@
       // Contested by more than one of your own products. Counted across the
       // whole account even here, where the list may be narrowed to one.
       const spread = r.products > 1
-        ? ` <span class="bw-tag st-contested" title="${r.products} of your products bid on this search">${
+        ? ` <span class="st-contested" title="${r.products} of your products bid on this search">${
             r.products} products</span>` : '';
       return `<tr${open ? ' class="st-open"' : ''}>
         <td class="arf-name">
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
-            stTermLabel(r.searchTerm)}</button>${
-          r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
+            stTermLabel(r.searchTerm)}</button>${spread}</td>
         <td>${escapeHtml((r.matchTypes || []).join(', ') || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
@@ -791,7 +791,7 @@
         <td class="arf-r">${stMoney(r.sales)}</td>
         <td class="arf-r">${stAcos(r.cost, r.sales)}</td>
         <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
-        <td>${stProductCell(r.searchTerm)}</td>
+        <td class="st-col-product">${stProductCell(r.searchTerm)}</td>
       </tr>${open ? stTermDetailRow() : ''}`;
     }
 
@@ -870,7 +870,8 @@
         return '<div class="arf-section"><p class="arf-none">No rows match these filters.</p></div>';
       }
       const head = ST_COLS.map(c => {
-        const cls = c.right ? ' class="arf-r"' : '';
+        const names = [c.right && 'arf-r', c.cls].filter(Boolean).join(' ');
+        const cls = names ? ` class="${names}"` : '';
         if (!c.sortable) return `<th${cls}>${c.label}</th>`;
         const active = stSort === c.key;
         return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
