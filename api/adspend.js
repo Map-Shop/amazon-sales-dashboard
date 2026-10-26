@@ -5822,7 +5822,8 @@ async function handleSearchTermsGet(req, res) {
         sort: req.query.sort, dir: req.query.dir,
         limit: req.query.limit, offset: req.query.offset,
         q: String(req.query.q || '').trim(), minClicks: req.query.minClicks,
-        onlyDead: String(req.query.onlyDead) === '1'
+        onlyDead: String(req.query.onlyDead) === '1',
+        match: String(req.query.match || '').trim() || null
       });
       return res.status(200).json({
         ...base, view, portfolio, rows: page.rows, total: page.total,

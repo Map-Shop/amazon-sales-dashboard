@@ -226,6 +226,7 @@ const OPTIONS = [
   ['click floor', { month: '2026-09', minClicks: 15 }],
   ['no orders yet', { month: '2026-09', onlyDead: true }],
   ['shared terms', { month: '2026-09', minProducts: 2 }],
+  ['Auto only', { month: '2026-09', match: 'Auto' }],
   ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
   ['sorted by ROAS', { month: '2026-09', sort: 'roas', dir: 'desc' }],
   ['paged', { month: '2026-09', limit: 50, offset: 400 }]
@@ -342,11 +343,37 @@ console.log('\nONE PRODUCT  — paged by term, so a term is never split across p
 {
   const q = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', limit: 50, offset: 100 });
   const pageCte = q.rows.text.slice(q.rows.text.indexOf('page AS ('));
-  ok(/LIMIT \$7::int OFFSET \$8::int/.test(pageCte.slice(0, pageCte.indexOf(')\n'))),
+  ok(/LIMIT \$8::int OFFSET \$9::int/.test(pageCte.slice(0, pageCte.indexOf(')\n'))),
      'the page size applies to terms, inside the step that picks them',
      'a limit on match rows could cut a term with four matches in half');
   ok(/count\(\*\)::int AS n FROM picked/.test(q.count.text),
      'and the count is of terms, so the pager agrees with what is shown');
+}
+
+console.log('\nONE PRODUCT, ONE MATCH TYPE  — what Auto spent, and what has been done about it');
+
+{
+  const q = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', match: 'Auto' });
+  const inproduct = q.rows.text.slice(q.rows.text.indexOf('inproduct AS ('), q.rows.text.indexOf('term AS ('));
+  ok(q.rows.params[6] === 'Auto' && /= \$7\)/.test(inproduct),
+     'the match type narrows the rows before they are added up',
+     'so a term\'s spend and orders are what Auto spent and earned, not the product\'s whole total');
+  ok(ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', match: 'Exact; DROP' }).rows.params[6] === null,
+     'a match type outside the funnel\'s list is no filter at all');
+  ok(/t\.campaign_id, t\.ad_group_id/.test(inproduct),
+     'each row keeps the campaign and ad group it matched in, to check its own negatives against');
+}
+
+{
+  const t = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1' }).rows.text;
+  ok(/k\.match_label = 'Exact' AND kc\.portfolio_id = \$3/.test(t),
+     'Exact is an exact keyword of this product\'s own, in any of its campaigns');
+  ok(/n\.campaign_id = i\.campaign_id/.test(t) && /n\.level = 'campaign' OR n\.ad_group_id = i\.ad_group_id/.test(t),
+     'Negated is a negative in the campaign the row matched in, at either level',
+     'a negative in the Auto campaign says nothing about the Broad one');
+  ok(/NEGATIVE_EXACT/.test(t) && /position\(' ' \|\| lower\(btrim\(n\.neg_text\)\) \|\| ' '/.test(t) && /'asin="'/.test(t),
+     'an exact negative, a phrase negative on whole words, or a negative ASIN target');
+  ok(/coalesce\(n\.state, 'ENABLED'\) = 'ENABLED'/.test(t), 'only negatives that are on');
 }
 
 console.log('\nTHE BREAKDOWN  — one term, by product');

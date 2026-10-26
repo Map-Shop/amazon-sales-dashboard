@@ -33,6 +33,7 @@
     let stView = 'products';   // products | targets | terms | rows
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
+    let stMatch = '';          // inside a product: one match type, or all of them
 
     // The product list arrives whole — one row per product, a few dozen of
     // them — so it is sorted and filtered here rather than asked for again.
@@ -116,6 +117,7 @@
           if (stQuery) qs.set('q', stQuery);
           if (stPortfolio) qs.set('portfolio', stPortfolio.id);
           if (stOnlyDead) qs.set('onlyDead', '1');
+          if (stMatch && stWhich() === 'product-terms') qs.set('match', stMatch);
         }
         const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
@@ -552,6 +554,15 @@
             </select>
           </label>` : ''}
           ${data.view === 'targets' ? stTargetFilters(data) : ''}
+          ${data.view === 'product-terms' ? `
+          <label class="wk-field">
+            <span>Match type</span>
+            <select data-st-match>
+              <option value=""${stMatch ? '' : ' selected'}>all</option>
+              ${ST_MATCH_TYPES.map(m => `<option value="${escapeHtml(m)}"${
+                stMatch === m ? ' selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+            </select>
+          </label>` : ''}
           ${filtering ? `
           <label class="wk-field">
             <span>Search term contains</span>
@@ -584,6 +595,7 @@
       { key: 'searchTerm', label: 'Search term', sortable: true },
       { key: 'type', label: 'Match type' },
       { key: 'matched', label: 'Matched by' },
+      { key: 'status', label: 'Status' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
@@ -608,15 +620,23 @@
       }).join('');
       return `
         <div class="arf-section">
-          <h4>${escapeHtml(stPortfolio ? stPortfolio.name : 'Product')}</h4>
+          <h4>${escapeHtml(stPortfolio ? stPortfolio.name : 'Product')}${
+            stMatch ? ` · ${escapeHtml(stMatch)} only` : ''}</h4>
           <p class="arf-blurb">
             What each search term did <strong>for this product</strong>, one row per way the
-            product matched it. Sorting and filtering work on the term's total here, so a
-            term's rows stay together. Open one to see what the whole term costs across the
-            account and which other products are paying for the same search.
+            product matched it${stMatch ? `, ${escapeHtml(stMatch)} matches only — the totals are
+            what ${escapeHtml(stMatch)} spent and earned` : ''}. Sorting and filtering work on the
+            term's total here, so a term's rows stay together. Open one to see what the whole
+            term costs across the account and which other products are paying for the same search.
+          </p>
+          <p class="arf-blurb">
+            Status is what has already been done about a term, as of the morning's pull.
+            <strong>Exact</strong>: this product targets the term as an exact keyword of its own,
+            since that date. <strong>Negated</strong>: the campaign the row matched in blocks the
+            term, since that date. Blank is neither.
           </p>
           <div class="arf-table-wrap">
-            <table class="table-fill arf-table">
+            <table class="table-fill arf-table st-oneline">
               <thead><tr>${head}</tr></thead>
               <tbody>${rows.map((r, i) => stProductTermRow(r, rows[i - 1])).join('')}</tbody>
             </table>
@@ -638,7 +658,8 @@
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${spread}` : ''}</td>
         <td>${stMatchCell(r.matchLabel, r.campaignType)}</td>
-        <td>${stMatchedLabel(r.matched)}</td>
+        <td>${stCut(stMatchedLabel(r.matched), r.matched, 'st-cut-matched')}</td>
+        <td class="st-status">${stStatusCell(r, first)}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
@@ -646,6 +667,26 @@
         <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
         <td class="st-col-product">${first ? stProductCell(r.searchTerm) : ''}</td>
       </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
+    }
+
+    // What has already been done about a term, from the morning's snapshot of
+    // the keywords and negatives. Exact belongs to the term, so it sits on the
+    // term's first row; Negated belongs to the row, since each row matched in
+    // its own campaign and a campaign blocks a term for itself alone.
+    function stStatusCell(r, first) {
+      const muted = (t) => ` <span class="arf-muted">${t}</span>`;
+      const parts = [];
+      if (first && r.exact) {
+        parts.push(`Exact${r.exact.since ? muted(stDateLabel(r.exact.since)) : ''}${
+          r.exact.state === 'PAUSED' ? muted('paused') : ''}`);
+      }
+      if (r.negated) {
+        const phrase = /PHRASE/i.test(r.negated.by || '')
+          ? muted(`phrase "${escapeHtml(r.negated.text || '')}"`) : '';
+        const whole = r.negated.level === 'campaign' ? muted('whole campaign') : '';
+        parts.push(`Negated${r.negated.since ? muted(stDateLabel(r.negated.since)) : ''}${phrase}${whole}`);
+      }
+      return parts.join(' · ');
     }
 
     // The breakdown goes under the LAST match row of a term, so it does not
@@ -672,16 +713,16 @@
       const total = stDetail.total || {};
       const here = stPortfolio ? stPortfolio.id : null;
       const others = (stDetail.products || []).filter(p => p.portfolioId !== here);
-      const line = (label, m, cls) => `<tr class="st-sub${cls ? ' ' + cls : ''}">
-        <td class="st-sub-label">${label}</td>
-        <td></td><td></td>
+      const line = (label, m, cls, full) => `<tr class="st-sub${cls ? ' ' + cls : ''}">
+        <td class="st-sub-label">${stCut(label, full, 'st-cut-sub')}</td>
+        <td></td><td></td><td></td>
         ${stMetricCells(m)}
         <td class="arf-r">${stRoas(m.sales, m.cost)}</td>
         <td></td>
       </tr>`;
       return line('All products &middot; the whole search term', total, 'st-total') +
         (others.length
-          ? others.map(p => line(`&#8627; ${escapeHtml(p.portfolio || '—')}`, p)).join('')
+          ? others.map(p => line(`&#8627; ${escapeHtml(p.portfolio || '—')}`, p, '', p.portfolio)).join('')
           : stSubNote(cols, '<span class="arf-muted">No other product bids on this search.</span>'));
     }
 
@@ -1362,6 +1403,8 @@
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
         if (dead) { stOnlyDead = dead.value === '1'; stOffset = 0; return stFetch(); }
+        const match = e.target.closest('[data-st-match]');
+        if (match) { stMatch = match.value; stOffset = 0; stDetail = null; return stFetch(); }
         const tg = e.target.closest('[data-st-tg]');
         if (tg) {
           const v = tg.value;
@@ -1411,6 +1454,22 @@
         line += ' Amazon has not started it yet; its report queue is backed up.';
       }
       return line;
+    }
+
+    // The funnel's order, the same list the server checks a match type against.
+    const ST_MATCH_TYPES = ['Auto', 'Broad', 'Keyword group', 'Phrase', 'Exact', 'ASIN', 'Category'];
+
+    // "Sep 13" this year, "Oct 2021" before it — on the Pacific calendar every
+    // date on this page uses. Short, because a status cell holds two, and the
+    // day stops mattering once it is a year or more back.
+    function stDateLabel(iso) {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '';
+      const tz = { timeZone: 'America/Los_Angeles' };
+      const year = (x) => x.toLocaleDateString('en-US', { year: 'numeric', ...tz });
+      return year(d) === year(new Date())
+        ? d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', ...tz })
+        : d.toLocaleDateString('en-US', { month: 'short', year: 'numeric', ...tz });
     }
 
     const ST_REPORT_LABELS = { spSearchTerm: 'search terms', spTargeting: 'targets' };

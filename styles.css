@@ -2322,18 +2322,39 @@
        will not hold a width by itself. */
     .arf-table th.st-col-product,
     .arf-table td.st-col-product {
-      width: 16rem;
-      min-width: 16rem;
-      max-width: 16rem;
+      width: 12rem;
+      min-width: 12rem;
+      max-width: 12rem;
     }
 
     .st-asin-link {
       display: block;
-      max-width: 16rem;
+      max-width: 12rem;
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
     }
+
+    /* One product's terms: one line per row. The search term is the fact the
+       row is about, so it is never cut short; what matched it is, at a set
+       width with the full text on hover. */
+    .arf-table.st-oneline th,
+    .arf-table.st-oneline td,
+    .arf-table.st-oneline td .arf-btn {
+      white-space: nowrap;
+    }
+
+    .arf-table.st-oneline th,
+    .arf-table.st-oneline td {
+      padding-left: 0.4rem;
+      padding-right: 0.4rem;
+    }
+
+    .st-cut.st-cut-matched { max-width: 8rem; }
+
+    /* An opened term's lines are labelled in the search term's column; a
+       long product name there is cut rather than widening the whole table. */
+    .st-cut.st-cut-sub { max-width: 18rem; }
 
     /* What the daily pull last did and will do next, beside Pull latest. */
     .st-daily-line {
