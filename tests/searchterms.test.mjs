@@ -1,10 +1,10 @@
-// Search term reporting, phase 1: which month can be asked for, and what comes
-// back from Amazon's answer.
+// Search terms and bids: which days a daily pull asks for, and what comes back
+// from Amazon's answers.
 //
-// The expensive mistake here is not a wrong number on screen — it is a month
-// that was never pulled. Amazon keeps 95 days of Sponsored Products reporting
-// and nothing reconstructs a month past that, so the rules about which months
-// are still reachable are worth pinning exactly.
+// The expensive mistake here is not a wrong number on screen — it is a day
+// that was never pulled. Amazon keeps 65 days of search terms and nothing
+// reconstructs one past that, so the rules about which days are asked for are
+// worth pinning exactly.
 import { loadAdspend } from './harness.mjs';
 
 const { M, cleanup } = await loadAdspend('st');
@@ -12,100 +12,82 @@ const { M, cleanup } = await loadAdspend('st');
 let fails = 0;
 const ok = (c, l, d = '') => { if (!c) fails++; console.log(`  ${c ? 'OK  ' : 'FAIL'} ${l}${d ? '  ' + d : ''}`); };
 
-// ─── SETTLING ────────────────────────────────────────────────────────────────
+// ─── THE DAILY WINDOW ────────────────────────────────────────────────────────
 
-console.log('\nSETTLING  — a month is complete a week after it ends');
+console.log('\nTHE DAILY WINDOW  — the days still changing, and the days not yet held');
 
 {
-  // September ends on the 30th; Sponsored Products keeps crediting a click for
-  // 7 days, so the month is whole on 8 October.
-  ok(M.stMonthSettled('2026-09', '2026-10-08') === true, 'September is settled on 8 October');
-  ok(M.stMonthSettled('2026-09', '2026-10-07') === false,
-     'and not on the 7th', 'the last day of the month is still collecting');
-  ok(M.stMonthSettled('2026-02', '2026-03-08') === true,
-     'a short month settles on its own length', 'February ends on the 28th in 2026');
+  // Up to date: the last 8 days, every day, because a sale lands on the day
+  // of its click for 7 days afterwards.
+  const w = M.dailyWindow('2026-10-26', '2026-10-25', 'spSearchTerm');
+  ok(w.start === '2026-10-18' && w.end === '2026-10-25',
+     'an up-to-date store re-pulls the last 8 days, ending yesterday', `${w.start}..${w.end}`);
+  ok(M.ST_SETTLE_DAYS === 8, 'eight, the same settling margin the bi-weekly window uses');
 }
 
 {
-  ok(M.stDefaultMonth('2026-10-23') === '2026-09', 'late October offers September');
-  ok(M.stDefaultMonth('2026-10-05') === '2026-08',
-     'early October still offers August',
-     'September has not finished crediting, and a part-attributed month would read as a bad one');
+  // Behind: carries on from the day after the last one held.
+  const w = M.dailyWindow('2026-10-26', '2026-09-30', 'spSearchTerm');
+  ok(w.start === '2026-10-01' && w.end === '2026-10-25',
+     'a store that stops at 30 September carries on from 1 October', `${w.start}..${w.end}`,
+     );
 }
 
-// ─── WHAT CAN STILL BE ASKED FOR ─────────────────────────────────────────────
+{
+  // Far behind: one report holds 31 days, so the oldest days go first and the
+  // rest follow on the next runs — nothing skipped while it is reachable.
+  const w = M.dailyWindow('2026-12-20', '2026-10-25', 'spTargeting');
+  ok(w.start === '2026-10-26' && w.end === '2026-11-25',
+     'a gap longer than one report closes from its oldest day, 31 days at a time', `${w.start}..${w.end}`);
+}
 
-console.log('\nRETENTION  \u2014 65 days of search terms, not the 95 a campaign report keeps');
+{
+  // Behind further than Amazon remembers: from the oldest day it still has.
+  const w = M.dailyWindow('2026-12-20', '2026-09-01', 'spSearchTerm');
+  ok(w.start === '2026-10-16',
+     'a gap past retention starts from the oldest day Amazon still keeps',
+     `${w.start}, which is 65 days before 20 December`);
+}
+
+{
+  // Nothing held: one report's worth, ending yesterday.
+  const w = M.dailyWindow('2026-10-26', null, 'spTargeting');
+  ok(w.start === '2026-09-25' && w.end === '2026-10-25',
+     'the first pull of an empty store takes the last 31 days', `${w.start}..${w.end}`);
+}
+
+{
+  // Pulled twice in a day: the second asks for the same days, not fewer.
+  const w = M.dailyWindow('2026-10-26', '2026-10-26', 'spSearchTerm');
+  ok(w.start === '2026-10-18' && w.end === '2026-10-25', 'a second pull the same day asks for the same days');
+}
+
+{
+  const months = M.stByMonth([{ date: '2026-09-29' }, { date: '2026-10-01' }, { date: '2026-09-30' }]);
+  ok([...months.keys()].join() === '2026-09,2026-10' && months.get('2026-09').length === 2,
+     'a window crossing a month end tops up both months');
+}
+
+{
+  const w = M.dailyParseWindows('spSearchTerm:2026-10-18:2026-10-25,spTargeting:2026-10-18:2026-10-25,' +
+                                'spCampaigns:2026-10-01:2026-10-02,spTargeting:bad:2026-10-01');
+  ok(w.spSearchTerm && w.spSearchTerm.start === '2026-10-18' && w.spTargeting && w.spTargeting.end === '2026-10-25',
+     'the page carries each report\'s window from request to collect');
+  ok(!w.spCampaigns && Object.keys(w).length === 2,
+     'a report type this pull does not make, or a malformed date, is ignored');
+  ok(Object.keys(M.dailyParseWindows('spSearchTerm:2026-10-25:2026-10-18')).length === 0,
+     'and so is a window that ends before it starts');
+}
+
+console.log('\nRETENTION  — 65 days of search terms, not the 95 a campaign report keeps');
 
 // Read off Amazon itself: asked for August on 23 October it returned the 19th
 // onward and called that a success. 23 October minus 65 days is 19 August.
 ok(M.REPORT_RETENTION_DAYS.spSearchTerm === 65 && M.REPORT_RETENTION_DAYS.sp === 95,
    'the search term report has its own, shorter retention',
    'one number for both is what let a short month through');
-
-{
-  const months = M.stPullableMonths('2026-10-23');
-  const by = Object.fromEntries(months.map(m => [m.month, m]));
-
-  ok(!!by['2026-09'] && by['2026-09'].partial === false,
-     'on 23 October September is whole');
-  ok(by['2026-09'].clipsAt === '2026-11-05' && by['2026-09'].expires === '2026-12-04',
-     'and is dated with when it starts losing days and when the last of it goes',
-     `${by['2026-09'].clipsAt} / ${by['2026-09'].expires}`);
-
-  ok(!!by['2026-08'] && by['2026-08'].partial === true,
-     'August is still offered, and marked short',
-     'half a month is worth capturing, so it is clamped rather than hidden');
-  ok(by['2026-08'].start === '2026-08-19' && by['2026-08'].monthStart === '2026-08-01',
-     'clamped to the oldest day Amazon still has', by['2026-08'].start);
-  ok(by['2026-08'].expires === '2026-11-04', 'with the day the rest of it goes', by['2026-08'].expires);
-
-  ok(!by['2026-07'], 'July is gone entirely and is not offered');
-  ok(!by['2026-10'], 'and October has not finished crediting');
-}
-
-{
-  // Two weeks later, August has gone entirely.
-  const by = Object.fromEntries(M.stPullableMonths('2026-11-06').map(m => [m.month, m]));
-  ok(!by['2026-08'], 'after 4 November, August is no longer offered at all');
-  ok(!!by['2026-09'] && by['2026-09'].partial === true,
-     'and September has started losing its own first days',
-     'which is five weeks earlier than the 95-day number implied');
-}
-
-console.log('\nstResolveMonth  \u2014 the refusals, and the clamp');
-
-{
-  const r = M.stResolveMonth('2026-09', '2026-10-23');
-  ok(!r.error && r.start === '2026-09-01' && r.end === '2026-09-30' && r.partial === false,
-     'a month Amazon holds whole resolves to its calendar bounds');
-  ok(M.stResolveMonth('', '2026-10-23').month === '2026-09',
-     'no month given falls back to the most recent settled one');
-}
-
-{
-  const r = M.stResolveMonth('2026-08', '2026-10-23');
-  ok(!r.error && r.start === '2026-08-19' && r.monthStart === '2026-08-01' && r.partial === true,
-     'a month Amazon holds only part of is CLAMPED, not refused',
-     'asking for days it has already dropped is how a short month passes for a whole one');
-}
-
-{
-  const r = M.stResolveMonth('2026-13', '2026-10-23');
-  ok(!!r.error && /YYYY-MM/.test(r.error), 'a malformed month is refused', r.error);
-}
-
-{
-  const r = M.stResolveMonth('2026-10', '2026-10-23');
-  ok(!!r.error && /2026-11-08/.test(r.error),
-     'a month still collecting is refused, and says when it will be ready', r.error);
-}
-
-{
-  const r = M.stResolveMonth('2026-06', '2026-10-23');
-  ok(!!r.error && /65/.test(r.error) && /no longer be pulled/.test(r.error),
-     'a month past retention is refused in those words, with the right number', r.error);
-}
+ok(!M.REPORT_RETENTION_DAYS.spTargeting,
+   'the targeting report keeps the campaign report\'s 95 days');
 
 console.log('\nTHE REQUEST  — what is actually asked of Amazon');
 
@@ -439,6 +421,131 @@ console.log('\nBIDS  \u2014 Amazon\'s keywords and targets, in the stored shape'
      'an expression type Amazon adds later is kept and labelled, not dropped');
   ok(close.state === 'PAUSED' && close.bid === 0.4 && t([]).text === null,
      'a target keeps its state and bid; one with no expression has no text');
+}
+
+{
+  const kw = M.tgNormalizeKeyword({ keywordId: 1, matchType: 'EXACT', keywordText: 'x',
+    extendedData: { creationDateTime: '2025-03-04T17:20:00Z', lastUpdateDateTime: 1761000000000, servingStatus: 'TARGETING_CLAUSE_STATUS_LIVE' } });
+  ok(kw.createdAt === '2025-03-04T17:20:00.000Z' && kw.updatedAt === new Date(1761000000000).toISOString() &&
+     kw.servingStatus === 'TARGETING_CLAUSE_STATUS_LIVE',
+     'Amazon\'s creation and last-change dates are kept, as ISO strings or epoch milliseconds',
+     'an exact keyword\'s creation date is the day its term was graduated');
+  ok(M.tgNormalizeKeyword({ keywordId: 2 }).createdAt === null && M.tgDate('not a date') === null,
+     'a list that sent no dates, or a date that is not one, stores none');
+}
+
+console.log('\nNEGATIVES AND PRODUCTS  \u2014 the rest of the morning snapshot');
+
+{
+  const [agKw, campKw, agTg, campTg] = M.NEG_LISTS;
+  ok(M.NEG_LISTS.map(s => `${s.level}/${s.kind}`).join(',') ===
+     'ad_group/keyword,campaign/keyword,ad_group/target,campaign/target',
+     'all four places a negative can live are pulled');
+  ok(M.NEG_LISTS.every(s => s.states.join() === 'ENABLED'), 'enabled only: an archived negative negates nothing');
+  const a = M.negNormalize(agKw, { keywordId: 9, campaignId: 1, adGroupId: 2, state: 'enabled',
+                                   matchType: 'NEGATIVE_EXACT', keywordText: 'free world map' });
+  ok(a.negativeId === '9' && a.adGroupId === '2' && a.matchType === 'NEGATIVE_EXACT' && a.text === 'free world map' &&
+     a.state === 'ENABLED', 'an ad group negative keyword keeps its ad group and match type');
+  const c = M.negNormalize(campKw, { keywordId: 10, campaignId: 1, adGroupId: 2, keywordText: 'cheap' });
+  ok(c.level === 'campaign' && c.adGroupId === null,
+     'a campaign negative belongs to no ad group, whatever Amazon sends');
+  const t = M.negNormalize(campTg, { targetId: 11, campaignId: 1,
+    expression: [{ type: 'ASIN_SAME_AS', value: 'B07SXC739C' }] });
+  ok(t.negativeId === '11' && t.text === 'asin="B07SXC739C"' && t.kind === 'target' && t.expression.length === 1,
+     'a negative product target reads like the targets it blocks');
+  ok(agTg.kind === 'target' && agTg.level === 'ad_group', 'and the ad group one is a product target too');
+}
+
+{
+  const p = M.productAdNormalize({ adId: 5, campaignId: 1, adGroupId: 2, asin: 'b07sxc739c', sku: 'SOK-PET', state: 'enabled' });
+  ok(p.adId === '5' && p.asin === 'B07SXC739C' && p.sku === 'SOK-PET' && p.state === 'ENABLED',
+     'an advertised product keeps its ASIN, upper-cased to match the catalog, and its SKU');
+}
+
+console.log('\nTHE TARGETING REPORT  \u2014 each keyword and target\'s own day');
+
+{
+  const rows = M.tdNormalizeRows([
+    { date: '2026-10-20', keywordId: 777, campaignId: 1, adGroupId: 2, keyword: 'world map', matchType: 'EXACT',
+      keywordBid: 0.85, impressions: 1200, clicks: 9, cost: 6.3, purchases7d: 1, sales7d: 34.99,
+      topOfSearchImpressionShare: 0.12, adKeywordStatus: 'ENABLED' },
+    { date: '2026-10-20', keywordId: null, impressions: 5 },
+    { date: 'nope', keywordId: 778, impressions: 5 }
+  ]);
+  ok(rows.length === 1 && rows[0].targetId === '777',
+     'a row is kept by the keyword or target it belongs to; one without either id or day is dropped');
+  ok(rows[0].impressions === 1200 && rows[0].topOfSearchIs === 0.12 && rows[0].keywordBid === 0.85,
+     'with its impressions, top-of-search share and the bid Amazon reports for the day');
+}
+
+{
+  const body = M.buildReportBody('sp', '2026-10-01', '2026-10-25', M.TD_REPORT_COLUMNS, {
+    name: 'Targets', groupBy: ['targeting'], reportTypeId: M.TD_REPORT_KEY });
+  ok(body.configuration.reportTypeId === 'spTargeting' && body.configuration.groupBy.join() === 'targeting' &&
+     body.configuration.timeUnit === 'DAILY', 'the targeting report, by target, by day');
+  ok(M.TD_OPTIONAL_COLUMNS.every(c => M.TD_REPORT_COLUMNS.includes(c)) &&
+     !M.TD_OPTIONAL_COLUMNS.includes('impressions') && !M.TD_OPTIONAL_COLUMNS.includes('keywordId'),
+     'only the newer columns may be dropped; the ones the table is for may not');
+}
+
+{
+  // A refused optional column is dropped and the report asked for again; a
+  // refused column the report needs is not.
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push(body.configuration.columns);
+    const refuse = body.configuration.columns.filter(c => /topOfSearch|madeUp/.test(c));
+    if (refuse.length) {
+      return new Response(JSON.stringify({ code: '400', detail: `configuration columns includes invalid values: (${refuse.join(', ')}). Allowed values: (date, clicks)` }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ reportId: 'rep-12345678' }), { status: 200 });
+  };
+  const plan = { key: 'spTargeting', window: { start: '2026-10-18', end: '2026-10-25' },
+                 columns: M.TD_REPORT_COLUMNS, optional: M.TD_OPTIONAL_COLUMNS,
+                 shape: { groupBy: ['targeting'], reportTypeId: 'spTargeting' } };
+  const r = await M.dailyRequestOne('token', plan);
+  ok(r.reportId === 'rep-12345678' && r.dropped.join() === 'topOfSearchImpressionShare' && sent.length === 2 &&
+     !sent[1].includes('topOfSearchImpressionShare') && sent[1].includes('impressions'),
+     'a refused newer column is dropped and the report asked for again without it', r.dropped.join());
+  let threw = '';
+  try {
+    await M.dailyRequestOne('token', { ...plan, columns: [...M.TD_REPORT_COLUMNS, 'madeUpColumn'] });
+  } catch (e) { threw = e.message; }
+  ok(/madeUpColumn/.test(threw), 'a refusal that includes a column it needs is not worked around', threw.slice(0, 80));
+  globalThis.fetch = realFetch;
+}
+
+console.log('\nWHAT CHANGED  \u2014 between one morning\'s bids and the next');
+
+{
+  const { diffTargets } = await import('../lib/targets.js');
+  const before = [
+    { targetId: 'a', state: 'ENABLED', bid: 0.85, matchLabel: 'Exact', text: 'world map' },
+    { targetId: 'b', state: 'ENABLED', bid: null, text: 'close-match' },
+    { targetId: 'c', state: 'ENABLED', bid: 0.5 },
+    { targetId: 'd', state: 'PAUSED', bid: 0.4 },
+    { targetId: 'e', state: 'ENABLED', bid: 1.2 }
+  ];
+  const after = [
+    { targetId: 'a', state: 'ENABLED', bid: 0.62, matchLabel: 'Exact', text: 'world map' },
+    { targetId: 'b', state: 'ENABLED', bid: 0.3 },
+    { targetId: 'c', state: 'PAUSED', bid: 0.5 },
+    { targetId: 'e', state: 'ENABLED', bid: 1.2000001 },
+    { targetId: 'f', state: 'ENABLED', bid: 0.75 }
+  ];
+  const d = diffTargets(before, after);
+  const by = (id, field) => d.find(x => x.targetId === id && x.field === field);
+  ok(by('a', 'bid') && by('a', 'bid').from === '0.85' && by('a', 'bid').to === '0.62' && by('a', 'bid').text === 'world map',
+     'a moved bid is logged with both values and what the target is');
+  ok(by('b', 'bid') && by('b', 'bid').from === 'default' && by('b', 'bid').to === '0.30',
+     'a target taken off its ad group\'s default is a bid change too');
+  ok(by('c', 'state') && by('c', 'state').to === 'PAUSED' && !by('c', 'bid'), 'a pause is a state change, and only that');
+  ok(by('d', 'removed') && by('f', 'added'), 'a target gone and a target new are both logged');
+  ok(!d.some(x => x.targetId === 'e'), 'a bid the same to the cent is not a change');
+  ok(diffTargets([], after).length === 5 && diffTargets(after, after).length === 0,
+     'identical pulls log nothing');
 }
 
 console.log('\nSUGGESTED BIDS  \u2014 reading Amazon\'s answer');

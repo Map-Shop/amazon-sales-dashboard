@@ -145,6 +145,10 @@ export default async function handler(req, res) {
     if (action === 'searchterms-get')      return handleSearchTermsGet(req, res);
     if (action === 'searchterms-bids')     return handleSearchTermsBids(req, res);
     if (action === 'searchterms-suggest')  return handleSearchTermsSuggest(req, res);
+    // The daily pull: snapshot, request, collect twice — see DAILY CRON.
+    if (action === 'cron-daily-snapshot')  return handleCronDailySnapshot(req, res);
+    if (action === 'cron-daily-request')   return handleCronDailyRequest(req, res);
+    if (action === 'cron-daily-collect')   return handleCronDailyCollect(req, res);
     // Weekly history — the continuous series, see the section at the bottom.
     if (action === 'weeks-get')            return handleWeeksGet(req, res);
     if (action === 'weeks-rebuild')        return handleWeeksRebuild(req, res);
@@ -5175,15 +5179,27 @@ async function whIngestWeeklyRun({ rows, census, window }) {
 }
 
 // ─── SEARCH TERMS ────────────────────────────────────────────────────────────
-// Phase 1: pull one calendar month of Sponsored Products search terms, store
-// it, and show it. Nothing is judged here and nothing is written to Amazon —
-// the negative and graduation lists are a later phase, and they will be built
-// from the stored rows rather than from a fresh report.
+// Sponsored Products search terms, and each keyword and target's own day,
+// pulled daily and stored day by day. Nothing is judged here and nothing is
+// written to Amazon — the negative and graduation lists come later, built from
+// the stored rows.
 //
-// Every row Amazon returns is kept, including the terms that drew impressions
-// and never a click. Those are most of the report on an Auto- and Broad-heavy
-// account, and whether they earn their space is exactly what the first pull is
-// meant to answer, so the collect reports the split rather than guessing it.
+// THE DAILY PULL. Each run asks for the days that can still change and the
+// days not yet held:
+//
+//   - the last 8 days, every day. Amazon credits a sale to the day of the
+//     click for 7 days afterwards, so a day is only final on its 8th re-pull.
+//   - back to the day after the last one stored, when the store has fallen
+//     behind — a missed run, or the first one. At most 31 days in one report,
+//     Amazon's limit; a longer gap closes over the following runs, oldest
+//     first, so nothing is skipped while something older is still reachable.
+//
+// Days are replaced, never months: Amazon keeps 65 days of search terms, and a
+// re-pull that comes back shorter must not delete what it did not bring.
+//
+// Every row Amazon returns is kept. The search term report only carries terms
+// that got a click; impressions for the rest are in the targeting report,
+// which is why that one is pulled alongside it.
 
 const ST_PRODUCT = 'SP';
 const ST_REPORT_KEY = 'spSearchTerm';
@@ -5196,84 +5212,43 @@ const ST_REPORT_COLUMNS = [
   'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d'
 ];
 
-// Sponsored Products credits a purchase to the click for 7 days, so a month is
-// only complete a week after it ends. The 8th day is the same margin the
-// bi-weekly window uses.
+// Sponsored Products credits a purchase to the click for 7 days, so a day is
+// only complete a week after it. The 8th day is the same margin the bi-weekly
+// window uses.
 const ST_SETTLE_DAYS = 8;
 
-// The month number is range-checked, not just counted: "2026-13" would
-// otherwise pass, and the date arithmetic below turns it into an invalid date
-// string that throws several calls later.
+// Each keyword and target's own day. keywordBid, top-of-search share and the
+// status are newer columns than the rest: if Amazon refuses one, the report is
+// asked for again without it rather than not at all.
+const TD_REPORT_KEY = 'spTargeting';
+const TD_REPORT_COLUMNS = [
+  'date', 'campaignId', 'adGroupId', 'keywordId', 'keyword', 'matchType', 'targeting',
+  'keywordType', 'adKeywordStatus', 'keywordBid',
+  'impressions', 'clicks', 'cost', 'purchases7d', 'sales7d', 'topOfSearchImpressionShare'
+];
+const TD_OPTIONAL_COLUMNS = ['keywordType', 'adKeywordStatus', 'keywordBid', 'topOfSearchImpressionShare'];
+
+const DAILY_REPORT_KEYS = [ST_REPORT_KEY, TD_REPORT_KEY];
+
+// Months are still how the page is read, so the range check stays: "2026-13"
+// would otherwise pass, and the date arithmetic turns it into an invalid date
+// that throws several calls later.
 const ST_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
-function stMonthSettled(ym, today) {
-  return _addDays(moMonthBounds(ym).end, ST_SETTLE_DAYS) <= today;
-}
-
-// The most recent month whose conversions have all landed.
-function stDefaultMonth(today) {
-  let ym = today.slice(0, 7);
-  for (let i = 0; i < 4; i++) {
-    ym = moShiftMonth(ym, -1);
-    if (stMonthSettled(ym, today)) return ym;
-  }
-  return ym;
-}
-
-// Months that can still be asked for, and how much of each Amazon still has.
-//
-// A month at the edge of retention is offered with its window clamped to the
-// floor rather than hidden: half a month is worth capturing, and the rows that
-// come back are dated, so a short month is visible rather than assumed whole.
-//
-//   clipsAt  the day this month starts losing its first days
-//   expires  the day the last of it goes
-function stPullableMonths(today) {
-  const floor = stRetentionFloor(today);
-  const days = REPORT_RETENTION_DAYS[ST_REPORT_KEY];
-  const out = [];
-  let ym = today.slice(0, 7);
-  for (let i = 0; i < 6; i++) {
-    ym = moShiftMonth(ym, -1);
-    const { start, end } = moMonthBounds(ym);
-    if (!stMonthSettled(ym, today)) continue;
-    if (floor && end < floor) break;          // nothing of it left
-    const from = (floor && start < floor) ? floor : start;
-    out.push({
-      month: ym, start: from, end, monthStart: start, partial: from !== start,
-      clipsAt: _addDays(start, days), expires: _addDays(end, days)
-    });
-  }
-  return out;
-}
-
-function stRetentionFloor(today) {
-  return reportRetentionStart(ST_REPORT_KEY, new Date(`${today}T12:00:00Z`));
-}
-
-// Validates the month a caller asked for and returns its window. The refusals
-// are the two that cost a report request to discover at Amazon.
-function stResolveMonth(raw, today) {
-  const month = String(raw || '').trim() || stDefaultMonth(today);
-  if (!ST_MONTH_RE.test(month)) return { error: `month must be YYYY-MM, got "${raw}"` };
-  const { start, end } = moMonthBounds(month);
-  if (!stMonthSettled(month, today)) {
-    return { error: `${moMonthLabel(month)} has not settled yet. Sponsored Products keeps ` +
-                    `crediting sales to a click for 7 days, so this month is complete on ` +
-                    `${_addDays(end, ST_SETTLE_DAYS)}.` };
-  }
-  const days = REPORT_RETENTION_DAYS[ST_REPORT_KEY];
-  const floor = stRetentionFloor(today);
-  if (floor && end < floor) {
-    return { error: `${moMonthLabel(month)} is past Amazon's ${days}-day search term ` +
-                    `retention, which now reaches back to ${floor}. That month can no ` +
-                    `longer be pulled.` };
-  }
-  // Clamped, not refused: Amazon would return these days and silently drop the
-  // rest, so the request says what is actually being asked for and the answer
-  // can be checked against it.
-  const from = (floor && start < floor) ? floor : start;
-  return { month, start: from, end, monthStart: start, partial: from !== start };
+// The days one daily pull asks for — see the top of this section.
+//   today       the Pacific date of the run
+//   lastStored  the last day already held, or null when nothing is
+//   key         the report type, whose retention floors the window
+function dailyWindow(today, lastStored, key) {
+  const yesterday = _addDays(today, -1);
+  const refreshFrom = _addDays(today, -ST_SETTLE_DAYS);
+  let start = lastStored ? _addDays(lastStored, 1) : _addDays(yesterday, -(MAX_REPORT_DAYS - 1));
+  if (start > refreshFrom) start = refreshFrom;
+  const floor = reportRetentionStart(key, new Date(`${today}T12:00:00Z`));
+  if (floor && start < floor) start = floor;
+  let end = _addDays(start, MAX_REPORT_DAYS - 1);
+  if (end > yesterday) end = yesterday;
+  return { start, end };
 }
 
 const stNum = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
@@ -5303,46 +5278,185 @@ function stNormalizeRows(raw) {
   return out;
 }
 
+// The targeting report's rows. keywordId is the keyword's or the target's id,
+// the same id the keyword and target lists carry. A row without one cannot be
+// joined to anything and is dropped, as is one without a date.
+function tdNormalizeRows(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const r of raw) {
+    const date = String(r.date || '').substring(0, 10);
+    const targetId = stText(r.keywordId);
+    if (!DATE_RE.test(date) || !targetId) continue;
+    out.push({
+      date, targetId,
+      campaignId: stText(r.campaignId), adGroupId: stText(r.adGroupId),
+      keyword: stText(r.keyword), targeting: stText(r.targeting),
+      matchType: stText(r.matchType), keywordType: stText(r.keywordType),
+      status: stText(r.adKeywordStatus), keywordBid: stNum(r.keywordBid),
+      impressions: stNum(r.impressions), clicks: stNum(r.clicks), cost: stNum(r.cost),
+      purchases7d: stNum(r.purchases7d), sales7d: stNum(r.sales7d),
+      topOfSearchIs: stNum(r.topOfSearchImpressionShare)
+    });
+  }
+  return out;
+}
+
+// Rows grouped by the month they fall in. The page still reads a month at a
+// time, and a pull that crosses a month end tops up both.
+function stByMonth(rows) {
+  const out = new Map();
+  for (const r of rows) {
+    const m = r.date.slice(0, 7);
+    if (!out.has(m)) out.set(m, []);
+    out.get(m).push(r);
+  }
+  return out;
+}
+
+// What one daily pull would ask for, today, given what is stored.
+async function dailyPlans(today) {
+  const [lastTerms, lastTargets] = await Promise.all([searchTerms.lastDate(ST_PRODUCT), targets.lastDay()]);
+  return [
+    { key: ST_REPORT_KEY, window: dailyWindow(today, lastTerms, ST_REPORT_KEY),
+      columns: ST_REPORT_COLUMNS, optional: [],
+      shape: { name: 'Search terms', groupBy: ['searchTerm'], reportTypeId: ST_REPORT_KEY } },
+    { key: TD_REPORT_KEY, window: dailyWindow(today, lastTargets, TD_REPORT_KEY),
+      columns: TD_REPORT_COLUMNS, optional: TD_OPTIONAL_COLUMNS,
+      shape: { name: 'Targets', groupBy: ['targeting'], reportTypeId: TD_REPORT_KEY } }
+  ];
+}
+
+// One report. A refused column that the report can do without is dropped and
+// the report asked for again, once; any other refusal stands. The same 425
+// recovery the cadences use: Amazon names the report already generating, and
+// adopting it beats leaving it orphaned.
+async function dailyRequestOne(accessToken, plan) {
+  let columns = plan.columns;
+  const dropped = [];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const body = buildReportBody('sp', plan.window.start, plan.window.end, columns, plan.shape);
+      const reportId = await withAdsRetry(() => requestReport(accessToken, body));
+      return { reportId, dropped };
+    } catch (err) {
+      if (/\(425\)/.test(err.message)) {
+        const adopted = rfDuplicateReportId(err.message);
+        if (adopted) return { reportId: adopted, adopted: true, dropped };
+      }
+      const bad = rfInvalidColumns(err.message);
+      if (attempt === 0 && bad.length && bad.every(c => plan.optional.includes(c))) {
+        columns = columns.filter(c => !bad.includes(c));
+        dropped.push(...bad);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function dailyRequest(accessToken, today) {
+  const reports = [];
+  const failures = [];
+  for (const plan of await dailyPlans(today)) {
+    if (plan.window.start > plan.window.end) continue;   // nothing to ask for
+    try {
+      const r = await dailyRequestOne(accessToken, plan);
+      reports.push({ key: plan.key, reportId: r.reportId, start: plan.window.start,
+                     end: plan.window.end, adopted: !!r.adopted, dropped: r.dropped });
+    } catch (err) {
+      console.error(`[DAILY] ${plan.key} request failed:`, err.message);
+      failures.push({ key: plan.key, error: err.message, invalidColumns: rfInvalidColumns(err.message),
+                      window: `${plan.window.start}..${plan.window.end}` });
+    }
+    await sleep(600);
+  }
+  return { reports, failures };
+}
+
+// Stores one downloaded search term report, month by month. What came back is
+// compared with what was asked for, because Amazon reports a clipped window as
+// a successful one.
+async function stStoreDays(raw, rep) {
+  const rows = stNormalizeRows(raw);
+  const months = [];
+  for (const [month, monthRows] of stByMonth(rows)) {
+    const covered = await searchTerms.replaceRange(ST_PRODUCT, month, monthRows);
+    const stats = await searchTerms.monthStats(ST_PRODUCT, month);
+    const { start: ms, end: me } = moMonthBounds(month);
+    await searchTerms.recordPull({
+      adProduct: ST_PRODUCT, month,
+      windowStart: rep.start > ms ? rep.start : ms, windowEnd: rep.end < me ? rep.end : me,
+      coveredStart: covered.from, coveredEnd: covered.to,
+      rows: stats.rows, zeroClick: stats.zeroClick, terms: stats.terms,
+      clicks: stats.clicks, cost: stats.cost, dataBytes: stats.dataBytes
+    });
+    months.push({ month, from: covered.from, to: covered.to, rows: monthRows.length });
+  }
+  const first = rows.reduce((a, r) => (a === null || r.date < a ? r.date : a), null);
+  return { returned: Array.isArray(raw) ? raw.length : 0, stored: rows.length, months,
+           from: first, short: !!(first && first > rep.start) };
+}
+
+async function tdStoreDays(raw, rep) {
+  const rows = tdNormalizeRows(raw);
+  const stored = await targets.replaceDays(rows);
+  return { returned: Array.isArray(raw) ? raw.length : 0, stored: rows.length,
+           from: stored.from, to: stored.to, short: !!(stored.from && stored.from > rep.start) };
+}
+
+// Downloads and stores whichever of these reports are ready. Each report is
+// stored on its own, so one that is late does not hold back the other.
+async function dailyCollect(accessToken, reports) {
+  const results = [];
+  const notReady = [];
+  for (const rep of reports) {
+    try {
+      const status = await withAdsRetry(() => getReportStatus(accessToken, rep.reportId));
+      const url = status.url || status.location;
+      if (!url) { notReady.push({ key: rep.key, status: status.status || 'unknown' }); continue; }
+      const raw = await withAdsRetry(() => downloadReport(url));
+      const stored = rep.key === ST_REPORT_KEY ? await stStoreDays(raw, rep) : await tdStoreDays(raw, rep);
+      results.push({ key: rep.key, start: rep.start, end: rep.end, ...stored });
+    } catch (err) {
+      console.error(`[DAILY] ${rep.key} collect failed:`, err.message);
+      notReady.push({ key: rep.key, status: 'error: ' + err.message });
+    }
+  }
+  return { results, notReady };
+}
+
+// "spSearchTerm:2026-10-01:2026-10-25,spTargeting:…" — the window each
+// report was asked for, carried by the page from request to collect.
+function dailyParseWindows(raw) {
+  const out = {};
+  for (const part of String(raw || '').split(',').map(s => s.trim()).filter(Boolean)) {
+    const [key, start, end] = part.split(':');
+    if (DAILY_REPORT_KEYS.includes(key) && DATE_RE.test(start || '') && DATE_RE.test(end || '') && start <= end) {
+      out[key] = { start, end };
+    }
+  }
+  return out;
+}
+
+// The page's Pull latest: the same pull the cron makes, on demand.
 async function handleSearchTermsRequest(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-
     const missing = missingAdsCredentials();
     if (missing.length) {
       return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
     }
-
-    const m = stResolveMonth(req.query.month, _ptDate(new Date()));
-    if (m.error) return res.status(400).json({ error: m.error });
-
     const accessToken = await getAdsAccessToken();
-    try {
-      const body = buildReportBody('sp', m.start, m.end, ST_REPORT_COLUMNS, {
-        name: 'Search terms', groupBy: ['searchTerm'], reportTypeId: ST_REPORT_KEY
-      });
-      const reportId = await withAdsRetry(() => requestReport(accessToken, body));
-      return res.status(200).json({
-        success: true, month: m.month, window: { start: m.start, end: m.end },
-        reports: [{ key: ST_REPORT_KEY, reportId }],
-        requestedAt: new Date().toISOString()
-      });
-    } catch (err) {
-      // The same 425 recovery the cadences use: Amazon names the report
-      // already generating, and adopting it beats leaving it orphaned.
-      const adopted = /\(425\)/.test(err.message) ? rfDuplicateReportId(err.message) : null;
-      if (adopted) {
-        return res.status(200).json({
-          success: true, month: m.month, window: { start: m.start, end: m.end },
-          reports: [{ key: ST_REPORT_KEY, reportId: adopted, adopted: true }],
-          requestedAt: new Date().toISOString()
-        });
-      }
-      console.error('[SEARCHTERMS REQUEST] failed:', err.message);
+    const { reports, failures } = await dailyRequest(accessToken, _ptDate(new Date()));
+    if (!reports.length) {
       return res.status(502).json({
-        error: err.message, invalidColumns: rfInvalidColumns(err.message)
+        error: failures.length ? failures.map(f => `${f.key}: ${f.error}`).join('; ') : 'Nothing to pull.',
+        invalidColumns: failures.flatMap(f => f.invalidColumns || [])
       });
     }
+    return res.status(200).json({ success: true, reports, failures, requestedAt: new Date().toISOString() });
   } catch (error) {
     console.error('[SEARCHTERMS REQUEST] Error:', error);
     return res.status(500).json({ error: 'Search term request failed: ' + error.message });
@@ -5354,7 +5468,7 @@ async function handleSearchTermsStatus(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const parsed = parseReportsParam(req.query.reports, [ST_REPORT_KEY]);
+    const parsed = parseReportsParam(req.query.reports, DAILY_REPORT_KEYS);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
 
     const accessToken = await getAdsAccessToken();
@@ -5375,62 +5489,162 @@ async function handleSearchTermsCollect(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const parsed = parseReportsParam(req.query.reports, [ST_REPORT_KEY]);
+    const parsed = parseReportsParam(req.query.reports, DAILY_REPORT_KEYS);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
-    // The month is required on collect: it decides which stored month this
-    // replaces, and defaulting that would let a late collect overwrite the
-    // wrong one.
-    if (!ST_MONTH_RE.test(String(req.query.month || ''))) {
-      return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
+    // The window is required: it is what a short answer is measured against,
+    // and the month summary records it.
+    const windows = dailyParseWindows(req.query.windows);
+    const reps = parsed.reports.map(r => ({ ...r, ...(windows[r.key] || {}) }));
+    const unwindowed = reps.filter(r => !r.start).map(r => r.key);
+    if (unwindowed.length) {
+      return res.status(400).json({ error: `windows parameter required for ${unwindowed.join(', ')}` });
     }
-    const m = stResolveMonth(req.query.month, _ptDate(new Date()));
-    if (m.error) return res.status(400).json({ error: m.error });
 
     const accessToken = await getAdsAccessToken();
-    const { reportId } = parsed.reports[0];
-    const status = await withAdsRetry(() => getReportStatus(accessToken, reportId));
-    const url = status.url || status.location;
-    if (!url) {
-      return res.status(409).json({ error: `Report not ready (${status.status || 'unknown'}).` });
-    }
-
-    const raw = await withAdsRetry(() => downloadReport(url));
-    const rows = stNormalizeRows(raw);
-    if (!rows.length) {
-      return res.status(502).json({
-        error: `The report downloaded but held no usable rows (${Array.isArray(raw) ? raw.length : 0} returned).`
+    const { results, notReady } = await dailyCollect(accessToken, reps);
+    if (!results.length) {
+      return res.status(409).json({
+        error: `Nothing ready to store: ${notReady.map(n => `${n.key} ${n.status}`).join('; ')}`
       });
     }
-
-    // Only the days this report actually carried are rewritten — see
-    // replaceRange. What came back is compared with what was asked for
-    // below, because Amazon reports a clipped month as a successful one.
-    const covered = await searchTerms.replaceRange(ST_PRODUCT, m.month, rows);
-    const stats = await searchTerms.monthStats(ST_PRODUCT, m.month);
-    await searchTerms.recordPull({
-      adProduct: ST_PRODUCT, month: m.month, windowStart: m.start, windowEnd: m.end,
-      coveredStart: covered.from, coveredEnd: covered.to,
-      rows: stats.rows, zeroClick: stats.zeroClick, terms: stats.terms,
-      clicks: stats.clicks, cost: stats.cost, dataBytes: stats.dataBytes
-    });
-    const size = await searchTerms.tableBytes();
-
-    const short = covered.from && covered.from > m.monthStart;
     return res.status(200).json({
-      success: true, month: m.month, window: { start: m.start, end: m.end },
-      monthStart: m.monthStart, covered, short,
-      shortNote: short
-        ? `Amazon returned ${moMonthLabel(m.month)} from ${covered.from} onward. ` +
-          `Its search term history reaches back ${REPORT_RETENTION_DAYS[ST_REPORT_KEY]} days, ` +
-          'so the earlier days are gone.'
-        : null,
-      returned: Array.isArray(raw) ? raw.length : 0,
-      stored: rows.length, stats, size,
-      collectedAt: new Date().toISOString()
+      success: true, results, notReady,
+      size: await searchTerms.tableBytes(), collectedAt: new Date().toISOString()
     });
   } catch (error) {
     console.error('[SEARCHTERMS COLLECT] Error:', error);
     return res.status(500).json({ error: 'Search term collect failed: ' + error.message });
+  }
+}
+
+// ─── DAILY CRON ──────────────────────────────────────────────────────────────
+// Three steps a day, each its own cron so each has the function's whole
+// minute:
+//
+//   snapshot   every keyword and target with its bid (logging what changed
+//              since yesterday), the negatives, and the advertised products.
+//   request    the search term and targeting reports for the daily window.
+//   collect    twice; the second carries final=1 and is the one that says so
+//              when something did not land. An earlier slot still has a retry
+//              behind it, so a slow queue never sends a message the next slot
+//              would contradict.
+//
+// Quiet when it works. Slack hears about it only when something failed —
+// a daily message nobody acts on is a message nobody reads.
+//
+// Unauthenticated, by the convention every cron here follows. Nothing in them
+// writes to Amazon.
+
+const DAILY_CRON_KEY = 'ads:daily:pending';
+const DAILY_CRON_JOB = 'daily';
+const DAILY_LABELS = { [ST_REPORT_KEY]: 'search terms', [TD_REPORT_KEY]: 'targets' };
+
+async function dailyCronSlack(lines) {
+  return adsCronSlack(['*Daily ads pull*', ...lines].join('\n'));
+}
+
+async function handleCronDailySnapshot(req, res) {
+  try {
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      const why = `Missing Advertising API credentials: ${missing.join(', ')}`;
+      await dailyCronSlack([why]);
+      return res.status(500).json({ error: why });
+    }
+    const accessToken = await getAdsAccessToken();
+    const snap = await dailySnapshot(accessToken);
+    if (snap.failures.length) {
+      await dailyCronSlack(['The morning snapshot missed part of the account:',
+        ...snap.failures.map(f => `• ${f.what}: ${f.error}`)]);
+    }
+    return res.status(200).json({ success: !snap.failures.length, ...snap });
+  } catch (error) {
+    console.error('[DAILY SNAPSHOT] Error:', error);
+    await dailyCronSlack(['The morning snapshot failed: ' + error.message]);
+    return res.status(500).json({ error: 'Daily snapshot failed: ' + error.message });
+  }
+}
+
+async function handleCronDailyRequest(req, res) {
+  try {
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      const why = `Missing Advertising API credentials: ${missing.join(', ')}`;
+      await dailyCronSlack([why]);
+      return res.status(500).json({ error: why });
+    }
+    const today = _ptDate(new Date());
+    // Once a day. A second firing — Vercel retries, or a hand-run — would
+    // only re-request what is already generating.
+    const pending = await cronJobRead(DAILY_CRON_KEY, DAILY_CRON_JOB);
+    if (pending && pending.ptDate === today && Array.isArray(pending.reports) && pending.reports.length) {
+      return res.status(200).json({ success: true, skipped: 'already requested today' });
+    }
+
+    const accessToken = await getAdsAccessToken();
+    const { reports, failures } = await dailyRequest(accessToken, today);
+    await cronJobWrite(DAILY_CRON_KEY, DAILY_CRON_JOB, {
+      reports, failures, ptDate: today, requestedAt: new Date().toISOString(),
+      collected: !reports.length, notified: false
+    });
+    // Nothing requested means no collect can rescue it, so it is said now.
+    if (!reports.length && failures.length) {
+      await dailyCronSlack(['No report could be requested:',
+        ...failures.map(f => `• ${DAILY_LABELS[f.key] || f.key} (${f.window}): ${f.error}`)]);
+    }
+    return res.status(200).json({ success: true, requested: reports.length, reports, failures });
+  } catch (error) {
+    console.error('[DAILY REQUEST] Error:', error);
+    await dailyCronSlack(['Could not request the reports: ' + error.message]);
+    return res.status(500).json({ error: 'Daily request failed: ' + error.message });
+  }
+}
+
+async function handleCronDailyCollect(req, res) {
+  const final = String(req.query.final || '') === '1';
+  try {
+    const pending = await cronJobRead(DAILY_CRON_KEY, DAILY_CRON_JOB);
+    if (!pending || !Array.isArray(pending.reports) || !pending.reports.length) {
+      return res.status(200).json({ success: true, skipped: 'nothing pending' });
+    }
+    if (pending.collected || pending.notified) {
+      return res.status(200).json({ success: true, skipped: 'already finished' });
+    }
+    // A record from another day is a run that never finished. Collecting its
+    // report ids now would store an old window as today's.
+    const today = _ptDate(new Date());
+    if (pending.ptDate !== today) {
+      return res.status(200).json({ success: true, skipped: `pending pull is from ${pending.ptDate}` });
+    }
+
+    // Only what is not stored yet: a slot that stored one report and missed
+    // the other carries on with the other.
+    const left = pending.reports.filter(r => !r.stored);
+    const accessToken = await getAdsAccessToken();
+    const { results, notReady } = await dailyCollect(accessToken, left);
+    const storedKeys = new Set(results.map(r => r.key));
+    const reports = pending.reports.map(r => (storedKeys.has(r.key)
+      ? { ...r, stored: true, result: results.find(x => x.key === r.key) } : r));
+    const done = reports.every(r => r.stored);
+
+    const record = { ...pending, reports, collected: done, lastCollectAt: new Date().toISOString() };
+    const failures = pending.failures || [];
+    // Terminal: everything landed, or this was the last attempt. Said only
+    // when something went wrong along the way.
+    if ((done || final) && (!done || failures.length)) {
+      await dailyCronSlack([
+        ...failures.map(f => `• ${DAILY_LABELS[f.key] || f.key} could not be requested (${f.window}): ${f.error}`),
+        ...(done ? [] : notReady.map(n => `• ${DAILY_LABELS[n.key] || n.key} did not arrive: ${n.status}`))
+      ]);
+      record.notified = true;
+      record.notifiedAt = new Date().toISOString();
+    }
+    await cronJobWrite(DAILY_CRON_KEY, DAILY_CRON_JOB, record);
+    return res.status(200).json({ success: true, collected: done, results, notReady });
+  } catch (error) {
+    console.error('[DAILY COLLECT] Error:', error);
+    if (final) await dailyCronSlack(['Could not collect the reports: ' + error.message]);
+    return res.status(500).json({ error: 'Daily collect failed: ' + error.message });
   }
 }
 
@@ -5542,18 +5756,37 @@ async function stNamesFor(values) {
   return asins.length ? asinNames.lookup(asins) : {};
 }
 
+// The daily pull as the page shows it: how the last one went, and what the
+// next one will ask for. Never fails the page — a missing record is no pull.
+async function dailyState() {
+  try {
+    const last = await cronJobRead(DAILY_CRON_KEY, DAILY_CRON_JOB);
+    const next = (await dailyPlans(_ptDate(new Date())))
+      .map(p => ({ key: p.key, start: p.window.start, end: p.window.end }));
+    return {
+      next,
+      last: last ? {
+        ptDate: last.ptDate || null, requestedAt: last.requestedAt || null,
+        collected: !!last.collected, lastCollectAt: last.lastCollectAt || null,
+        reports: (last.reports || []).map(r => ({ key: r.key, start: r.start, end: r.end, stored: !!r.stored })),
+        failures: (last.failures || []).map(f => ({ key: f.key, error: f.error }))
+      } : null
+    };
+  } catch (err) {
+    console.error('[SEARCHTERMS] daily state failed:', err.message);
+    return { next: [], last: null };
+  }
+}
+
 async function handleSearchTermsGet(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const today = _ptDate(new Date());
     const pulls = await searchTerms.listPulls();
-    const pullable = stPullableMonths(today);
+    const daily = await dailyState();
     if (!pulls.length) {
-      return res.status(200).json({
-        success: true, empty: true, pullable, suggested: stDefaultMonth(today)
-      });
+      return res.status(200).json({ success: true, empty: true, daily });
     }
 
     const month = ST_MONTH_RE.test(String(req.query.month || ''))
@@ -5561,7 +5794,7 @@ async function handleSearchTermsGet(req, res) {
     const pull = pulls.find(p => p.month === month) || null;
     const size = await searchTerms.tableBytes();
     const base = {
-      success: true, month, pulls, pullable, size, pull,
+      success: true, month, pulls, daily, size, pull,
       asins: await asinNames.counts(month, { adProduct: ST_PRODUCT }),
       bids: await targets.status()
     };
@@ -5677,13 +5910,34 @@ async function handleSearchTermsGet(req, res) {
 // Nothing here writes to Amazon.
 
 const TG_ADS_HOST = 'https://advertising-api.amazon.com';
-const TG_LISTS = [
-  { kind: 'keyword', url: `${TG_ADS_HOST}/sp/keywords/list`,
-    media: 'application/vnd.spKeyword.v3+json', field: 'keywords' },
-  { kind: 'target', url: `${TG_ADS_HOST}/sp/targets/list`,
-    media: 'application/vnd.spTargetingClause.v3+json', field: 'targetingClauses' }
-];
 const TG_STATES = ['ENABLED', 'PAUSED'];
+const TG_LISTS = [
+  { kind: 'keyword', label: 'keywords', url: `${TG_ADS_HOST}/sp/keywords/list`,
+    media: 'application/vnd.spKeyword.v3+json', field: 'keywords', states: TG_STATES },
+  { kind: 'target', label: 'targets', url: `${TG_ADS_HOST}/sp/targets/list`,
+    media: 'application/vnd.spTargetingClause.v3+json', field: 'targetingClauses', states: TG_STATES }
+];
+// The four places a negative can live: a keyword or a product, on one ad
+// group or a whole campaign. Enabled only — an archived negative negates
+// nothing.
+const NEG_LISTS = [
+  { list: 'adGroupNegativeKeywords', label: 'ad group negative keywords', level: 'ad_group', kind: 'keyword',
+    url: `${TG_ADS_HOST}/sp/negativeKeywords/list`, media: 'application/vnd.spNegativeKeyword.v3+json',
+    field: 'negativeKeywords', states: ['ENABLED'] },
+  { list: 'campaignNegativeKeywords', label: 'campaign negative keywords', level: 'campaign', kind: 'keyword',
+    url: `${TG_ADS_HOST}/sp/campaignNegativeKeywords/list`, media: 'application/vnd.spCampaignNegativeKeyword.v3+json',
+    field: 'campaignNegativeKeywords', states: ['ENABLED'] },
+  { list: 'adGroupNegativeTargets', label: 'ad group negative product targets', level: 'ad_group', kind: 'target',
+    url: `${TG_ADS_HOST}/sp/negativeTargets/list`, media: 'application/vnd.spNegativeTargetingClause.v3+json',
+    field: 'negativeTargetingClauses', states: ['ENABLED'] },
+  { list: 'campaignNegativeTargets', label: 'campaign negative product targets', level: 'campaign', kind: 'target',
+    url: `${TG_ADS_HOST}/sp/campaignNegativeTargets/list`, media: 'application/vnd.spCampaignNegativeTargetingClause.v3+json',
+    field: 'campaignNegativeTargetingClauses', states: ['ENABLED'] }
+];
+const PRODUCT_ADS_LIST = {
+  kind: 'productAd', label: 'advertised products', url: `${TG_ADS_HOST}/sp/productAds/list`,
+  media: 'application/vnd.spProductAd.v3+json', field: 'productAds', states: TG_STATES
+};
 const TG_PAGE_SIZE = 1000;
 // A list longer than this is not this account; stopping beats storing part.
 const TG_MAX_PAGES = 50;
@@ -5723,6 +5977,23 @@ function tgBid(v) {
   return v !== null && v !== undefined && v !== '' && Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// Amazon's own dates, from the extended fields: an ISO string from v3, epoch
+// milliseconds from the older lists. Anything else is no date.
+function tgDate(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const d = typeof v === 'number' || /^\d+$/.test(String(v)) ? new Date(Number(v)) : new Date(String(v));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function tgExtended(x) {
+  const e = (x && x.extendedData) || {};
+  return {
+    createdAt: tgDate(e.creationDateTime ?? e.creationDate),
+    updatedAt: tgDate(e.lastUpdateDateTime ?? e.lastUpdatedDate),
+    servingStatus: stText(e.servingStatus)
+  };
+}
+
 function tgNormalizeKeyword(k) {
   const match = String((k && k.matchType) || '').toUpperCase();
   const text = stText(k && k.keywordText);
@@ -5732,24 +6003,29 @@ function tgNormalizeKeyword(k) {
     state: stText(k && k.state) ? String(k.state).toUpperCase() : null,
     matchLabel: TG_KEYWORD_MATCH[match] || stText(k && k.matchType) || '—',
     text, bid: tgBid(k && k.bid), expression: null,
-    recExpr: TG_KEYWORD_MATCH[match] && text ? { type: `KEYWORD_${match}_MATCH`, value: text } : null
+    recExpr: TG_KEYWORD_MATCH[match] && text ? { type: `KEYWORD_${match}_MATCH`, value: text } : null,
+    ...tgExtended(k)
   };
 }
 
-function tgNormalizeTarget(t) {
-  const expr = Array.isArray(t && t.expression) ? t.expression : [];
-  // resolvedExpression carries names where expression carries ids — a
-  // category's name rather than its number — so it is what is shown, and the
-  // id is what Amazon is asked about.
-  const resolved = Array.isArray(t && t.resolvedExpression) ? t.resolvedExpression : [];
+// An expression the way the search term report writes it. resolvedExpression
+// carries names where expression carries ids — a category's name rather than
+// its number — so it is what is shown, and the id is what Amazon is asked about.
+function tgExpressionText(expr, resolved) {
   const typeOf = (e) => String((e && e.type) || '').toUpperCase();
-  const first = TG_EXPRESSIONS[typeOf(expr[0])];
-  const text = expr.map((e, i) => {
+  return expr.map((e, i) => {
     const known = TG_EXPRESSIONS[typeOf(e)];
     const value = (resolved[i] && resolved[i].value) ?? e.value;
     return known ? known.text(value)
                  : `${typeOf(e).toLowerCase().replace(/_/g, '-')}${value !== undefined ? `="${value}"` : ''}`;
   }).join(' ');
+}
+
+function tgNormalizeTarget(t) {
+  const expr = Array.isArray(t && t.expression) ? t.expression : [];
+  const resolved = Array.isArray(t && t.resolvedExpression) ? t.resolvedExpression : [];
+  const first = TG_EXPRESSIONS[String((expr[0] && expr[0].type) || '').toUpperCase()];
+  const text = tgExpressionText(expr, resolved);
   // Only a single-part expression has a suggestion request to match it. A
   // category narrowed by brand or price is a different, refined request.
   const recExpr = first && first.rec && expr.length === 1 ? first.rec(expr[0].value) : null;
@@ -5759,7 +6035,38 @@ function tgNormalizeTarget(t) {
     state: stText(t && t.state) ? String(t.state).toUpperCase() : null,
     matchLabel: first ? first.label : 'Other',
     text: text || null, bid: tgBid(t && t.bid), expression: expr.length ? expr : null,
-    recExpr: recExpr && (recExpr.value === undefined || recExpr.value) ? recExpr : null
+    recExpr: recExpr && (recExpr.value === undefined || recExpr.value) ? recExpr : null,
+    ...tgExtended(t)
+  };
+}
+
+// A negative keyword or product target from any of the four lists. A
+// campaign-level one has no ad group.
+function negNormalize(spec, x) {
+  const base = {
+    level: spec.level, kind: spec.kind,
+    campaignId: stText(x && x.campaignId),
+    adGroupId: spec.level === 'ad_group' ? stText(x && x.adGroupId) : null,
+    state: stText(x && x.state) ? String(x.state).toUpperCase() : null,
+    createdAt: tgExtended(x).createdAt
+  };
+  if (spec.kind === 'keyword') {
+    return { ...base, negativeId: stText(x && x.keywordId),
+             matchType: stText(x && x.matchType), text: stText(x && x.keywordText), expression: null };
+  }
+  const expr = Array.isArray(x && x.expression) ? x.expression : [];
+  const resolved = Array.isArray(x && x.resolvedExpression) ? x.resolvedExpression : [];
+  return { ...base, negativeId: stText(x && x.targetId), matchType: null,
+           text: tgExpressionText(expr, resolved) || null, expression: expr.length ? expr : null };
+}
+
+function productAdNormalize(a) {
+  return {
+    adId: stText(a && a.adId), campaignId: stText(a && a.campaignId),
+    adGroupId: stText(a && a.adGroupId),
+    asin: stText(a && a.asin) ? String(a.asin).toUpperCase() : null,
+    sku: stText(a && a.sku),
+    state: stText(a && a.state) ? String(a.state).toUpperCase() : null
   };
 }
 
@@ -5781,18 +6088,68 @@ async function tgAdsPost(accessToken, url, media, body) {
   catch { throw new Error(`Amazon answered with something that is not JSON: ${text.slice(0, 200)}`); }
 }
 
+// Every page of one of Amazon's lists. The extended fields — the creation and
+// last-change dates — are asked for; a list that refuses them is asked again
+// without, so a missing date never costs the list itself.
 async function tgList(accessToken, spec) {
-  const items = [];
-  let nextToken = null;
-  for (let page = 0; page < TG_MAX_PAGES; page++) {
-    const body = { stateFilter: { include: TG_STATES }, maxResults: TG_PAGE_SIZE };
-    if (nextToken) body.nextToken = nextToken;
-    const resp = await withAdsRetry(() => tgAdsPost(accessToken, spec.url, spec.media, body));
-    items.push(...(resp[spec.field] || []));
-    nextToken = resp.nextToken || null;
-    if (!nextToken) return items;
+  for (const extended of [true, false]) {
+    const items = [];
+    let nextToken = null;
+    try {
+      for (let page = 0; page < TG_MAX_PAGES; page++) {
+        const body = { stateFilter: { include: spec.states || TG_STATES }, maxResults: TG_PAGE_SIZE };
+        if (extended) body.includeExtendedDataFields = true;
+        if (nextToken) body.nextToken = nextToken;
+        const resp = await withAdsRetry(() => tgAdsPost(accessToken, spec.url, spec.media, body));
+        items.push(...(resp[spec.field] || []));
+        nextToken = resp.nextToken || null;
+        if (!nextToken) return items;
+      }
+    } catch (err) {
+      if (extended && err.status === 400) continue;
+      throw err;
+    }
+    throw new Error(`Amazon's ${spec.label} list ran past ${TG_MAX_PAGES} pages, so it was not stored.`);
   }
-  throw new Error(`Amazon's ${spec.kind} list ran past ${TG_MAX_PAGES} pages, so it was not stored.`);
+  return [];
+}
+
+// The account's structure as it stands this morning: every keyword and target
+// with its bid (what changed since the last pull is logged as it is stored),
+// every negative, and every advertised product. Each part stands on its own,
+// so one list Amazon refuses does not cost the others.
+async function dailySnapshot(accessToken) {
+  const out = { failures: [] };
+  try {
+    const [keywords, clauses] = await Promise.all(TG_LISTS.map(spec => tgList(accessToken, spec)));
+    const seen = new Set();
+    const rows = [...keywords.map(tgNormalizeKeyword), ...clauses.map(tgNormalizeTarget)]
+      .filter(r => r.targetId && !seen.has(r.targetId) && seen.add(r.targetId));
+    if (!rows.length) throw new Error('Amazon returned none, so the stored list was left as it was');
+    out.targets = { keywords: keywords.length, targets: clauses.length, ...(await targets.replaceAll(rows)) };
+  } catch (err) {
+    out.failures.push({ what: 'keywords and targets', error: err.message });
+  }
+  out.negatives = {};
+  for (const spec of NEG_LISTS) {
+    try {
+      const seen = new Set();
+      const rows = (await tgList(accessToken, spec)).map(x => negNormalize(spec, x))
+        .filter(r => r.negativeId && !seen.has(r.negativeId) && seen.add(r.negativeId));
+      out.negatives[spec.list] = (await targets.replaceNegatives(spec.list, rows)).stored;
+    } catch (err) {
+      out.failures.push({ what: spec.label, error: err.message });
+    }
+  }
+  try {
+    const seen = new Set();
+    const rows = (await tgList(accessToken, PRODUCT_ADS_LIST)).map(productAdNormalize)
+      .filter(r => r.adId && !seen.has(r.adId) && seen.add(r.adId));
+    out.productAds = (await targets.replaceProductAds(rows)).stored;
+  } catch (err) {
+    out.failures.push({ what: PRODUCT_ADS_LIST.label, error: err.message });
+  }
+  return out;
 }
 
 // Amazon's suggestions come grouped by theme — the everyday one, and others
@@ -5909,19 +6266,19 @@ async function handleSearchTermsBids(req, res) {
       return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
     }
 
+    // The same snapshot the morning cron takes. The bids are what this button
+    // is for, so they failing is the button failing; a negative or product
+    // list that failed is reported alongside.
     const accessToken = await getAdsAccessToken();
-    const [keywords, clauses] = await Promise.all(TG_LISTS.map(spec => tgList(accessToken, spec)));
-    const seen = new Set();
-    const rows = [...keywords.map(tgNormalizeKeyword), ...clauses.map(tgNormalizeTarget)]
-      .filter(r => r.targetId && !seen.has(r.targetId) && seen.add(r.targetId));
-    if (!rows.length) {
-      return res.status(502).json({
-        error: 'Amazon returned no keywords or targets, so the stored bids were left as they were.'
-      });
+    const snap = await dailySnapshot(accessToken);
+    if (!snap.targets) {
+      const why = snap.failures.find(f => f.what === 'keywords and targets');
+      return res.status(502).json({ error: `Keywords and targets: ${why ? why.error : 'not stored'}` });
     }
-    await targets.replaceAll(rows);
     return res.status(200).json({
-      success: true, keywords: keywords.length, targets: clauses.length, stored: rows.length,
+      success: true, keywords: snap.targets.keywords, targets: snap.targets.targets,
+      stored: snap.targets.stored, changes: snap.targets.changes,
+      negatives: snap.negatives, productAds: snap.productAds, failures: snap.failures,
       status: await targets.status(), pulledAt: new Date().toISOString()
     });
   } catch (error) {
@@ -6009,8 +6366,10 @@ export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          MO_CONFIG, MO_REPORT_KEYS, MO_SPEC_DEVIATIONS, TARGET_ACOS,
          BW_CONFIG, BW_POSTURES, BW_REPORT_KEYS, BW_SPEC_DEVIATIONS,
          BW_INCREASES, BW_DECREASES,
-         stNormalizeRows, stResolveMonth, stDefaultMonth, stMonthSettled,
-         stPullableMonths, ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS,
+         stNormalizeRows, tdNormalizeRows, stByMonth, dailyWindow, dailyParseWindows,
+         ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS,
+         TD_REPORT_COLUMNS, TD_REPORT_KEY, TD_OPTIONAL_COLUMNS,
+         negNormalize, productAdNormalize, tgDate, NEG_LISTS, dailyRequestOne, dailyPlans,
          tgNormalizeKeyword, tgNormalizeTarget, tgParseRecommendations, tgRange,
          tgMatchRecommendations, tgVersionRefused, tgShortError, tgSuggestionWork,
          TG_REC_VERSIONS, TG_REC_BATCH };

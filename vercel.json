@@ -67,6 +67,22 @@
     {
       "path": "/api/adspend?action=cron-monthly-collect&slot=2&final=1",
       "schedule": "0 13 15 * *"
+    },
+    {
+      "path": "/api/adspend?action=cron-daily-snapshot",
+      "schedule": "0 12 * * *"
+    },
+    {
+      "path": "/api/adspend?action=cron-daily-request",
+      "schedule": "0 13 * * *"
+    },
+    {
+      "path": "/api/adspend?action=cron-daily-collect",
+      "schedule": "0 15 * * *"
+    },
+    {
+      "path": "/api/adspend?action=cron-daily-collect&slot=2&final=1",
+      "schedule": "0 18 * * *"
     }
   ],
   "functions": {

@@ -1,15 +1,16 @@
     // ─── SEARCH TERMS ────────────────────────────────────────────────────────
-    // What shoppers actually typed, a calendar month at a time.
+    // What shoppers actually typed, stored day by day and read a month at a
+    // time, beside every keyword and target with its bid.
     //
-    // Phase 1 is a reader: pull a month, store it, look at it. No lists, no
-    // recommendations, nothing written to Amazon. The negative and graduation
-    // lists come later and will be built from the stored rows.
+    // A reader: no lists, no recommendations, nothing written to Amazon. The
+    // negative and graduation lists come later and will be built from the
+    // stored rows.
     //
-    // Pulling is a deliberate click, never something a page load does — this is
-    // the slowest report Amazon generates, and a month that is already stored
-    // would be re-fetched for nothing. Bids are the same: Pull bids fetches
-    // every keyword and target with its bid and Amazon's suggested range, for
-    // the Targets tab, until the daily cron takes that over.
+    // A cron pulls every morning — the bids, the negatives, the advertised
+    // products, then the search term and targeting reports. Pull latest makes
+    // the same pull on demand, and Pull bids the same snapshot plus Amazon's
+    // suggested ranges. A page load never pulls: the reports are the slowest
+    // Amazon generates.
     //
     // Everything is prefixed `st`. These files share one global scope, so
     // escapeHtml / formatNumber / _svTimeAgo are CALLED, never redefined.
@@ -24,7 +25,6 @@
     let stBound = false;
     let stData = null;
     let stMonth = '';          // the stored month on screen
-    let stPullMonth = '';      // the month the picker is set to
     let stSort = 'cost';
     let stDir = 'desc';
     let stQuery = '';
@@ -126,11 +126,9 @@
         stData = data;
         stNames = data.names || {};
         if (data.empty) {
-          stPullMonth = stPullMonth || data.suggested || '';
           stRenderIdle(data);
         } else {
           stMonth = data.month;
-          stPullMonth = stPullMonth || data.month;
           stRender(data);
         }
         if (after) stSetStatus(after);
@@ -158,16 +156,16 @@
       stSchedulePoll(0);
     }
 
+    // The same pull the morning cron makes: the days still changing, and any
+    // the store has fallen behind on.
     async function stRun() {
       if (stBusy || !accessToken) return;
       if (stRunLoad()) return stResume();
-      const month = stPullMonth;
-      if (!month) return;
       stBusy = true;
       stSetBusy(true);
       try {
-        stSetStatus(`Asking Amazon for ${month}…`);
-        const res = await fetch(`/api/adspend?action=searchterms-request&month=${encodeURIComponent(month)}`, {
+        stSetStatus('Asking Amazon for the latest search terms and targets…');
+        const res = await fetch('/api/adspend?action=searchterms-request', {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
@@ -176,17 +174,18 @@
           throw new Error((data.error || `Request failed (${res.status})`) +
                           (cols ? ` — Amazon rejected these columns: ${cols}` : ''));
         }
-        const report = (data.reports || [])[0];
-        if (!report || !report.reportId) throw new Error('Amazon accepted no report.');
+        const reports = (data.reports || []).filter(r => r && r.reportId);
+        if (!reports.length) throw new Error('Amazon accepted no report.');
 
         stRunSave({
-          month: data.month, window: data.window,
-          reports: [{ key: report.key, reportId: report.reportId }],
+          reports: reports.map(r => ({ key: r.key, reportId: r.reportId, start: r.start, end: r.end })),
           startedAt: new Date().toISOString(),
           pollUntil: Date.now() + ST_MAX_WAIT_MS
         });
-        stSetStatus('Amazon is generating the report. Search term reports are the ' +
-                    'slowest it produces — 10 to 20 minutes is normal.');
+        const failed = (data.failures || []).map(f => `${stReportLabel(f.key)}: ${f.error}`).join('; ');
+        stSetStatus(`Amazon is generating ${reports.map(r => `${stReportLabel(r.key)} ${
+          stRangeLabel(r.start, r.end)}`).join(' and ')}. These are the slowest reports it ` +
+          `produces — 10 to 20 minutes is normal.${failed ? ` Not requested: ${failed}` : ''}`);
         stSchedulePoll(ST_POLL_MS);
       } catch (err) {
         console.error('[ST] run failed:', err);
@@ -220,7 +219,9 @@
         if (!res.ok) throw new Error(data.error || `Status failed (${res.status})`);
 
         if (data.allDone) return stCollect(state);
-        state.lastStatus = (data.statuses || [])[0] || null;
+        // The slowest report is the one worth reporting on.
+        const statuses = data.statuses || [];
+        state.lastStatus = statuses.find(x => !x.done && !x.failed) || statuses[0] || null;
         state.pollErrors = 0;
         stRunSave(state);
         stSetStatus(stStatusLine(state.startedAt, state.lastStatus));
@@ -241,10 +242,10 @@
     }
 
     async function stCollect(state) {
-      stSetStatus('Downloading and storing the report…');
+      stSetStatus('Downloading and storing the reports…');
       try {
         const qs = `reports=${encodeURIComponent(state.reports.map(r => `${r.key}:${r.reportId}`).join(','))}` +
-                   `&month=${encodeURIComponent(state.month)}`;
+                   `&windows=${encodeURIComponent(state.reports.map(r => `${r.key}:${r.start}:${r.end}`).join(','))}`;
         const res = await fetch(`/api/adspend?action=searchterms-collect&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -253,12 +254,14 @@
 
         stRunClear();
         stSetBusy(false);
-        stMonth = data.month;
         stOffset = 0;
-        const s = data.stats || {};
-        await stFetch(`Stored ${formatCount(s.rows || 0)} rows for ${stMonthLabel(data.month)} — ` +
-                      `${stPct(s.zeroClick, s.rows)} of them never got a click.` +
-                      (data.shortNote ? ` ${data.shortNote}` : ''));
+        // Each report says what it stored, and whether Amazon came back with
+        // fewer days than were asked for — which it reports as a success.
+        const said = (data.results || []).map(r => `${formatCount(r.stored || 0)} ${
+          r.key === 'spSearchTerm' ? 'search term rows' : 'target days'} ${stRangeLabel(r.from || r.start, r.end)}${
+          r.short ? ` (Amazon had nothing before ${r.from})` : ''}`);
+        const missed = (data.notReady || []).map(n => `${stReportLabel(n.key)}: ${n.status}`);
+        await stFetch(`Stored ${said.join(' and ')}.${missed.length ? ` Not stored: ${missed.join('; ')}` : ''}`);
       } catch (err) {
         console.error('[ST] collect failed:', err);
         // The download URL is short-lived, so a failed collect means re-running.
@@ -431,16 +434,14 @@
         <div class="card card-flat" style="text-align: center; padding: 4rem 2rem;">
           <div style="font-size: 2.5rem; opacity: 0.35; margin-bottom: 1rem;">🔎</div>
           <div style="color: var(--text-secondary); max-width: 44rem; margin: 0 auto; line-height: 1.6;">
-            What shoppers actually typed, a calendar month at a time, kept day by day.
-            Nothing has been pulled yet.
+            What shoppers actually typed, kept day by day. Nothing has been pulled yet.
             <div style="margin-top: 1rem;">
-              Pick a month and pull it. Amazon keeps about 65 days of search term history
-              — less than the 95 days its campaign reports keep — so the months below are
-              everything still reachable, and one that drops off that list cannot be
-              recovered.
+              A pull runs every morning, or press Pull latest. Amazon keeps about 65 days of
+              search term history — less than the 95 days its campaign reports keep — and a
+              day that drops out of it cannot be recovered.
             </div>
           </div>
-          <div style="margin-top: 1.5rem;">${stMonthPicker(data)}</div>
+          <div style="margin-top: 1.5rem;">${stDailyLine(data)}</div>
         </div>`;
       stBindActions();
     }
@@ -774,31 +775,28 @@
         </label>`;
     }
 
-    // The month to pull sits beside the button that pulls it, in the header.
-    // It is about getting data rather than reading it, so it does not belong
-    // among the filters.
+    // What the daily pull does, beside the button that makes it now: how the
+    // last one went, and the days the next one will ask for.
     function stPullControl(data) {
-      const el = document.getElementById('st-pull-month');
-      if (el) el.innerHTML = stMonthPicker(data);
+      const el = document.getElementById('st-daily');
+      if (el) el.innerHTML = stDailyLine(data);
     }
 
-    // The pull control, shown both on the idle page and beside a stored month.
-    function stMonthPicker(data) {
-      const pullable = data.pullable || [];
-      const stored = new Set((data.pulls || []).map(p => p.month));
-      if (!pullable.length) {
-        return '<span class="arf-muted">No month is both settled and still inside Amazon\'s ' +
-               'search term history.</span>';
+    function stDailyLine(data) {
+      const daily = data.daily || {};
+      const next = daily.next || [];
+      const last = daily.last;
+      const starts = next.map(n => n.start).sort();
+      const ends = next.map(n => n.end).sort();
+      const nextText = starts.length ? `next pull: ${stRangeLabel(starts[0], ends[ends.length - 1])}` : '';
+      let lastText = '';
+      if (last && last.ptDate) {
+        const failed = (last.failures || []).length || (last.reports || []).some(r => !r.stored);
+        lastText = `daily pull ${last.collected && !failed ? 'stored' : failed ? 'incomplete' : 'running'} ${
+          stDayLabel(last.ptDate)}`;
       }
-      return `
-        <label class="wk-field">
-          <span>Pull a month</span>
-          <select data-st-pull>
-            ${pullable.map(p => `<option value="${escapeHtml(p.month)}"${
-              p.month === stPullMonth ? ' selected' : ''}>${escapeHtml(stMonthLabel(p.month))}${
-              stored.has(p.month) ? ' (stored)' : ''} · ${escapeHtml(stReachLabel(p))}</option>`).join('')}
-          </select>
-        </label>`;
+      return `<span class="arf-muted st-daily-line">${escapeHtml([lastText, nextText].filter(Boolean).join(' · ') ||
+        'runs every morning')}</span>`;
     }
 
     // The measurement the first pull exists to produce.
@@ -821,7 +819,8 @@
             ${escapeHtml(stMonthLabel(s.month))} were already gone when it was pulled.</span></div>
         </div>` : ''}
         <div class="card card-flat wk-stats">
-          ${cell('Covers', covers, s.partial ? 'short of the month' : 'the whole month')}
+          ${cell('Covers', covers, s.partial ? 'missing its first days'
+            : s.coveredEnd && s.coveredEnd < stMonthEnd(s.month) ? 'so far — filling in daily' : 'the whole month')}
           ${cell('Rows', formatCount(s.rows || 0))}
           ${cell('Distinct terms', formatCount(s.terms || 0))}
           ${cell('Never clicked', stPct(s.zeroClick, s.rows), `${formatCount(s.zeroClick || 0)} rows`)}
@@ -1234,11 +1233,11 @@
       const pulls = data.pulls || [];
       return `
         <div class="card card-flat arf-footer">
-          <div class="arf-muted">Sponsored Products only. Rows are kept per day, because Amazon
-            credits a sale to the day of the click for 7 days afterwards — so a month can be
-            pulled again later to collect the conversions that had not landed yet. A second pull
-            rewrites only the days it brings back, so one made after Amazon has dropped the start
-            of a month tops it up rather than trimming it.</div>
+          <div class="arf-muted">Sponsored Products only, pulled every morning. Rows are kept per
+            day, because Amazon credits a sale to the day of the click for 7 days afterwards — so
+            each pull re-fetches the last 8 days to collect the conversions that have landed since,
+            and carries on from the last day stored if a morning was missed. A pull rewrites only
+            the days it brings back, so one that Amazon answers short never trims what is held.</div>
           ${pulls.length > 1
             ? `<div class="arf-muted">Stored: ${pulls.map(p =>
                 `${escapeHtml(stMonthLabel(p.month))} (${formatCount(p.rows)})`).join(' · ')}</div>`
@@ -1316,8 +1315,6 @@
       el.addEventListener('change', e => {
         const month = e.target.closest('[data-st-month]');
         if (month) { stMonth = month.value; stOffset = 0; return stFetch(); }
-        const pull = e.target.closest('[data-st-pull]');
-        if (pull) { stPullMonth = pull.value; return stSetBusy(false); }
         const clicks = e.target.closest('[data-st-clicks]');
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
@@ -1373,12 +1370,29 @@
       return line;
     }
 
-    // How much of a month Amazon can still answer for. `clipsAt` is the day it
-    // starts losing its first days; `expires` the day the last of it goes.
-    function stReachLabel(p) {
-      return p.partial
-        ? `only from ${p.start} · all gone ${p.expires}`
-        : `complete until ${p.clipsAt}`;
+    const ST_REPORT_LABELS = { spSearchTerm: 'search terms', spTargeting: 'targets' };
+
+    function stReportLabel(key) {
+      return ST_REPORT_LABELS[key] || key;
+    }
+
+    // "Oct 1 – Oct 25", or one day alone.
+    function stRangeLabel(start, end) {
+      if (!start) return '';
+      return start === end || !end ? stDayLabel(start) : `${stDayLabel(start)} – ${stDayLabel(end)}`;
+    }
+
+    function stDayLabel(ymd) {
+      const [y, m, d] = String(ymd || '').split('-').map(Number);
+      if (!y || !m || !d) return String(ymd || '');
+      const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      return `${names[m - 1]} ${d}`;
+    }
+
+    function stMonthEnd(ym) {
+      const [y, m] = String(ym || '').split('-').map(Number);
+      if (!y || !m) return '';
+      return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
     }
 
     function stMonthLabel(ym) {
@@ -1437,10 +1451,9 @@
     function stSetBusy(busy) {
       const btn = document.getElementById('st-run-btn');
       if (!btn) return;
-      btn.disabled = busy || !stPullMonth;
+      btn.disabled = busy;
       btn.innerHTML = busy ? 'Pulling<span class="loading"></span>'
-                           : (stRunLoad() ? 'Check again'
-                                          : `Pull ${stPullMonth ? stMonthLabel(stPullMonth) : 'a month'}`);
+                           : (stRunLoad() ? 'Check again' : 'Pull latest');
     }
 
     function stRunSave(state) {

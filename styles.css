@@ -2335,6 +2335,12 @@
       text-overflow: ellipsis;
     }
 
+    /* What the daily pull last did and will do next, beside Pull latest. */
+    .st-daily-line {
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
+
     /* Targets: one line per row. Fifteen columns do not leave room for any of
        them to wrap, so nothing does, and the three that run long — the
        keyword, the campaign, the product — are cut short at a set width with
