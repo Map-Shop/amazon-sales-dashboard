@@ -2393,7 +2393,92 @@
     /* Negatives carry two more columns than Targets, so their long ones are
        cut shorter. The campaign's type has a column of its own there. */
     .st-cut.st-cut-negative { max-width: 12rem; }
-    .st-cut.st-cut-campaign { max-width: 9rem; }
+    .st-cut.st-cut-product { max-width: 9rem; }
+
+    /* The product picker: a button that looks like the selects beside it,
+       a menu of lines, and each line's products opening beside it on hover —
+       or on a tap, where there is no hover (.open). */
+    .st-pick { position: relative; }
+
+    .st-pick-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      max-width: 16rem;
+      padding: 0.75rem 1rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-family: 'Work Sans', sans-serif;
+      font-size: 0.875rem;
+      cursor: pointer;
+    }
+
+    .st-pick-btn:focus,
+    .st-pick.open .st-pick-btn {
+      outline: none;
+      border-color: var(--accent-orange);
+    }
+
+    .st-pick-current {
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .st-pick-caret { color: var(--text-secondary); font-size: 0.7rem; }
+
+    .st-pick-menu,
+    .st-pick-sub {
+      display: none;
+      position: absolute;
+      z-index: 50;
+      min-width: 14rem;
+      padding: 0.25rem 0;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    .st-pick-menu { top: calc(100% + 4px); left: 0; }
+
+    /* Overlapping its line by a hair, so the pointer never crosses a gap
+       on its way into the products and closes them. */
+    .st-pick-sub { top: -0.3rem; left: calc(100% - 2px); }
+
+    .st-pick.open .st-pick-menu,
+    .st-pick-group:hover > .st-pick-sub,
+    .st-pick-group.open > .st-pick-sub { display: block; }
+
+    .st-pick-item,
+    .st-pick-group {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      width: 100%;
+      padding: 0.45rem 0.9rem;
+      background: none;
+      border: none;
+      color: var(--text-primary);
+      font-family: 'Work Sans', sans-serif;
+      font-size: 0.8125rem;
+      text-align: left;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .st-pick-group { position: relative; }
+
+    .st-pick-item:hover,
+    .st-pick-group:hover,
+    .st-pick-group.open { background: var(--bg-secondary); }
+
+    .st-pick-item.active { color: var(--accent-orange); }
+
+    .st-pick-arrow { color: var(--text-secondary); }
 
     .st-asin-link,
     .st-asin-inline {

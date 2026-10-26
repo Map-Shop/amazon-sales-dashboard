@@ -5796,7 +5796,8 @@ async function handleSearchTermsGet(req, res) {
     const base = {
       success: true, month, pulls, daily, size, pull,
       asins: await asinNames.counts(month, { adProduct: ST_PRODUCT }),
-      bids: await targets.status()
+      bids: await targets.status(),
+      portfolios: await searchTerms.portfolioNames()
     };
 
     // Three depths of the same month: the products, the terms inside one, and

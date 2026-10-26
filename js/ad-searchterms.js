@@ -511,6 +511,7 @@
       const pull = data.pull || {};
       stSetBlurb(`${stMonthLabel(data.month)} · ${formatCount(pull.rows || 0)} rows · pulled ${
         pull.collectedAt ? _svTimeAgo(pull.collectedAt) : 'just now'}`);
+      stProductLabels = stBuildProductLabels(data.portfolios || []);
       const body = data.view === 'products' ? stProductTable(data)
                  : data.view === 'product-terms' ? stProductTermTable(data)
                  : data.view === 'targets' ? stTargetTable(data)
@@ -980,13 +981,10 @@
           <span>Target contains</span>
           <input type="search" data-st-tq value="${escapeHtml(stTgQuery)}" placeholder="any">
         </label>
-        <label class="wk-field">
+        <div class="wk-field">
           <span>Product</span>
-          <select data-st-tg="product">
-            ${opt('', 'All products', stTgProduct)}
-            ${(data.filterProducts || []).map(p => opt(p.id, p.name || p.id, stTgProduct)).join('')}
-          </select>
-        </label>
+          ${stProductPicker('tg', data.filterProducts || [], stTgProduct)}
+        </div>
         <label class="wk-field">
           <span>Match type</span>
           <select data-st-tg="match">
@@ -1144,9 +1142,11 @@
       { key: 'beforeRoas', label: 'ROAS', group: 'before', right: true },
       { key: 'sinceClicks', label: 'Clicks', group: 'since', right: true },
       { key: 'sinceCost', label: 'Spend', group: 'since', right: true },
-      // Reference rather than data, so it sits after the numbers; the
-      // product's full name is on hover, as on Targets.
-      { key: 'campaign', label: 'Campaign', text: true }
+      // Reference rather than data, so it sits after the numbers. The
+      // campaign is its product and its type, and the type has a column of
+      // its own, so the product stands in for it; the full product name and
+      // the campaign's are on hover.
+      { key: 'product', label: 'Product', text: true }
     ];
 
     const ST_NEGATIVE_TYPES = { Exact: 'Negative exact', Phrase: 'Negative phrase', Product: 'Negative ASIN' };
@@ -1160,13 +1160,10 @@
           <span>Negative contains</span>
           <input type="search" data-st-nq value="${escapeHtml(stNgQuery)}" placeholder="any">
         </label>
-        <label class="wk-field">
+        <div class="wk-field">
           <span>Product</span>
-          <select data-st-ng="product">
-            ${opt('', 'All products', stNgProduct)}
-            ${(data.filterProducts || []).map(p => opt(p.id, p.name || p.id, stNgProduct)).join('')}
-          </select>
-        </label>
+          ${stProductPicker('ng', data.filterProducts || [], stNgProduct)}
+        </div>
         <label class="wk-field">
           <span>Type</span>
           <select data-st-ng="type">
@@ -1253,7 +1250,8 @@
         <td class="arf-r">${r.beforeCost === null || r.beforeCost === undefined ? '—' : stRoas(r.beforeSales, r.beforeCost)}</td>
         <td class="arf-r">${dash(r.sinceClicks, formatCount)}</td>
         <td class="arf-r">${dash(r.sinceCost, stMoney)}</td>
-        <td>${stCut(escapeHtml(r.campaign || '—'), [r.campaign, r.portfolio].filter(Boolean).join(' · '), 'st-cut-campaign')}</td>
+        <td>${stCut(escapeHtml(stProductLabel(r.portfolioId, r.portfolio)),
+                    [r.portfolio, r.campaign].filter(Boolean).join(' · '), 'st-cut-product')}</td>
       </tr>`;
     }
 
@@ -1530,6 +1528,32 @@
           stResetSort();
           return stFetch();
         }
+        // The product picker: the button opens it; a line opens its products
+        // on hover, or on a tap where there is no hover; a product picks.
+        const pickToggle = e.target.closest('[data-st-pick-toggle]');
+        if (pickToggle) {
+          const pick = pickToggle.closest('.st-pick');
+          const wasOpen = pick.classList.contains('open');
+          stClosePickers();
+          if (!wasOpen) pick.classList.add('open');
+          return;
+        }
+        const pickValue = e.target.closest('[data-st-pick-value]');
+        if (pickValue) {
+          const which = pickValue.closest('.st-pick').dataset.stPick;
+          const id = pickValue.dataset.stPickValue;
+          if (which === 'tg') stTgProduct = id;
+          if (which === 'ng') stNgProduct = id;
+          stOffset = 0;
+          return stFetch();
+        }
+        const pickGroup = e.target.closest('.st-pick-group');
+        if (pickGroup) {
+          const wasOpen = pickGroup.classList.contains('open');
+          pickGroup.parentElement.querySelectorAll('.st-pick-group.open').forEach(g => g.classList.remove('open'));
+          if (!wasOpen) pickGroup.classList.add('open');
+          return;
+        }
         if (e.target.closest('[data-st-name]')) return stNameAsins();
         if (e.target.closest('[data-st-suggest]')) return stSuggestBids();
         const expand = e.target.closest('[data-st-expand]');
@@ -1603,9 +1627,15 @@
         if (pq) { stProdQuery = pq.value; stRedrawProducts(); }
       });
 
+      // An open picker closes on a click anywhere else, or on Escape.
+      document.addEventListener('click', e => {
+        if (!e.target.closest('.st-pick')) stClosePickers();
+      });
+
       // Typing filters on Enter rather than per keystroke: each one is a query
       // against six figures of rows.
       el.addEventListener('keydown', e => {
+        if (e.key === 'Escape') stClosePickers();
         const q = e.target.closest('[data-st-q]');
         if (q && e.key === 'Enter') { stQuery = q.value.trim(); stOffset = 0; stFetch(); }
         const tq = e.target.closest('[data-st-tq]');
@@ -1630,6 +1660,94 @@
         line += ' Amazon has not started it yet; its report queue is backed up.';
       }
       return line;
+    }
+
+    // ── PRODUCT NAMES ────────────────────────────────────────────────────────
+    // A product's name is its line and then itself: "Wall Map - SOK - US
+    // Ranger". Every product in a line carries the same prefix, so in a column
+    // it is noise; the last part alone is the name. Where two lines both have
+    // one — US Ranger is a wall map and a raised relief — the line's initials
+    // follow it: "US Ranger (WM)", "US Ranger (RR)".
+    let stProductLabels = new Map();   // portfolio id -> { group, short, label, full }
+
+    function stSplitProduct(name) {
+      const parts = String(name || '').split(' - ').map(x => x.trim()).filter(Boolean);
+      if (parts.length < 2) return { group: '', short: String(name || '').trim() };
+      return { group: parts.slice(0, -1).join(' - '), short: parts[parts.length - 1] };
+    }
+
+    function stLineInitials(group) {
+      return String(group || '').split(' - ')[0].split(/\s+/).filter(Boolean)
+        .map(w => w[0]).join('').toUpperCase();
+    }
+
+    function stBuildProductLabels(portfolios) {
+      const split = portfolios.map(p => ({ id: p.id, full: p.name, ...stSplitProduct(p.name) }));
+      const count = (key, f) => split.filter(x => f(x) === key).length;
+      const out = new Map();
+      for (const x of split) {
+        let label = x.short;
+        if (x.group && count(x.short.toLowerCase(), y => y.short.toLowerCase()) > 1) {
+          // Initials first; the whole line only where two lines share them too.
+          const initials = stLineInitials(x.group);
+          const clash = split.some(y => y !== x && y.short.toLowerCase() === x.short.toLowerCase() &&
+                                        stLineInitials(y.group) === initials);
+          label = `${x.short} (${clash ? x.group : initials})`;
+        }
+        out.set(x.id, { group: x.group, short: x.short, label, full: x.full });
+      }
+      return out;
+    }
+
+    // The short name for a product, or its own name shortened when it is not
+    // in the list — a campaign that has left it still has a heading.
+    function stProductLabel(id, fallback) {
+      const l = id ? stProductLabels.get(id) : null;
+      if (l) return l.label;
+      return fallback ? stSplitProduct(fallback).short : '—';
+    }
+
+    // A product picker with the products under their lines: hover a line and
+    // its products open beside it, by their short names. A native select
+    // cannot hold a menu inside a menu, so this is a button and two lists.
+    // `which` names the filter it sets: 'tg' for Targets, 'ng' for Negatives.
+    function stProductPicker(which, products, current) {
+      const lines = new Map();
+      const loose = [];
+      for (const p of products) {
+        const l = stProductLabels.get(p.id) || { ...stSplitProduct(p.name), label: p.name };
+        if (l.group) {
+          if (!lines.has(l.group)) lines.set(l.group, []);
+          lines.get(l.group).push({ id: p.id, short: l.short });
+        } else {
+          loose.push({ id: p.id, short: l.short });
+        }
+      }
+      const byName = (a, b) => a.short.localeCompare(b.short, 'en', { numeric: true });
+      const item = (id, text) => `<button type="button" class="st-pick-item${
+        id === current ? ' active' : ''}" data-st-pick-value="${escapeHtml(id)}">${escapeHtml(text)}</button>`;
+      const label = current ? stProductLabel(current, (products.find(p => p.id === current) || {}).name)
+                            : 'All products';
+      return `
+        <div class="st-pick" data-st-pick="${which}">
+          <button type="button" class="st-pick-btn" data-st-pick-toggle title="${escapeHtml(
+            current ? ((stProductLabels.get(current) || {}).full || label) : label)}">
+            <span class="st-pick-current">${escapeHtml(label)}</span><span class="st-pick-caret">▾</span>
+          </button>
+          <div class="st-pick-menu">
+            ${item('', 'All products')}
+            ${[...lines.keys()].sort((a, b) => a.localeCompare(b)).map(g => `
+              <div class="st-pick-group">
+                <span>${escapeHtml(g)}</span><span class="st-pick-arrow">›</span>
+                <div class="st-pick-sub">${lines.get(g).sort(byName).map(x => item(x.id, x.short)).join('')}</div>
+              </div>`).join('')}
+            ${loose.sort(byName).map(x => item(x.id, x.short)).join('')}
+          </div>
+        </div>`;
+    }
+
+    function stClosePickers() {
+      document.querySelectorAll('.st-pick.open, .st-pick-group.open').forEach(x => x.classList.remove('open'));
     }
 
     // The funnel's order, the same list the server checks a match type against.
