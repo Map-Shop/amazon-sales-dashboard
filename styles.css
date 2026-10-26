@@ -2315,21 +2315,36 @@
       white-space: nowrap;
     }
 
-    /* Product names run long — Amazon catalogue titles pass 150 characters —
-       so the column holds one width and wraps, rather than stretching the
-       table or pushing the figures off to the right. */
+    /* The Amazon product an ASIN search term is. Catalogue titles pass 150
+       characters, so the column holds one width and the title is cut short on
+       one line, the full title on hover. The cut is made by a block inside the
+       cell: a table cell on its own grows to fit text that cannot wrap, so it
+       will not hold a width by itself. */
     .arf-table th.st-col-product,
     .arf-table td.st-col-product {
       width: 16rem;
       min-width: 16rem;
       max-width: 16rem;
-      white-space: normal;
-      overflow-wrap: anywhere;
     }
 
-    .arf-table td.st-col-product .arf-btn {
-      white-space: normal;
-      text-align: left;
+    .st-asin-link {
+      display: block;
+      max-width: 16rem;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .st-asin-link,
+    .st-asin-inline {
+      color: var(--text-secondary);
+      text-decoration: none;
+    }
+
+    .st-asin-link:hover,
+    .st-asin-inline:hover {
+      color: var(--accent-orange);
+      text-decoration: underline;
     }
 
     /* Search Terms: the breadcrumb back out of one product, the first row of

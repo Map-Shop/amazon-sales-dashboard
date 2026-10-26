@@ -264,9 +264,25 @@
     }
 
     // The name alone, for the column beside the term.
-    function stProductCell(term) {
+    // Amazon's own page for an ASIN. Every product has one at /dp/, so this
+    // works for any ASIN — yours or anyone's — whether or not it has been named.
+    const ST_ASIN_RE = /^(?=.*[0-9])[0-9A-Za-z]{10}$/;
+
+    function stAsinUrl(asin) {
+      return `https://www.amazon.com/dp/${String(asin).toUpperCase()}`;
+    }
+
+    // The product an ASIN search term is, as a link to it. In the Product
+    // column it is one line cut short with an ellipsis, the full title on
+    // hover; elsewhere (`inline`) it sits beside the term at its full length.
+    // An ASIN Amazon's catalogue has not named still gets the link.
+    function stProductCell(term, inline) {
+      if (!ST_ASIN_RE.test(String(term || ''))) return '';
       const name = stAsinName(term);
-      return name ? `<span class="arf-muted">${escapeHtml(name)}</span>` : '';
+      const label = name || 'view on Amazon';
+      return `<a class="${inline ? 'st-asin-inline' : 'st-asin-link'}" href="${stAsinUrl(term)}"
+                 target="_blank" rel="noopener noreferrer"
+                 title="${escapeHtml(name ? `${name} — open on Amazon` : 'Open on Amazon')}">${escapeHtml(label)}</a>`;
     }
 
     // The keyword or targeting expression exactly as Amazon reports it. The
@@ -545,7 +561,7 @@
     // first. A ratio that cannot be worked out — no spend, no sales — always
     // sorts last, whichever way the column is turned.
     const ST_PRODUCT_COLS = [
-      { key: 'name', label: 'Product', text: true, cls: 'st-col-product', of: r => r.portfolio || '' },
+      { key: 'name', label: 'Product', text: true, of: r => r.portfolio || '' },
       { key: 'brand', label: 'Brand', text: true, of: r => r.brand || '' },
       { key: 'terms', label: 'Terms', of: r => r.terms },
       { key: 'clicks', label: 'Clicks', of: r => r.clicks },
@@ -623,7 +639,7 @@
       const id = r.portfolioId ? escapeHtml(r.portfolioId) : '';
       const name = escapeHtml(r.portfolio || '(no portfolio)');
       return `<tr>
-        <td class="arf-name st-col-product">${id
+        <td class="arf-name">${id
           ? `<button class="arf-btn" data-st-product="${id}" data-st-product-name="${name}">${name}</button>`
           : name}</td>
         <td>${escapeHtml(r.brand || '—')}</td>
@@ -897,7 +913,7 @@
       const matched = r.keyword || r.targeting || '—';
       const type = r.matchType ? ` <span class="arf-muted">${escapeHtml(r.matchType.toLowerCase())}</span>` : '';
       return `<tr>
-        <td class="arf-name">${stTermLabel(r.searchTerm)} ${stProductCell(r.searchTerm)}</td>
+        <td class="arf-name">${stTermLabel(r.searchTerm)} ${stProductCell(r.searchTerm, true)}</td>
         <td>${escapeHtml(matched)}${type}</td>
         <td>${escapeHtml(r.campaign || '—')}${
           r.campaignType ? ` <span class="arf-muted">${escapeHtml(r.campaignType)}</span>` : ''}</td>
