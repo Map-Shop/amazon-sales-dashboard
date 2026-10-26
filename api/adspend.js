@@ -7,6 +7,7 @@ import * as reviews from '../lib/adreviews.js';
 import * as spendOps from '../lib/adspendops.js';
 import * as searchTerms from '../lib/searchterms.js';
 import * as asinNames from '../lib/asinnames.js';
+import * as targets from '../lib/targets.js';
 import SellingPartner from 'amazon-sp-api';
 
 // An ad type's month as { rows } (null when kv has no record), and its
@@ -142,6 +143,8 @@ export default async function handler(req, res) {
     if (action === 'searchterms-collect')  return handleSearchTermsCollect(req, res);
     if (action === 'searchterms-names')    return handleSearchTermsNames(req, res);
     if (action === 'searchterms-get')      return handleSearchTermsGet(req, res);
+    if (action === 'searchterms-bids')     return handleSearchTermsBids(req, res);
+    if (action === 'searchterms-suggest')  return handleSearchTermsSuggest(req, res);
     // Weekly history — the continuous series, see the section at the bottom.
     if (action === 'weeks-get')            return handleWeeksGet(req, res);
     if (action === 'weeks-rebuild')        return handleWeeksRebuild(req, res);
@@ -5559,14 +5562,15 @@ async function handleSearchTermsGet(req, res) {
     const size = await searchTerms.tableBytes();
     const base = {
       success: true, month, pulls, pullable, size, pull,
-      asins: await asinNames.counts(month, { adProduct: ST_PRODUCT })
+      asins: await asinNames.counts(month, { adProduct: ST_PRODUCT }),
+      bids: await targets.status()
     };
 
     // Three depths of the same month: the products, the terms inside one, and
     // the raw daily rows underneath. A product is where a decision is made —
     // a cluster of terms with nothing to show for itself is one question about
     // that product, not fifty about terms.
-    const view = ['products', 'product-terms', 'terms', 'rows', 'term', 'term-products']
+    const view = ['products', 'product-terms', 'targets', 'terms', 'rows', 'term', 'term-products']
       .includes(String(req.query.view)) ? String(req.query.view) : 'products';
 
     if (view === 'products') {
@@ -5614,6 +5618,27 @@ async function handleSearchTermsGet(req, res) {
       });
     }
 
+    // One row per keyword or target: the bid as of the last pull beside what
+    // the target did in this month.
+    if (view === 'targets') {
+      const pick = (v, allowed) => (allowed.includes(String(v)) ? String(v) : null);
+      const page = await targets.byTarget({
+        adProduct: ST_PRODUCT, month,
+        portfolioId: String(req.query.portfolio || '').trim() || null,
+        q: String(req.query.q || '').trim(),
+        match: String(req.query.match || '').trim() || null,
+        state: pick(req.query.state, ['ENABLED', 'PAUSED']),
+        position: pick(req.query.position, targets.TARGET_POSITIONS),
+        sort: req.query.sort, dir: req.query.dir,
+        limit: req.query.limit, offset: req.query.offset
+      });
+      return res.status(200).json({
+        ...base, view, rows: page.rows, total: page.total, positions: page.positions,
+        filterProducts: page.products, filterMatches: searchTerms.funnelSort(page.matches),
+        names: await stNamesFor(page.rows.map(r => r.text))
+      });
+    }
+
     const common = {
       adProduct: ST_PRODUCT, month,
       sort: req.query.sort, dir: req.query.dir,
@@ -5621,9 +5646,12 @@ async function handleSearchTermsGet(req, res) {
       q: String(req.query.q || '').trim(), minClicks: req.query.minClicks
     };
     // No portfolio here: looking inside a product is its own view, with its
-    // own table, because the question is a different one.
+    // own table, because the question is a different one. Account-wide, the
+    // terms worth a list of their own are the ones two or more of your
+    // products pay for — about one in seven terms, and half of September's
+    // spend. A term only one product pays for reads better inside that product.
     const page = view === 'terms'
-      ? await searchTerms.byTerm({ ...common, onlyDead: String(req.query.onlyDead) === '1' })
+      ? await searchTerms.byTerm({ ...common, onlyDead: String(req.query.onlyDead) === '1', minProducts: 2 })
       : await searchTerms.getMonth(common);
 
     return res.status(200).json({
@@ -5633,6 +5661,332 @@ async function handleSearchTermsGet(req, res) {
   } catch (error) {
     console.error('[SEARCHTERMS GET] Error:', error);
     return res.status(500).json({ error: 'Search term load failed: ' + error.message });
+  }
+}
+
+// ─── BIDS ────────────────────────────────────────────────────────────────────
+// Every keyword and target with its own bid, and Amazon's suggested range for
+// each. Two presses' worth of work behind one button: the list comes back in a
+// few calls, the suggestions take one call per ad group and are worked through
+// in rounds, because a hundred-odd calls do not fit in one function's minute.
+//
+// Enabled and paused targets both, because switching a target on or off from
+// here is coming and a paused one has to be listed to be switched back on.
+// Archived ones are left out — Amazon will not re-enable those.
+//
+// Nothing here writes to Amazon.
+
+const TG_ADS_HOST = 'https://advertising-api.amazon.com';
+const TG_LISTS = [
+  { kind: 'keyword', url: `${TG_ADS_HOST}/sp/keywords/list`,
+    media: 'application/vnd.spKeyword.v3+json', field: 'keywords' },
+  { kind: 'target', url: `${TG_ADS_HOST}/sp/targets/list`,
+    media: 'application/vnd.spTargetingClause.v3+json', field: 'targetingClauses' }
+];
+const TG_STATES = ['ENABLED', 'PAUSED'];
+const TG_PAGE_SIZE = 1000;
+// A list longer than this is not this account; stopping beats storing part.
+const TG_MAX_PAGES = 50;
+
+// Amazon takes up to 100 targets in one suggestion request.
+const TG_REC_BATCH = 100;
+// Left of the function's 60 seconds once the slowest request is allowed for.
+const TG_SUGGEST_BUDGET_MS = 40000;
+const TG_REC_URL = `${TG_ADS_HOST}/sp/targets/bid/recommendations`;
+// v3 of this request was retired in 2025. v4 first, then v5; whichever Amazon
+// accepts is remembered for the rest of the process.
+const TG_REC_VERSIONS = ['v4', 'v5'];
+const tgRecMedia = (v) => `application/vnd.spthemebasedbidrecommendation.${v}+json`;
+let tgRecVersion = null;
+
+const TG_KEYWORD_MATCH = { EXACT: 'Exact', PHRASE: 'Phrase', BROAD: 'Broad' };
+
+// Amazon's expression types, written the way the search term report writes the
+// same target, so one target reads the same on every tab. `rec` is how to ask
+// for its suggested bid; null where Amazon is not known to give one.
+const TG_EXPRESSIONS = {
+  QUERY_HIGH_REL_MATCHES:  { label: 'Auto', text: () => 'close-match', rec: () => ({ type: 'CLOSE_MATCH' }) },
+  QUERY_BROAD_REL_MATCHES: { label: 'Auto', text: () => 'loose-match', rec: () => ({ type: 'LOOSE_MATCH' }) },
+  ASIN_SUBSTITUTE_RELATED: { label: 'Auto', text: () => 'substitutes', rec: () => ({ type: 'SUBSTITUTES' }) },
+  ASIN_ACCESSORY_RELATED:  { label: 'Auto', text: () => 'complements', rec: () => ({ type: 'COMPLEMENTS' }) },
+  ASIN_SAME_AS:            { label: 'ASIN', text: v => `asin="${v}"`, rec: v => ({ type: 'PAT_ASIN', value: v }) },
+  ASIN_EXPANDED_FROM:      { label: 'ASIN', text: v => `asin-expanded="${v}"`, rec: null },
+  ASIN_CATEGORY_SAME_AS:   { label: 'Category', text: v => `category="${v}"`, rec: v => ({ type: 'PAT_CATEGORY', value: v }) },
+  ASIN_BRAND_SAME_AS:      { label: 'Category', text: v => `brand="${v}"`, rec: null },
+  KEYWORD_GROUP_SAME_AS:   { label: 'Keyword group', text: v => `keyword-group="${v}"`, rec: null }
+};
+
+// A bid of its own, or null when the target bids the ad group's default —
+// Amazon leaves the field out for those.
+function tgBid(v) {
+  const n = Number(v);
+  return v !== null && v !== undefined && v !== '' && Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function tgNormalizeKeyword(k) {
+  const match = String((k && k.matchType) || '').toUpperCase();
+  const text = stText(k && k.keywordText);
+  return {
+    targetId: stText(k && k.keywordId), kind: 'keyword',
+    campaignId: stText(k && k.campaignId), adGroupId: stText(k && k.adGroupId),
+    state: stText(k && k.state) ? String(k.state).toUpperCase() : null,
+    matchLabel: TG_KEYWORD_MATCH[match] || stText(k && k.matchType) || '—',
+    text, bid: tgBid(k && k.bid), expression: null,
+    recExpr: TG_KEYWORD_MATCH[match] && text ? { type: `KEYWORD_${match}_MATCH`, value: text } : null
+  };
+}
+
+function tgNormalizeTarget(t) {
+  const expr = Array.isArray(t && t.expression) ? t.expression : [];
+  // resolvedExpression carries names where expression carries ids — a
+  // category's name rather than its number — so it is what is shown, and the
+  // id is what Amazon is asked about.
+  const resolved = Array.isArray(t && t.resolvedExpression) ? t.resolvedExpression : [];
+  const typeOf = (e) => String((e && e.type) || '').toUpperCase();
+  const first = TG_EXPRESSIONS[typeOf(expr[0])];
+  const text = expr.map((e, i) => {
+    const known = TG_EXPRESSIONS[typeOf(e)];
+    const value = (resolved[i] && resolved[i].value) ?? e.value;
+    return known ? known.text(value)
+                 : `${typeOf(e).toLowerCase().replace(/_/g, '-')}${value !== undefined ? `="${value}"` : ''}`;
+  }).join(' ');
+  // Only a single-part expression has a suggestion request to match it. A
+  // category narrowed by brand or price is a different, refined request.
+  const recExpr = first && first.rec && expr.length === 1 ? first.rec(expr[0].value) : null;
+  return {
+    targetId: stText(t && t.targetId), kind: 'target',
+    campaignId: stText(t && t.campaignId), adGroupId: stText(t && t.adGroupId),
+    state: stText(t && t.state) ? String(t.state).toUpperCase() : null,
+    matchLabel: first ? first.label : 'Other',
+    text: text || null, bid: tgBid(t && t.bid), expression: expr.length ? expr : null,
+    recExpr: recExpr && (recExpr.value === undefined || recExpr.value) ? recExpr : null
+  };
+}
+
+async function tgAdsPost(accessToken, url, media, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: adsAuthHeaders(accessToken, { 'Content-Type': media, 'Accept': media }),
+    body: JSON.stringify(body)
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    // The status in brackets is what withAdsRetry reads to retry a 429.
+    const err = new Error(`Amazon refused (${res.status}): ${text.slice(0, 300)}`);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+  try { return text ? JSON.parse(text) : {}; }
+  catch { throw new Error(`Amazon answered with something that is not JSON: ${text.slice(0, 200)}`); }
+}
+
+async function tgList(accessToken, spec) {
+  const items = [];
+  let nextToken = null;
+  for (let page = 0; page < TG_MAX_PAGES; page++) {
+    const body = { stateFilter: { include: TG_STATES }, maxResults: TG_PAGE_SIZE };
+    if (nextToken) body.nextToken = nextToken;
+    const resp = await withAdsRetry(() => tgAdsPost(accessToken, spec.url, spec.media, body));
+    items.push(...(resp[spec.field] || []));
+    nextToken = resp.nextToken || null;
+    if (!nextToken) return items;
+  }
+  throw new Error(`Amazon's ${spec.kind} list ran past ${TG_MAX_PAGES} pages, so it was not stored.`);
+}
+
+// Amazon's suggestions come grouped by theme — the everyday one, and others
+// for events like Prime Day. The everyday one is used; failing that, the first.
+// Each target gets its values lowest first: a low, the suggestion, and a high.
+function tgParseRecommendations(body) {
+  const themes = Array.isArray(body && body.bidRecommendations) ? body.bidRecommendations : [];
+  const pick = themes.find(t => String((t && t.theme) || '').toUpperCase() === 'CONVERSION_OPPORTUNITIES')
+            || themes[0];
+  if (!pick) return { theme: null, items: [] };
+  const list = Array.isArray(pick.bidRecommendationsForTargetingExpressions)
+    ? pick.bidRecommendationsForTargetingExpressions : [];
+  return {
+    theme: pick.theme ? String(pick.theme) : null,
+    items: list.map(x => {
+      const e = (x && x.targetingExpression) || {};
+      const values = ((x && x.bidValues) || [])
+        .map(b => Number(b && b.suggestedBid))
+        .filter(n => Number.isFinite(n) && n > 0)
+        .sort((a, b) => a - b);
+      return { type: String(e.type || '').toUpperCase(), value: e.value ?? null, ...tgRange(values) };
+    })
+  };
+}
+
+function tgRange(values) {
+  if (!values.length) return { low: null, mid: null, high: null };
+  if (values.length === 1) return { low: null, mid: values[0], high: null };
+  return {
+    low: values[0],
+    mid: values.length >= 3 ? values[Math.floor(values.length / 2)] : null,
+    high: values[values.length - 1]
+  };
+}
+
+// Pairs each target asked about with Amazon's answer for it, by expression.
+// Keyword text is compared without regard to case or spacing at the ends,
+// since Amazon may hand it back normalised.
+function tgMatchRecommendations(asked, items) {
+  const key = (type, value) => `${String(type || '').toUpperCase()}|${String(value ?? '').trim().toLowerCase()}`;
+  const byKey = new Map(items.map(i => [key(i.type, i.value), i]));
+  return asked.map((t, i) => {
+    let hit = byKey.get(key(t.rec.type, t.rec.value));
+    // The same order back as asked, when the counts agree and the type does.
+    if (!hit && items.length === asked.length && items[i] &&
+        items[i].type === String(t.rec.type).toUpperCase()) hit = items[i];
+    return hit
+      ? { targetId: t.targetId, found: !!(hit.low || hit.mid || hit.high), low: hit.low, mid: hit.mid, high: hit.high }
+      : { targetId: t.targetId, found: false, low: null, mid: null, high: null };
+  });
+}
+
+// A refusal of the version being asked in, as opposed to of the request.
+function tgVersionRefused(err) {
+  const status = err && err.status;
+  if (status === 406 || status === 415) return true;
+  return status === 400 && /media.?type|content-type|accept header|unsupported version/i.test(String((err && err.body) || ''));
+}
+
+// Amazon's own words for a refusal, short enough to sit on a row.
+function tgShortError(err) {
+  try {
+    const b = JSON.parse(err.body || '');
+    const msg = b.message || b.details || b.code || (Array.isArray(b.errors) && b.errors[0] &&
+                (b.errors[0].message || b.errors[0].errorType));
+    if (msg) return `${err.status || ''} ${String(msg)}`.trim().slice(0, 160);
+  } catch { /* not JSON */ }
+  return String(err.message || err).slice(0, 160);
+}
+
+async function tgAskSuggestions(accessToken, campaignId, adGroupId, recs) {
+  const versions = tgRecVersion ? [tgRecVersion] : TG_REC_VERSIONS;
+  let last;
+  for (const v of versions) {
+    try {
+      const body = await withAdsRetry(() => tgAdsPost(accessToken, TG_REC_URL, tgRecMedia(v), {
+        recommendationType: 'BIDS_FOR_EXISTING_AD_GROUP',
+        campaignId, adGroupId, targetingExpressions: recs
+      }));
+      tgRecVersion = v;
+      return { version: v, ...tgParseRecommendations(body) };
+    } catch (err) {
+      last = err;
+      if (!tgVersionRefused(err)) throw err;
+    }
+  }
+  throw last;
+}
+
+// The work for one round of suggestions: keywords and Auto groups first,
+// product and category targets after, each in requests of up to 100 from one
+// ad group. Apart, because Amazon may not suggest for the second kind and its
+// refusal should not take the first down with it; first, so that by the time a
+// product target is refused, an answer has already shown the request is sound.
+function tgSuggestionWork(groups) {
+  const work = [];
+  for (const pat of [false, true]) {
+    for (const g of groups) {
+      const mine = g.targets.filter(t => /^PAT_/.test(String(t.rec && t.rec.type)) === pat);
+      for (let i = 0; i < mine.length; i += TG_REC_BATCH) {
+        work.push({ campaignId: g.campaignId, adGroupId: g.adGroupId, targets: mine.slice(i, i + TG_REC_BATCH) });
+      }
+    }
+  }
+  return work;
+}
+
+async function handleSearchTermsBids(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
+    }
+
+    const accessToken = await getAdsAccessToken();
+    const [keywords, clauses] = await Promise.all(TG_LISTS.map(spec => tgList(accessToken, spec)));
+    const seen = new Set();
+    const rows = [...keywords.map(tgNormalizeKeyword), ...clauses.map(tgNormalizeTarget)]
+      .filter(r => r.targetId && !seen.has(r.targetId) && seen.add(r.targetId));
+    if (!rows.length) {
+      return res.status(502).json({
+        error: 'Amazon returned no keywords or targets, so the stored bids were left as they were.'
+      });
+    }
+    await targets.replaceAll(rows);
+    return res.status(200).json({
+      success: true, keywords: keywords.length, targets: clauses.length, stored: rows.length,
+      status: await targets.status(), pulledAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS BIDS] Error:', error);
+    return res.status(500).json({ error: 'Pulling bids failed: ' + error.message });
+  }
+}
+
+async function handleSearchTermsSuggest(req, res) {
+  try {
+    const auth = await verifyGoogleToken(req);
+    if (!auth.ok) return res.status(401).json({ error: auth.error });
+    const missing = missingAdsCredentials();
+    if (missing.length) {
+      return res.status(500).json({ error: `Missing Advertising API credentials: ${missing.join(', ')}` });
+    }
+
+    const accessToken = await getAdsAccessToken();
+    const deadline = Date.now() + TG_SUGGEST_BUDGET_MS;
+    const work = tgSuggestionWork(await targets.needSuggestions(80));
+    // Until Amazon has answered one request, a refusal says more about how it
+    // was asked than about the targets in it — so it stops the round and is
+    // shown, rather than written against every target as "no suggestion".
+    let trusted = await targets.anySuggestion();
+    let asked = 0, got = 0, refused = 0, missed = 0;
+    let error = null;
+
+    for (const item of work) {
+      if (Date.now() > deadline) break;
+      const out = [];
+      try {
+        if (asked) await sleep(250);
+        asked++;
+        const r = await tgAskSuggestions(accessToken, item.campaignId, item.adGroupId,
+                                         item.targets.map(t => t.rec));
+        for (const m of tgMatchRecommendations(item.targets, r.items)) {
+          if (m.found) got++; else missed++;
+          out.push({ targetId: m.targetId, low: m.low, mid: m.mid, high: m.high,
+                     theme: r.theme, version: r.version,
+                     note: m.found ? null : 'Amazon returned no suggestion for this target.' });
+        }
+        if (got) trusted = true;
+      } catch (err) {
+        const status = err.status || 0;
+        if ((status === 400 || status === 422) && trusted) {
+          refused += item.targets.length;
+          const note = `Amazon gave no suggestion: ${tgShortError(err)}`;
+          for (const t of item.targets) out.push({ targetId: t.targetId, note, version: tgRecVersion });
+        } else {
+          error = tgShortError(err);
+          console.error('[SEARCHTERMS SUGGEST] stopped:', err.message);
+        }
+      }
+      await targets.recordSuggestions(out);
+      if (error) break;
+    }
+
+    const status = await targets.status();
+    return res.status(200).json({
+      success: true, asked, got, missed, refused, version: tgRecVersion,
+      remaining: status ? status.groupsLeft : 0, status, error
+    });
+  } catch (error) {
+    console.error('[SEARCHTERMS SUGGEST] Error:', error);
+    return res.status(500).json({ error: 'Suggested bids failed: ' + error.message });
   }
 }
 
@@ -5656,4 +6010,7 @@ export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          BW_CONFIG, BW_POSTURES, BW_REPORT_KEYS, BW_SPEC_DEVIATIONS,
          BW_INCREASES, BW_DECREASES,
          stNormalizeRows, stResolveMonth, stDefaultMonth, stMonthSettled,
-         stPullableMonths, ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS };
+         stPullableMonths, ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS,
+         tgNormalizeKeyword, tgNormalizeTarget, tgParseRecommendations, tgRange,
+         tgMatchRecommendations, tgVersionRefused, tgShortError, tgSuggestionWork,
+         TG_REC_VERSIONS, TG_REC_BATCH };

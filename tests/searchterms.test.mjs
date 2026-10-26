@@ -243,6 +243,7 @@ const OPTIONS = [
   ['term filter', { month: '2026-09', q: 'laminated' }],
   ['click floor', { month: '2026-09', minClicks: 15 }],
   ['no orders yet', { month: '2026-09', onlyDead: true }],
+  ['shared terms', { month: '2026-09', minProducts: 2 }],
   ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
   ['sorted by ROAS', { month: '2026-09', sort: 'roas', dir: 'desc' }],
   ['paged', { month: '2026-09', limit: 50, offset: 400 }]
@@ -379,6 +380,184 @@ console.log('\nTHE BREAKDOWN  — one term, by product');
   ok(at('not in campaign list') > 0 && at("WHEN 'Auto' THEN 1") > at('not in campaign list') &&
      at('sum(t.cost) DESC') > at("WHEN 'Auto' THEN 1"),
      'ordered by product, then funnel stage, then biggest line first');
+}
+
+console.log('\nSHARED TERMS  \u2014 the terms two or more products pay for');
+
+{
+  const q = ST.termQueries({ month: '2026-09', minProducts: 2 });
+  ok(q.rows.params[6] === 2 && q.count.params[6] === 2,
+     'the product floor is a parameter of both the page and its total');
+  ok(/spread\.products, 0\) >= \$7::int/.test(q.count.text) && /JOIN spread/.test(q.count.text),
+     'and the total counts only shared terms',
+     'counted without the spread, the pager would promise five thousand terms and show seven hundred');
+  ok(ST.termQueries({ month: '2026-09' }).rows.params[6] === 0,
+     'with no floor every term qualifies');
+}
+
+console.log('\nBIDS  \u2014 Amazon\'s keywords and targets, in the stored shape');
+
+{
+  const kw = M.tgNormalizeKeyword({ keywordId: 111, campaignId: 'c1', adGroupId: 'g1', state: 'enabled',
+                                    matchType: 'EXACT', keywordText: 'pull down world map', bid: 0.85 });
+  ok(kw.targetId === '111' && kw.kind === 'keyword' && kw.state === 'ENABLED' && kw.matchLabel === 'Exact',
+     'a keyword keeps its id, ad group, state and match type');
+  ok(kw.bid === 0.85 && kw.recExpr.type === 'KEYWORD_EXACT_MATCH' && kw.recExpr.value === 'pull down world map',
+     'with its own bid, and the expression Amazon\'s suggestion is asked with');
+  const dflt = M.tgNormalizeKeyword({ keywordId: 112, matchType: 'BROAD', keywordText: 'world map' });
+  ok(dflt.bid === null && dflt.recExpr.type === 'KEYWORD_BROAD_MATCH',
+     'a keyword with no bid field bids its ad group\'s default, and says so with no bid',
+     'Amazon leaves the field out rather than repeating the default');
+}
+
+{
+  const t = (expression, extra = {}) => M.tgNormalizeTarget({
+    targetId: 't1', campaignId: 'c1', adGroupId: 'g1', state: 'PAUSED', expression, ...extra });
+  const close = t([{ type: 'QUERY_HIGH_REL_MATCHES' }], { expressionType: 'AUTO', bid: 0.4 });
+  ok(close.text === 'close-match' && close.matchLabel === 'Auto' && close.recExpr.type === 'CLOSE_MATCH',
+     'an Auto group reads the way the search term report writes it', close.text);
+  ok(['QUERY_BROAD_REL_MATCHES', 'ASIN_SUBSTITUTE_RELATED', 'ASIN_ACCESSORY_RELATED']
+       .map(type => t([{ type }]).text).join(',') === 'loose-match,substitutes,complements',
+     'all four Auto groups do');
+  const asin = t([{ type: 'ASIN_SAME_AS', value: 'B07SXC739C' }]);
+  ok(asin.text === 'asin="B07SXC739C"' && asin.matchLabel === 'ASIN' &&
+     asin.recExpr.type === 'PAT_ASIN' && asin.recExpr.value === 'B07SXC739C',
+     'an ASIN target keeps the report\'s form, so it is named like an ASIN search term');
+  const cat = t([{ type: 'ASIN_CATEGORY_SAME_AS', value: '1069242' }],
+                { resolvedExpression: [{ type: 'ASIN_CATEGORY_SAME_AS', value: 'Wall Maps' }] });
+  ok(cat.text === 'category="Wall Maps"' && cat.recExpr.value === '1069242',
+     'a category is shown by its name and asked about by its id');
+  const refined = t([{ type: 'ASIN_CATEGORY_SAME_AS', value: '1069242' }, { type: 'ASIN_BRAND_SAME_AS', value: '42' }]);
+  ok(refined.recExpr === null && /category=.* brand=/.test(refined.text),
+     'a category narrowed by brand is listed, with no suggestion asked for',
+     'a refined target is a different request, not the plain category one');
+  const group = t([{ type: 'KEYWORD_GROUP_SAME_AS', value: 'Keywords related to your product category' }]);
+  ok(group.matchLabel === 'Keyword group' && group.recExpr === null,
+     'a keyword group is listed with no suggestion asked for');
+  const odd = t([{ type: 'SOMETHING_NEW', value: 'x' }]);
+  ok(odd.matchLabel === 'Other' && odd.text === 'something-new="x"' && odd.recExpr === null,
+     'an expression type Amazon adds later is kept and labelled, not dropped');
+  ok(close.state === 'PAUSED' && close.bid === 0.4 && t([]).text === null,
+     'a target keeps its state and bid; one with no expression has no text');
+}
+
+console.log('\nSUGGESTED BIDS  \u2014 reading Amazon\'s answer');
+
+{
+  const body = { bidRecommendations: [
+    { theme: 'PRIME_DAY', bidRecommendationsForTargetingExpressions: [
+      { targetingExpression: { type: 'CLOSE_MATCH' }, bidValues: [{ suggestedBid: 9 }, { suggestedBid: 10 }, { suggestedBid: 11 }] }] },
+    { theme: 'CONVERSION_OPPORTUNITIES', bidRecommendationsForTargetingExpressions: [
+      { targetingExpression: { type: 'CLOSE_MATCH' }, bidValues: [{ suggestedBid: 1.1 }, { suggestedBid: 0.62 }, { suggestedBid: 0.85 }] },
+      { targetingExpression: { type: 'KEYWORD_EXACT_MATCH', value: 'Pull Down World Map' }, bidValues: [{ suggestedBid: 1.4 }] }] }
+  ] };
+  const r = M.tgParseRecommendations(body);
+  ok(r.theme === 'CONVERSION_OPPORTUNITIES', 'the everyday suggestion is used, not an event\'s',
+     'a Prime Day range would read as Amazon wanting triple the bid');
+  ok(r.items[0].low === 0.62 && r.items[0].mid === 0.85 && r.items[0].high === 1.1,
+     'three values become a low, the suggestion and a high, whatever order they arrive in');
+  ok(r.items[1].low === null && r.items[1].mid === 1.4 && r.items[1].high === null,
+     'a single value is the suggestion alone, with no range to sit inside');
+  ok(M.tgParseRecommendations({}).items.length === 0 && M.tgParseRecommendations(null).theme === null,
+     'an answer with no recommendations reads as none');
+  ok(M.tgRange([0.3, 0.9]).low === 0.3 && M.tgRange([0.3, 0.9]).mid === null && M.tgRange([0.3, 0.9]).high === 0.9,
+     'two values are a range with no suggestion between them');
+
+  const asked = [
+    { targetId: 'a', rec: { type: 'KEYWORD_EXACT_MATCH', value: 'pull down world map ' } },
+    { targetId: 'b', rec: { type: 'CLOSE_MATCH' } },
+    { targetId: 'c', rec: { type: 'PAT_ASIN', value: 'B000000001' } }
+  ];
+  const m = M.tgMatchRecommendations(asked, r.items);
+  ok(m[0].found && m[0].mid === 1.4, 'a keyword is matched to its answer whatever case Amazon hands it back in');
+  ok(m[1].found && m[1].low === 0.62, 'an Auto group is matched by type');
+  ok(!m[2].found && m[2].low === null, 'a target Amazon did not answer for is recorded as no suggestion');
+  const swapped = M.tgMatchRecommendations(
+    [{ targetId: 'x', rec: { type: 'PAT_ASIN', value: 'B0AAAAAAA1' } }],
+    [{ type: 'CLOSE_MATCH', value: null, low: 1, mid: 2, high: 3 }]);
+  ok(!swapped[0].found,
+     'an answer in the same position but for another kind of target is not taken as this one');
+}
+
+{
+  const e = (status, body) => Object.assign(new Error('x'), { status, body });
+  ok(M.tgVersionRefused(e(415, '')) && M.tgVersionRefused(e(406, '')),
+     'an unsupported media type moves on to the next version');
+  ok(M.tgVersionRefused(e(400, '{"message":"Invalid Content-Type header"}')),
+     'and so does a 400 that names the content type');
+  ok(!M.tgVersionRefused(e(400, '{"message":"targetingExpressions[0].value is invalid"}')) &&
+     !M.tgVersionRefused(e(422, '')) && !M.tgVersionRefused(e(429, '')),
+     'a refusal of the request itself does not, nor does throttling');
+  ok(M.TG_REC_VERSIONS[0] === 'v4' && !M.TG_REC_VERSIONS.includes('v3'),
+     'v4 is asked first and the retired v3 not at all');
+  ok(M.tgShortError(e(422, '{"code":"UNSUPPORTED","message":"PAT_ASIN is not supported"}')) === '422 PAT_ASIN is not supported',
+     'a refusal is recorded in Amazon\'s own words');
+}
+
+{
+  const many = Array.from({ length: 230 }, (_, i) => ({ targetId: `k${i}`, rec: { type: 'KEYWORD_EXACT_MATCH', value: `t${i}` } }));
+  const work = M.tgSuggestionWork([
+    { campaignId: 'c1', adGroupId: 'g1', targets: [{ targetId: 'p1', rec: { type: 'PAT_ASIN', value: 'B0' } },
+                                                    { targetId: 'a1', rec: { type: 'CLOSE_MATCH' } }] },
+    { campaignId: 'c2', adGroupId: 'g2', targets: many }
+  ]);
+  ok(work.map(w => w.targets.length).join(',') === '1,100,100,30,1',
+     'requests carry at most 100 targets, from one ad group each', work.map(w => w.targets.length).join(','));
+  ok(work[work.length - 1].targets[0].targetId === 'p1' &&
+     work.slice(0, -1).every(w => w.targets.every(t => !/^PAT_/.test(t.rec.type))),
+     'product targets are asked about last, after keywords and Auto groups in every ad group',
+     'by then an answer has shown the request is sound, so a refusal is about the target');
+}
+
+console.log('\nTHE TARGETS TABLE  \u2014 every parameter lines up, every sort is whitelisted');
+
+{
+  const TG = await import('../lib/targets.js');
+  const TG_OPTIONS = [
+    ['default', { month: '2026-09' }],
+    ['one product', { month: '2026-09', portfolioId: 'pf1' }],
+    ['target filter', { month: '2026-09', q: 'world map' }],
+    ['match type', { month: '2026-09', match: 'Exact' }],
+    ['paused only', { month: '2026-09', state: 'PAUSED' }],
+    ['below the range', { month: '2026-09', position: 'below' }],
+    ['every filter', { month: '2026-09', portfolioId: 'pf1', q: 'map', match: 'Auto', state: 'ENABLED', position: 'within' }],
+    ['by CPC', { month: '2026-09', sort: 'cpc', dir: 'asc' }],
+    ['by ROAS', { month: '2026-09', sort: 'roas' }],
+    ['paged', { month: '2026-09', limit: 50, offset: 400 }]
+  ];
+  for (const [label, opts] of TG_OPTIONS) {
+    const q = TG.targetQueries(opts);
+    checkStatement(`targets, rows, ${label}`, q.rows);
+    checkStatement(`targets, count, ${label}`, q.count);
+    checkStatement(`targets, positions, ${label}`, q.positions);
+    checkStatement(`targets, facets, ${label}`, q.facets);
+  }
+
+  const q = TG.targetQueries({ month: '2026-09', position: 'below', limit: 50, offset: 100 });
+  ok(q.count.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[7] === 50 && q.rows.params[8] === 100,
+     'a page and its total are filtered the same way, and the paging is passed, not interpolated');
+  ok(!/position = \$/.test(q.positions.text) && q.positions.params.length === 6,
+     'the tally by position ignores the position filter',
+     'so each choice says what picking it would show');
+  ok(TG.targetQueries({ month: '2026-09', position: 'sideways' }).rows.params[6] === null,
+     'a position outside the four is no filter at all');
+
+  const evil = 'cost; DROP TABLE sp_targets --';
+  ok(!/DROP/.test(TG.targetQueries({ month: '2026-09', sort: evil }).rows.text),
+     'a sort key outside the whitelist never reaches the statement');
+  const order = (sort) => { const t = TG.targetQueries({ month: '2026-09', sort }).rows.text; return t.slice(t.lastIndexOf('ORDER BY')); };
+  ok(/cost \/ NULLIF\(clicks, 0\)/.test(order('cpc')) && /sales \/ NULLIF\(cost, 0\)/.test(order('roas')),
+     'CPC and ROAS sort by their own ratios, guarded against nothing to divide by',
+     'a paused target with no clicks would otherwise stop the whole statement');
+  const unguarded = TG_OPTIONS.map(([, o]) => TG.targetQueries(o).rows.text)
+    .filter(t => /\/ (?!NULLIF)/.test(t));
+  ok(unguarded.length === 0, 'no division anywhere in the statement is unguarded');
+  ok(/LEFT JOIN ad_campaigns/.test(q.rows.text) && /LEFT JOIN perf/.test(q.rows.text),
+     'a target outside the campaign list, or with nothing in the month, is still listed');
+  ok(/CASE WHEN c\.ad_group_id = g\.ad_group_id THEN c\.default_bid END/.test(q.rows.text),
+     'a default bid is only credited to a target in the ad group it belongs to');
+  ok(TG.TG_COLUMNS.map(([, c]) => c).includes('target_text') && !TG.TG_COLUMNS.some(([, c]) => c === 'text'),
+     'the text column is not named after a Postgres type');
 }
 
 console.log('\nCOVERAGE  \u2014 what a pull actually brought back');

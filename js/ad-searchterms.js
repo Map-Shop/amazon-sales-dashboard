@@ -7,7 +7,9 @@
     //
     // Pulling is a deliberate click, never something a page load does — this is
     // the slowest report Amazon generates, and a month that is already stored
-    // would be re-fetched for nothing.
+    // would be re-fetched for nothing. Bids are the same: Pull bids fetches
+    // every keyword and target with its bid and Amazon's suggested range, for
+    // the Targets tab, until the daily cron takes that over.
     //
     // Everything is prefixed `st`. These files share one global scope, so
     // escapeHtml / formatNumber / _svTimeAgo are CALLED, never redefined.
@@ -28,7 +30,7 @@
     let stQuery = '';
     let stMinClicks = 0;
     let stOffset = 0;
-    let stView = 'products';   // products | terms | rows
+    let stView = 'products';   // products | targets | terms | rows
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
 
@@ -43,6 +45,16 @@
     let stProdBrand = 'all';
     let stProdOrders = 'any';
     let stDetail = null;       // { term, rows, loading, error } for the open term
+
+    // The Targets tab's filters. Its own, like the product list's: a product
+    // picked here is a filter on targets, not a drill-down, and its search box
+    // looks in keywords rather than in what shoppers typed.
+    let stTgProduct = '';
+    let stTgQuery = '';
+    let stTgMatch = '';
+    let stTgState = '';
+    let stTgPosition = '';
+    let stBidsBusy = false;
 
     // Every click fires a request and they can come back out of order; the
     // slowest query is the one inside a product. Each request takes a number,
@@ -94,9 +106,17 @@
           minClicks: String(stMinClicks)
         });
         if (stMonth) qs.set('month', stMonth);
-        if (stQuery) qs.set('q', stQuery);
-        if (stPortfolio) qs.set('portfolio', stPortfolio.id);
-        if (stOnlyDead) qs.set('onlyDead', '1');
+        if (stView === 'targets') {
+          if (stTgQuery) qs.set('q', stTgQuery);
+          if (stTgProduct) qs.set('portfolio', stTgProduct);
+          if (stTgMatch) qs.set('match', stTgMatch);
+          if (stTgState) qs.set('state', stTgState);
+          if (stTgPosition) qs.set('position', stTgPosition);
+        } else {
+          if (stQuery) qs.set('q', stQuery);
+          if (stPortfolio) qs.set('portfolio', stPortfolio.id);
+          if (stOnlyDead) qs.set('onlyDead', '1');
+        }
         const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -313,6 +333,85 @@
       }
     }
 
+    // ── BIDS ─────────────────────────────────────────────────────────────────
+    // Pull bids is two steps behind one button. The keyword and target lists
+    // come back in a few calls; Amazon's suggested ranges take a call per ad
+    // group, so they are asked for in rounds until none are left. A round that
+    // stops — a closed tab, a refusal — picks up from the Targets tab.
+
+    async function stPullBids() {
+      if (stBidsBusy || !accessToken) return;
+      stBidsBusy = true;
+      stSetBidsBusy(true);
+      try {
+        stSetStatus('Fetching every keyword and target, with its bid, from Amazon…');
+        const res = await fetch('/api/adspend?action=searchterms-bids', {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Pulling bids failed (${res.status})`);
+        stSetStatus(`Stored ${formatCount(data.stored)} keywords and targets. ` +
+                    'Asking Amazon for its suggested bids…');
+        await stSuggestRounds();
+      } catch (err) {
+        console.error('[ST] bids failed:', err);
+        stSetStatus('', err.message);
+      } finally {
+        stBidsBusy = false;
+        stSetBidsBusy(false);
+      }
+    }
+
+    async function stSuggestBids() {
+      if (stBidsBusy || !accessToken) return;
+      stBidsBusy = true;
+      stSetBidsBusy(true);
+      try {
+        await stSuggestRounds();
+      } catch (err) {
+        console.error('[ST] suggestions failed:', err);
+        stSetStatus('', err.message);
+      } finally {
+        stBidsBusy = false;
+        stSetBidsBusy(false);
+      }
+    }
+
+    // Rounds until Amazon has been asked about every ad group, it refuses, or
+    // a round gets nothing done — the last so a stuck round cannot loop.
+    async function stSuggestRounds() {
+      for (;;) {
+        const res = await fetch('/api/adspend?action=searchterms-suggest', {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Suggested bids failed (${res.status})`);
+        const s = data.status || {};
+        const progress = `Amazon's suggested bids: ${formatCount(s.suggested || 0)} of ${
+          formatCount(s.askable || 0)} targets it can suggest for`;
+        if (data.error) {
+          stBidsBusy = false;
+          await stFetch();
+          stSetStatus('', `${progress}. Amazon stopped answering: ${data.error}`);
+          return;
+        }
+        if (!data.remaining || !data.asked) {
+          stBidsBusy = false;
+          await stFetch(`${progress}.${data.remaining
+            ? ` ${formatCount(data.remaining)} ad groups are still to ask — use the button on the Targets tab.` : ''}`);
+          return;
+        }
+        stSetStatus(`${progress} · ${formatCount(data.remaining)} ad groups to go…`);
+      }
+    }
+
+    function stSetBidsBusy(busy) {
+      const btn = document.getElementById('st-bids-btn');
+      if (!btn) return;
+      btn.disabled = busy;
+      btn.innerHTML = busy ? 'Pulling bids<span class="loading"></span>' : 'Pull bids';
+    }
+
     // How Amazon says a row matched. When that differs from what the campaign's
     // name says it is for — a broad keyword inside an "(Exact)" campaign — both
     // are shown, because both are facts and the label alone would hide one.
@@ -354,10 +453,12 @@
         pull.collectedAt ? _svTimeAgo(pull.collectedAt) : 'just now'}`);
       const body = data.view === 'products' ? stProductTable(data)
                  : data.view === 'product-terms' ? stProductTermTable(data)
+                 : data.view === 'targets' ? stTargetTable(data)
                  : stTable(data);
       container.innerHTML =
         stControls(data) + body + stStats(data) + stFooter(data);
       stPullControl(data);
+      stSetBidsBusy(stBidsBusy);
       stBindActions();
     }
 
@@ -371,7 +472,7 @@
         ? [...new Set((data.products || []).map(r => r.brand || '—'))].sort() : [];
       return `
         <div class="tabs">
-          ${tab('products', 'Products')}${tab('terms', 'Terms')}${tab('rows', 'Daily rows')}
+          ${tab('products', 'Products')}${tab('targets', 'Targets')}${tab('terms', 'Shared terms')}${tab('rows', 'Daily rows')}
         </div>
         ${stPortfolio && data.view === 'product-terms' ? `
         <div class="st-crumb">
@@ -406,6 +507,7 @@
               <option value="none"${stProdOrders === 'none' ? ' selected' : ''}>none yet</option>
             </select>
           </label>` : ''}
+          ${data.view === 'targets' ? stTargetFilters(data) : ''}
           ${filtering ? `
           <label class="wk-field">
             <span>Search term contains</span>
@@ -730,6 +832,193 @@
         </div>`;
     }
 
+    // ── TARGETS ──────────────────────────────────────────────────────────────
+    // One row per keyword or target: its bid, Amazon's suggested range, and
+    // what it did in the stored month. A bid belongs to a target, not to a
+    // search term — one target matches many terms and one term is matched by
+    // many targets — so this is the table bids live in.
+    //
+    // Two times on one row: the bid and the range are as of the last Pull
+    // bids, the figures are the month on screen. The heading says both.
+    const ST_TARGET_COLS = [
+      { key: 'target', label: 'Target', sortable: true, text: true },
+      { key: 'match', label: 'Match type', sortable: true, text: true },
+      { key: 'state', label: 'Status', sortable: true, text: true },
+      { key: 'bid', label: 'Bid', sortable: true, right: true },
+      { key: 'low', label: 'Low', sortable: true, right: true },
+      { key: 'mid', label: 'Suggested', sortable: true, right: true },
+      { key: 'high', label: 'High', sortable: true, right: true },
+      { key: 'clicks', label: 'Clicks', sortable: true, right: true },
+      { key: 'cost', label: 'Spend', sortable: true, right: true },
+      { key: 'cpc', label: 'CPC', sortable: true, right: true },
+      { key: 'orders', label: 'Orders', sortable: true, right: true },
+      { key: 'sales', label: 'Sales', sortable: true, right: true },
+      { key: 'roas', label: 'ROAS', sortable: true, right: true },
+      // Reference rather than data, so it sits after the numbers. Campaign
+      // names here are the product's short name and the campaign's type —
+      // "SOK World Peters (Broad)" — so the product's full name is on hover
+      // rather than in a column of its own that would push the row past the
+      // page. The Product filter above narrows by it.
+      { key: 'campaign', label: 'Campaign', sortable: true, text: true }
+    ];
+
+    const ST_POSITION_LABELS = {
+      below: 'below Amazon\'s range', within: 'within Amazon\'s range',
+      above: 'above Amazon\'s range', none: 'no suggestion'
+    };
+
+    function stTargetFilters(data) {
+      const positions = data.positions || {};
+      const opt = (value, label, current) =>
+        `<option value="${escapeHtml(value)}"${current === value ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+      return `
+        <label class="wk-field">
+          <span>Target contains</span>
+          <input type="search" data-st-tq value="${escapeHtml(stTgQuery)}" placeholder="any">
+        </label>
+        <label class="wk-field">
+          <span>Product</span>
+          <select data-st-tg="product">
+            ${opt('', 'All products', stTgProduct)}
+            ${(data.filterProducts || []).map(p => opt(p.id, p.name || p.id, stTgProduct)).join('')}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Match type</span>
+          <select data-st-tg="match">
+            ${opt('', 'any', stTgMatch)}
+            ${(data.filterMatches || []).map(m => opt(m, m, stTgMatch)).join('')}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Status</span>
+          <select data-st-tg="state">
+            ${opt('', 'any', stTgState)}${opt('ENABLED', 'enabled', stTgState)}${opt('PAUSED', 'paused', stTgState)}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Bid against Amazon's range</span>
+          <select data-st-tg="position">
+            ${opt('', 'any', stTgPosition)}
+            ${['below', 'within', 'above', 'none'].map(k => {
+              const p = positions[k];
+              const count = p ? ` (${formatCount(p.targets)} · ${stMoney(p.cost)} spend)` : ' (0)';
+              return opt(k, ST_POSITION_LABELS[k] + count, stTgPosition);
+            }).join('')}
+          </select>
+        </label>`;
+    }
+
+    function stTargetTable(data) {
+      const bids = data.bids;
+      if (!bids) {
+        return `<div class="arf-section"><p class="arf-none">No bids pulled yet. Press
+          <strong>Pull bids</strong> at the top of the page to fetch every keyword and target
+          with its bid, and Amazon's suggested range for each.</p></div>`;
+      }
+      const rows = data.rows || [];
+      const head = ST_TARGET_COLS.map(c => {
+        const names = [c.right && 'arf-r', c.cls].filter(Boolean).join(' ');
+        const cls = names ? ` class="${names}"` : '';
+        if (!c.sortable) return `<th${cls}>${c.label}</th>`;
+        const active = stSort === c.key;
+        return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
+          c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
+      }).join('');
+      return `
+        <div class="arf-section">
+          <h4>Targets · every keyword and target</h4>
+          <p class="arf-blurb">
+            Each keyword and target with the bid it carries, Amazon's suggested range for it, and
+            what it did in ${escapeHtml(stMonthLabel(data.month))}. The bid and the range are as of the
+            last pull, ${escapeHtml(_svTimeAgo(bids.pulledAt))}; the clicks and spend are the month's.
+            Low, Suggested and High are Amazon's. "default" marks a target bidding its ad group's
+            default rather than a bid of its own.
+          </p>
+          ${stSuggestLine(bids)}
+          ${rows.length ? `
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table st-targets">
+              <thead><tr>${head}</tr></thead>
+              <tbody>${rows.map(stTargetRow).join('')}</tbody>
+            </table>
+          </div>
+          ${stPager(data)}` : '<p class="arf-none">No targets match these filters.</p>'}
+        </div>`;
+    }
+
+    // How far Amazon's suggestions have got. They come an ad group at a time,
+    // so a round can stop part way — a closed tab, a refusal — and pick up here.
+    function stSuggestLine(bids) {
+      const counts = `${formatCount(bids.targets)} targets (${formatCount(bids.enabled)} enabled, ${
+        formatCount(bids.paused)} paused) · ${formatCount(bids.ownBid)} with a bid of their own · ` +
+        `Amazon's range for ${formatCount(bids.suggested)}`;
+      const left = bids.groupsLeft || 0;
+      return `<p class="arf-muted st-shown">${counts}${left ? ` · ${formatCount(left)} ad groups still to ask
+        <button class="arf-btn" data-st-suggest${stBidsBusy ? ' disabled' : ''}>${
+          stBidsBusy ? 'Asking…' : 'Ask Amazon for the rest'}</button>` : ''}</p>`;
+    }
+
+    function stTargetRow(r) {
+      const paused = r.state === 'PAUSED';
+      const campaignOff = r.campaignState && r.campaignState !== 'ENABLED';
+      const note = r.note ? ` title="${escapeHtml(r.note)}"` : '';
+      return `<tr>
+        <td class="arf-name">${stCut(stTargetLabel(r), stTargetTitle(r), 'st-cut-target')}</td>
+        <td>${escapeHtml(r.matchLabel || '—')}</td>
+        <td>${paused ? 'Paused' : r.state === 'ENABLED' ? 'Enabled' : escapeHtml(r.state || '—')}${
+          campaignOff ? ` <span class="arf-muted">campaign ${escapeHtml(String(r.campaignState).toLowerCase())}</span>` : ''}</td>
+        <td class="arf-r arf-em">${stBidCell(r)}</td>
+        <td class="arf-r"${note}>${stMoneyOrDash(r.low)}</td>
+        <td class="arf-r"${note}>${stMoneyOrDash(r.mid)}</td>
+        <td class="arf-r"${note}>${stMoneyOrDash(r.high)}</td>
+        <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
+        <td class="arf-r">${stMoney(r.cost || 0)}</td>
+        <td class="arf-r">${r.clicks > 0 ? stMoney(r.cost / r.clicks) : '—'}</td>
+        <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
+        <td class="arf-r">${stMoney(r.sales || 0)}</td>
+        <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
+        <td>${stCut(escapeHtml(r.campaign || '—'),
+                    [r.campaign, r.portfolio].filter(Boolean).join(' · '))}</td>
+      </tr>`;
+    }
+
+    // One line per row, always: a long keyword, campaign or product name is
+    // cut short with an ellipsis and given in full on hover, rather than
+    // wrapping the row onto two lines.
+    function stCut(html, full, cls) {
+      return `<span class="st-cut${cls ? ' ' + cls : ''}"${
+        full ? ` title="${escapeHtml(full)}"` : ''}>${html}</span>`;
+    }
+
+    function stTargetTitle(r) {
+      const m = String(r.text || '').match(/^asin="([^"]+)"$/i);
+      const name = m ? stAsinName(m[1]) : null;
+      return name ? `${m[1].toUpperCase()} — ${name}` : (r.text || '');
+    }
+
+    // The bid doing the work: the target's own, or its ad group's default,
+    // said as such. Where it sits against the range is left to the columns
+    // beside it and the filter above.
+    function stBidCell(r) {
+      if (r.liveBid === null || r.liveBid === undefined) return '—';
+      const which = r.bid === null || r.bid === undefined
+        ? ' <span class="arf-muted">default</span>' : '';
+      return `${stMoney(r.liveBid)}${which}`;
+    }
+
+    // A keyword as typed; an Auto group or keyword group as the search term
+    // report writes it; an ASIN with the product it is, linked.
+    function stTargetLabel(r) {
+      const m = String(r.text || '').match(/^asin="([^"]+)"$/i);
+      if (m) return `${escapeHtml(m[1].toUpperCase())} ${stProductCell(m[1], true)}`;
+      return escapeHtml(r.text || '—');
+    }
+
+    function stMoneyOrDash(n) {
+      return typeof n === 'number' && isFinite(n) ? stMoney(n) : '—';
+    }
+
     const ST_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
       { key: 'matched', label: 'Matched by' },
@@ -772,11 +1061,12 @@
       }).join('');
       return `
         <div class="arf-section">
-          <h4>Terms · all products</h4>
+          <h4>Shared terms · bid on by two or more products</h4>
           <p class="arf-blurb">
-            One row per search term for the month, across the whole account, however many
-            campaigns matched it. Open a term to see each campaign and target that matched it
-            separately. "N products" is how many of your products bid on the same search.
+            The searches more than one of your products paid for this month, one row per term
+            across the whole account. "N products" is how many. Open a term to see each product,
+            campaign and target that matched it. A term only one product pays for is in that
+            product, on the Products tab.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table">
@@ -995,6 +1285,7 @@
           return stFetch();
         }
         if (e.target.closest('[data-st-name]')) return stNameAsins();
+        if (e.target.closest('[data-st-suggest]')) return stSuggestBids();
         const expand = e.target.closest('[data-st-expand]');
         if (expand) return stExpand(expand.dataset.stExpand);
         const psort = e.target.closest('[data-st-psort]');
@@ -1008,8 +1299,9 @@
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;
+          const textCol = stView === 'targets' && (ST_TARGET_COLS.find(c => c.key === key) || {}).text;
           if (stSort === key) stDir = stDir === 'asc' ? 'desc' : 'asc';
-          else { stSort = key; stDir = 'desc'; }
+          else { stSort = key; stDir = textCol ? 'asc' : 'desc'; }
           stOffset = 0;
           return stFetch();
         }
@@ -1030,6 +1322,17 @@
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
         if (dead) { stOnlyDead = dead.value === '1'; stOffset = 0; return stFetch(); }
+        const tg = e.target.closest('[data-st-tg]');
+        if (tg) {
+          const v = tg.value;
+          const which = tg.dataset.stTg;
+          if (which === 'product') stTgProduct = v;
+          if (which === 'match') stTgMatch = v;
+          if (which === 'state') stTgState = v;
+          if (which === 'position') stTgPosition = v;
+          stOffset = 0;
+          return stFetch();
+        }
         const pbrand = e.target.closest('[data-st-pbrand]');
         if (pbrand) { stProdBrand = pbrand.value; return stRedrawProducts(); }
         const porders = e.target.closest('[data-st-porders]');
@@ -1048,6 +1351,8 @@
       el.addEventListener('keydown', e => {
         const q = e.target.closest('[data-st-q]');
         if (q && e.key === 'Enter') { stQuery = q.value.trim(); stOffset = 0; stFetch(); }
+        const tq = e.target.closest('[data-st-tq]');
+        if (tq && e.key === 'Enter') { stTgQuery = tq.value.trim(); stOffset = 0; stFetch(); }
       });
 
       stBound = true;

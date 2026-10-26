@@ -2335,6 +2335,27 @@
       text-overflow: ellipsis;
     }
 
+    /* Targets: one line per row. Fifteen columns do not leave room for any of
+       them to wrap, so nothing does, and the three that run long — the
+       keyword, the campaign, the product — are cut short at a set width with
+       the full text on hover. */
+    .arf-table.st-targets th,
+    .arf-table.st-targets td {
+      white-space: nowrap;
+      padding-left: 0.45rem;
+      padding-right: 0.45rem;
+    }
+
+    .st-cut {
+      display: block;
+      max-width: 12rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .st-cut.st-cut-target { max-width: 16rem; }
+
     .st-asin-link,
     .st-asin-inline {
       color: var(--text-secondary);
