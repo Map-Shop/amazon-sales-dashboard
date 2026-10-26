@@ -539,7 +539,8 @@
         ${stPortfolio && data.view === 'product-terms' ? `
         <div class="st-crumb">
           <button class="arf-btn" data-st-clear-portfolio>&larr; All products</button>
-          <strong>${escapeHtml(stPortfolio.name)}</strong>
+          <strong title="${escapeHtml(stPortfolio.name)}">${
+            escapeHtml(stProductLabel(stPortfolio.id, stPortfolio.name))}</strong>
         </div>` : ''}
         <div class="card card-flat wk-controls">
           ${data.view === 'negatives' ? '' : `<label class="wk-field">
@@ -638,7 +639,7 @@
       }).join('');
       return `
         <div class="arf-section">
-          <h4>${escapeHtml(stPortfolio ? stPortfolio.name : 'Product')}${
+          <h4>${escapeHtml(stPortfolio ? stProductLabel(stPortfolio.id, stPortfolio.name) : 'Product')}${
             stMatch ? ` · ${escapeHtml(stMatch)} only` : ''}</h4>
           <p class="arf-blurb">
             What each search term did <strong>for this product</strong>, one row per way the
@@ -744,7 +745,8 @@
       </tr>`;
       return line('All products &middot; the whole search term', total, 'st-total') +
         (others.length
-          ? others.map(p => line(`&#8627; ${escapeHtml(p.portfolio || '—')}`, p, '', p.portfolio)).join('')
+          ? others.map(p => line(`&#8627; ${escapeHtml(stProductLabel(p.portfolioId, p.portfolio))}`,
+                                 p, '', p.portfolio)).join('')
           : stSubNote(cols, '<span class="arf-muted">No other product bids on this search.</span>'));
     }
 
@@ -770,7 +772,7 @@
     // first. A ratio that cannot be worked out — no spend, no sales — always
     // sorts last, whichever way the column is turned.
     const ST_PRODUCT_COLS = [
-      { key: 'name', label: 'Product', text: true, of: r => r.portfolio || '' },
+      { key: 'name', label: 'Product', text: true, of: r => stProductLabel(r.portfolioId, r.portfolio) },
       { key: 'brand', label: 'Brand', text: true, of: r => r.brand || '' },
       { key: 'terms', label: 'Terms', of: r => r.terms },
       { key: 'clicks', label: 'Clicks', of: r => r.clicks },
@@ -787,7 +789,10 @@
       const col = ST_PRODUCT_COLS.find(c => c.key === stProdSort) || ST_PRODUCT_COLS[0];
       const dir = stProdDir === 'asc' ? 1 : -1;
       return rows
-        .filter(r => !q || String(r.portfolio || '').toLowerCase().includes(q))
+        // The full name as well as the short one, so a line's name finds
+        // every product in it: "raised relief" lists the raised reliefs.
+        .filter(r => !q || `${r.portfolio || ''} ${stProductLabel(r.portfolioId, r.portfolio)}`
+          .toLowerCase().includes(q))
         .filter(r => stProdBrand === 'all' || (r.brand || '—') === stProdBrand)
         .filter(r => stProdOrders === 'any' || !(r.orders > 0))
         .slice()
@@ -798,7 +803,8 @@
           const cmp = col.text
             ? String(x).localeCompare(String(y), 'en', { sensitivity: 'base', numeric: true })
             : x - y;
-          return cmp * dir || String(a.portfolio || '').localeCompare(String(b.portfolio || ''));
+          return cmp * dir || stProductLabel(a.portfolioId, a.portfolio)
+            .localeCompare(stProductLabel(b.portfolioId, b.portfolio));
         });
     }
 
@@ -847,10 +853,11 @@
     function stProductRow(r) {
       const id = r.portfolioId ? escapeHtml(r.portfolioId) : '';
       const name = escapeHtml(r.portfolio || '(no portfolio)');
+      const shown = escapeHtml(stProductLabel(r.portfolioId, r.portfolio || '(no portfolio)'));
       return `<tr>
         <td class="arf-name">${id
-          ? `<button class="arf-btn" data-st-product="${id}" data-st-product-name="${name}">${name}</button>`
-          : name}</td>
+          ? `<button class="arf-btn" data-st-product="${id}" data-st-product-name="${name}" title="${name}">${shown}</button>`
+          : `<span title="${name}">${shown}</span>`}</td>
         <td>${escapeHtml(r.brand || '—')}</td>
         <td class="arf-r">${formatCount(r.terms || 0)}</td>
         <td class="arf-r">${formatCount(r.clicks || 0)}</td>
@@ -981,7 +988,7 @@
           <span>Target contains</span>
           <input type="search" data-st-tq value="${escapeHtml(stTgQuery)}" placeholder="any">
         </label>
-        <div class="wk-field">
+        <div class="wk-field st-pick-field">
           <span>Product</span>
           ${stProductPicker('tg', data.filterProducts || [], stTgProduct)}
         </div>
@@ -1160,7 +1167,7 @@
           <span>Negative contains</span>
           <input type="search" data-st-nq value="${escapeHtml(stNgQuery)}" placeholder="any">
         </label>
-        <div class="wk-field">
+        <div class="wk-field st-pick-field">
           <span>Product</span>
           ${stProductPicker('ng', data.filterProducts || [], stNgProduct)}
         </div>
@@ -1363,7 +1370,8 @@
       const rows = stDetail.rows || [];
       if (!rows.length) return stSubNote(cols, '<span class="arf-muted">Nothing matched.</span>');
       return rows.map(d => `<tr class="st-sub">
-        <td class="st-sub-label">&#8627; ${escapeHtml(d.portfolio || '—')}
+        <td class="st-sub-label" title="${escapeHtml(d.portfolio || '')}">&#8627; ${
+          escapeHtml(stProductLabel(d.portfolioId, d.portfolio))}
           <span class="st-sub-line">${escapeHtml(d.campaign || '—')}</span></td>
         <td>${stMatchCell(d.matchLabel, d.campaignType)}
           <span class="st-sub-line">${stMatchedLabel(d.matched)}</span></td>

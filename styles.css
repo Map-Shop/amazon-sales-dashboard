@@ -2400,10 +2400,16 @@
        or on a tap, where there is no hover (.open). */
     .st-pick { position: relative; }
 
+    /* The other filters are <label>s, which carry the page's label margin;
+       the picker's field is a <div>, since a label would hand every click
+       inside the menu to its button. Same margin, so they line up. */
+    .wk-field.st-pick-field { margin-bottom: 0.5rem; }
+
     .st-pick-btn {
       display: flex;
       align-items: center;
       gap: 0.5rem;
+      min-height: 2.75rem;   /* the height of the selects beside it */
       max-width: 16rem;
       padding: 0.75rem 1rem;
       background: var(--bg-secondary);
