@@ -32,6 +32,21 @@
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
     let stDetail = null;       // { term, rows, loading, error } for the open term
+
+    // Every click fires a request and they can come back out of order; the
+    // slowest query is the one inside a product. Each request takes a number,
+    // and only the latest may draw — otherwise a slow answer to an earlier
+    // click paints the wrong table under whatever tab is open now.
+    let stFetchSeq = 0;
+    let stDetailSeq = 0;
+
+    // Each table starts from its own default order. A sort key carried in from
+    // another tab may not exist here, and would quietly fall back to spend —
+    // possibly ascending, with no arrow showing it.
+    function stResetSort() {
+      stSort = 'cost';
+      stDir = 'desc';
+    }
     let stNames = {};          // ASIN -> { title, brand, found } for what is on screen
     let stNaming = false;
 
@@ -60,6 +75,7 @@
     }
 
     async function stFetch(after) {
+      const seq = ++stFetchSeq;
       try {
         const qs = new URLSearchParams({
           view: stWhich(), sort: stSort, dir: stDir,
@@ -74,6 +90,7 @@
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
+        if (seq !== stFetchSeq) return;   // a later click has already asked again
         if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
         stData = data;
         stNames = data.names || {};
@@ -87,6 +104,7 @@
         }
         if (after) stSetStatus(after);
       } catch (err) {
+        if (seq !== stFetchSeq) return;
         console.error('[ST] load failed:', err);
         stSetStatus('', err.message);
       }
@@ -268,6 +286,16 @@
       }
     }
 
+    // How Amazon says a row matched. When that differs from what the campaign's
+    // name says it is for — a broad keyword inside an "(Exact)" campaign — both
+    // are shown, because both are facts and the label alone would hide one.
+    function stMatchCell(matchLabel, campaignType) {
+      const label = escapeHtml(matchLabel || '—');
+      return campaignType && matchLabel && campaignType !== matchLabel
+        ? `${label} <span class="arf-muted">in ${escapeHtml(campaignType)} campaign</span>`
+        : label;
+    }
+
     // ── RENDER ───────────────────────────────────────────────────────────────
 
     function stRenderIdle(data) {
@@ -364,7 +392,7 @@
       }
       const cols = [
         { key: 'searchTerm', label: 'Search term', sortable: true },
-        { key: 'type', label: 'Stage' },
+        { key: 'type', label: 'Match type' },
         { key: 'matched', label: 'Matched by' },
         { key: 'clicks', label: 'Clicks', sortable: true, right: true },
         { key: 'cost', label: 'Spend', sortable: true, right: true },
@@ -411,7 +439,7 @@
         <td class="arf-name">${first ? `
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${spread}` : ''}</td>
-        <td>${escapeHtml(r.campaignType || '—')}</td>
+        <td>${stMatchCell(r.matchLabel, r.campaignType)}</td>
         <td>${stMatchedLabel(r.matched)}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
@@ -613,7 +641,7 @@
 
     const ST_TERM_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
-      { key: 'types', label: 'Matched in' },
+      { key: 'types', label: 'Match types' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
@@ -668,7 +696,7 @@
           <button class="arf-btn st-expand" data-st-expand="${term}">${open ? '▾' : '▸'} ${
             stTermLabel(r.searchTerm)}</button>${
           r.targetedExact ? ' <span class="bw-tag bw-adjusted" title="already targeted as its own exact keyword">exact</span>' : ''}${spread}</td>
-        <td>${escapeHtml(r.types || '—')}</td>
+        <td>${escapeHtml((r.matchTypes || []).join(', ') || '—')}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
@@ -698,7 +726,7 @@
       return `<tr class="st-detail"><td colspan="${cols}">
         <table class="table-fill arf-table st-detail-table">
           <thead><tr>
-            <th>Product</th><th>Campaign</th><th>Type</th><th>Matched by</th>
+            <th>Product</th><th>Campaign</th><th>Match type</th><th>Matched by</th>
             <th class="arf-r">Clicks</th><th class="arf-r">Spend</th>
             <th class="arf-r">Orders</th><th class="arf-r">Sales</th>
           </tr></thead>
@@ -708,7 +736,7 @@
               <td class="arf-name">${escapeHtml(d.portfolio || '—')}${
                 elsewhere ? ' <span class="arf-muted">· another product</span>' : ''}</td>
               <td>${escapeHtml(d.campaign || '—')}</td>
-              <td>${escapeHtml(d.campaignType || '—')}</td>
+              <td>${stMatchCell(d.matchLabel, d.campaignType)}</td>
               <td>${stMatchedLabel(d.matched)}</td>
               <td class="arf-r">${formatCount(d.clicks || 0)}</td>
               <td class="arf-r">${stMoney(d.cost)}</td>
@@ -727,9 +755,11 @@
       // open term would be left stuck on its spinner.
       if (!stData) return;
       if (stDetail && stDetail.term === term) {
+        stDetailSeq++;
         stDetail = null;
         return stRender(stData);
       }
+      const seq = ++stDetailSeq;
       stDetail = { term, loading: true };
       stRender(stData);
       try {
@@ -743,11 +773,14 @@
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
+        // Another term was opened, or this one closed, while it loaded.
+        if (seq !== stDetailSeq || !stDetail || stDetail.term !== term) return;
         if (!res.ok) throw new Error(data.error || `Load failed (${res.status})`);
         stDetail = { term, rows: data.detail || [],
                      total: data.total || null, products: data.products || null };
         stNames = { ...stNames, ...(data.names || {}) };
       } catch (err) {
+        if (seq !== stDetailSeq || !stDetail || stDetail.term !== term) return;
         console.error('[ST] term detail failed:', err);
         stDetail = { term, rows: [], error: err.message };
       }
@@ -842,6 +875,7 @@
           stView = view.dataset.stView;
           stOffset = 0;
           stDetail = null;
+          stResetSort();
           // A drill-down belongs to the Products tab. Carrying it into Terms
           // labelled account-wide numbers with one product's name.
           stPortfolio = null;
@@ -856,12 +890,14 @@
           stView = 'products';
           stDetail = null;
           stOffset = 0;
+          stResetSort();
           return stFetch();
         }
         if (e.target.closest('[data-st-clear-portfolio]')) {
           stPortfolio = null;
           stDetail = null;
           stOffset = 0;
+          stResetSort();
           return stFetch();
         }
         if (e.target.closest('[data-st-name]')) return stNameAsins();

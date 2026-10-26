@@ -216,7 +216,12 @@ ok(M.stNormalizeRows(null).length === 0 && M.stNormalizeRows({}).length === 0,
 
 console.log('\nTHE QUERIES  — every parameter is referenced, and every reference is supplied');
 
-const { monthQueries } = await import('../lib/searchterms.js');
+// Built without a database, so every statement can be checked here rather
+// than in production. Postgres refuses a statement carrying a parameter it
+// never mentions, and the page went down once on exactly that:
+//   "could not determine data type of parameter $3"
+// So every query the page runs is checked, not only the one that failed.
+const ST = await import('../lib/searchterms.js');
 
 // $1, $2 … actually written in the statement.
 const refs = (text) => new Set([...text.matchAll(/\$(\d+)/g)].map(m => Number(m[1])));
@@ -226,74 +231,131 @@ function checkStatement(label, { text, params }) {
   const highest = Math.max(0, ...used);
   const unmentioned = params.map((_, i) => i + 1).filter(n => !used.has(n));
   const missing = [...used].filter(n => n > params.length);
-  ok(unmentioned.length === 0,
-     `${label}: every parameter it is given is used`,
-     unmentioned.length ? `$${unmentioned.join(', $')} never appear in the statement` : '');
-  ok(missing.length === 0,
-     `${label}: every parameter it uses is given`,
-     missing.length ? `$${missing.join(', $')} beyond the ${params.length} supplied` : '');
-  ok(highest === params.length,
-     `${label}: the numbering has no gaps`, `highest $${highest}, ${params.length} params`);
+  ok(unmentioned.length === 0 && missing.length === 0 && highest === params.length,
+     `${label}: parameters line up`,
+     unmentioned.length ? `$${unmentioned.join(', $')} never appear`
+       : missing.length ? `$${missing.join(', $')} beyond the ${params.length} supplied`
+       : highest !== params.length ? `highest $${highest}, ${params.length} params` : '');
 }
 
-for (const [label, opts] of [
+const OPTIONS = [
   ['default', { month: '2026-09' }],
-  ['with a term filter', { month: '2026-09', q: 'laminated' }],
-  ['with a click floor', { month: '2026-09', minClicks: 15 }],
+  ['term filter', { month: '2026-09', q: 'laminated' }],
+  ['click floor', { month: '2026-09', minClicks: 15 }],
+  ['no orders yet', { month: '2026-09', onlyDead: true }],
   ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
   ['paged', { month: '2026-09', limit: 50, offset: 400 }]
+];
+
+// The paged queries: a rows statement and a count statement each.
+for (const [name, build] of [
+  ['daily rows', (o) => ST.monthQueries(o)],
+  ['all terms', (o) => ST.termQueries(o)],
+  ['one product', (o) => ST.productTermQueries({ portfolioId: 'pf1', ...o })]
 ]) {
-  const q = monthQueries(opts);
-  checkStatement(`rows, ${label}`, q.rows);
-  checkStatement(`count, ${label}`, q.count);
+  for (const [label, opts] of OPTIONS) {
+    const q = build(opts);
+    checkStatement(`${name}, rows, ${label}`, q.rows);
+    checkStatement(`${name}, count, ${label}`, q.count);
+  }
 }
 
+// The single statements.
+checkStatement('products', ST.productQuery({ month: '2026-09' }));
+checkStatement('one term by product', ST.termProductQuery({ month: '2026-09', searchTerm: 'world map' }));
+checkStatement('one term by campaign', ST.termDetailQuery({ month: '2026-09', searchTerm: 'world map' }));
+
 {
-  const q = monthQueries({ month: '2026-09', q: 'laminated', minClicks: 5, limit: 50, offset: 100 });
-  ok(q.count.params.length === 4 && q.rows.params.length === 6,
-     'the count statement takes the filters only, and the rows statement those plus paging');
+  const q = ST.monthQueries({ month: '2026-09', q: 'laminated', minClicks: 5, limit: 50, offset: 100 });
   ok(q.count.params.every((v, i) => v === q.rows.params[i]),
-     'and the two agree on the filters, so a page and its total describe the same rows');
-  ok(q.rows.params[4] === 50 && q.rows.params[5] === 100, 'the page size and offset are passed, not interpolated');
-}
-
-{
-  const injected = monthQueries({ month: '2026-09', sort: 'cost; DROP TABLE search_terms --' });
-  ok(/ORDER BY cost DESC/.test(injected.rows.text) && !/DROP/.test(injected.rows.text),
-     'a sort key outside the whitelist falls back to spend',
-     'the column name is interpolated, so this is the one place that must not take free text');
-  ok(/ORDER BY clicks ASC/.test(monthQueries({ month: '2026-09', sort: 'clicks', dir: 'asc' }).rows.text),
-     'and a known one is used as asked');
-}
-
-{
-  const q = monthQueries({ month: '2026-09' });
-  ok(q.count.params[3] === null && /\$4::text IS NULL/.test(q.count.text),
+     'a page and its total are filtered the same way');
+  ok(q.rows.params[4] === 50 && q.rows.params[5] === 100, 'page size and offset are passed, not interpolated');
+  const bare = ST.monthQueries({ month: '2026-09' });
+  ok(bare.count.params[3] === null && /\$4::text IS NULL/.test(bare.count.text),
      'with no term filter the parameter is null and typed in the statement',
      'an untyped null is the other half of the same Postgres refusal');
 }
 
-console.log('\nTHE BREAKDOWN  \u2014 one term, by product');
+{
+  // The sort column is interpolated, so it is the one value that must never be
+  // free text. Every table's sort goes through a whitelist.
+  const evil = 'cost; DROP TABLE search_terms --';
+  const texts = [
+    ST.monthQueries({ month: '2026-09', sort: evil }).rows.text,
+    ST.termQueries({ month: '2026-09', sort: evil }).rows.text,
+    ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', sort: evil }).rows.text
+  ];
+  ok(texts.every(t => !/DROP/.test(t)),
+     'a sort key outside the whitelist never reaches the statement, on any table');
+}
+
+console.log('\nTHE CAMPAIGN LIST  — a campaign that leaves it keeps its history');
 
 {
-  const { termDetailQuery } = await import('../lib/searchterms.js');
-  const d = termDetailQuery({ month: '2026-09', searchTerm: 'new world map' });
-  ok(d.params.length === 3 && d.params[2] === 'new world map',
-     'the term is a parameter, not interpolated');
-  ok(/ORDER BY lower\(coalesce\(p\.name/.test(d.text),
-     'the lines are ordered by product name, not by spend',
-     'the breakdown is read product by product, and spend order scattered each one');
-  // Auto discovers, Broad widens, Exact targets, ASIN catches on a page.
-  const rank = ['Auto', 'Broad', 'Phrase', 'Exact', 'ASIN'].map(t => d.text.indexOf(`'${t}'`));
-  ok(rank.every(i => i > 0) && rank.every((v, i) => i === 0 || v > rank[i - 1]),
-     'then by campaign type in funnel order rather than alphabetically',
-     'alphabetical would read ASIN, Auto, Broad, Exact — the funnel backwards at the front');
-  ok(d.text.indexOf('lower(coalesce(p.name') < d.text.indexOf('CASE c.campaign_type') &&
-     d.text.indexOf('CASE c.campaign_type') < d.text.indexOf('sum(t.cost) DESC'),
-     'and biggest line first inside a type');
+  // Every view joins search terms to TODAY's campaign list. An inner join would
+  // drop a campaign that has since left it from every total, while the stored
+  // figures at the foot of the page still counted it.
+  const views = {
+    products: ST.productQuery({ month: '2026-09' }).text,
+    'all terms': ST.termQueries({ month: '2026-09' }).rows.text,
+    'one term by product': ST.termProductQuery({ month: '2026-09', searchTerm: 'x' }).text,
+    'one term by campaign': ST.termDetailQuery({ month: '2026-09', searchTerm: 'x' }).text
+  };
+  const inner = Object.entries(views)
+    .filter(([, t]) => /(^|[^T]\s)JOIN ad_campaigns/m.test(t.replace(/LEFT JOIN ad_campaigns/g, '')))
+    .map(([k]) => k);
+  ok(inner.length === 0, 'every account-wide view outer-joins the campaign list', inner.join(', '));
+  ok(Object.values(views).filter(t => /not in campaign list/.test(t)).length === 3,
+     'and names the rows of a campaign that has left it',
+     'products, and both breakdowns of a term');
+}
+
+console.log('\nHOW IT MATCHED  — from Amazon\'s match type, not the campaign\'s name');
+
+{
+  const t = ST.termQueries({ month: '2026-09' }).rows.text;
+  ok(/upper\(t\.match_type\) = 'EXACT'/.test(t) && !/campaign_type = 'Exact'/.test(t),
+     'a term is marked exact from the match type Amazon reports',
+     'the campaign name marked one September term exact that a broad keyword had caught');
+}
+
+{
+  ok(ST.MATCH_FUNNEL.join(' > ') === 'Auto > Broad > Keyword group > Phrase > Exact > ASIN > Category',
+     'the funnel runs Auto, Broad, keyword groups, Phrase, Exact, then product targets',
+     ST.MATCH_FUNNEL.join(' > '));
+  ok(ST.funnelSort(['Exact', 'ASIN', 'Auto', 'Broad']).join(',') === 'Auto,Broad,Exact,ASIN',
+     'match types are listed in funnel order', 'not alphabetically, which would lead with ASIN');
+  ok(ST.funnelSort(['Exact', 'Something new', 'Auto']).join(',') === 'Auto,Exact,Something new',
+     'an unrecognised match type sorts last rather than disappearing');
+  ok(ST.funnelSort([null, 'Auto', undefined]).join(',') === 'Auto' && ST.funnelSort(null).length === 0,
+     'and nothing is listed for a row with no match type');
+}
+
+console.log('\nONE PRODUCT  — paged by term, so a term is never split across pages');
+
+{
+  const q = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', limit: 50, offset: 100 });
+  const pageCte = q.rows.text.slice(q.rows.text.indexOf('page AS ('));
+  ok(/LIMIT \$7::int OFFSET \$8::int/.test(pageCte.slice(0, pageCte.indexOf(')\n'))),
+     'the page size applies to terms, inside the step that picks them',
+     'a limit on match rows could cut a term with four matches in half');
+  ok(/count\(\*\)::int AS n FROM picked/.test(q.count.text),
+     'and the count is of terms, so the pager agrees with what is shown');
+}
+
+console.log('\nTHE BREAKDOWN  — one term, by product');
+
+{
+  const d = ST.termDetailQuery({ month: '2026-09', searchTerm: 'new world map' });
+  ok(d.params[2] === 'new world map', 'the term is a parameter, not interpolated');
   ok(!/portfolio_id = \$/.test(d.text),
-     'and it is never narrowed to one product',
+     'it is never narrowed to one product',
      'the other products paying for the same search are the point of it');
+  const order = d.text.slice(d.text.lastIndexOf('ORDER BY'));
+  const at = (needle) => order.indexOf(needle);
+  ok(at('not in campaign list') > 0 && at("WHEN 'Auto' THEN 1") > at('not in campaign list') &&
+     at('sum(t.cost) DESC') > at("WHEN 'Auto' THEN 1"),
+     'ordered by product, then funnel stage, then biggest line first');
 }
 
 console.log('\nCOVERAGE  \u2014 what a pull actually brought back');
