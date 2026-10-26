@@ -366,8 +366,12 @@ console.log('\nONE PRODUCT, ONE MATCH TYPE  — what Auto spent, and what has be
 
 {
   const t = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1' }).rows.text;
-  ok(/k\.match_label = 'Exact' AND kc\.portfolio_id = \$3/.test(t),
-     'Exact is an exact keyword of this product\'s own, in any of its campaigns');
+  ok(/k\.match_label IN \('Broad', 'Phrase', 'Exact'\)/.test(t) && /kc\.portfolio_id = \$3/.test(t),
+     'Graduated is a keyword of this product\'s own, broad, phrase or exact, in any of its campaigns',
+     'exact is not the only thing a term graduates into');
+  ok(/DISTINCT ON \(k\.match_label\)/.test(t) && /ORDER BY g\.created_at ASC/.test(t),
+     'one keyword per match type, listed oldest first, each with its own date',
+     'one date for the whole list read as Broad and Exact added the same day');
   ok(/n\.campaign_id = i\.campaign_id/.test(t) && /n\.level = 'campaign' OR n\.ad_group_id = i\.ad_group_id/.test(t),
      'Negated is a negative in the campaign the row matched in, at either level',
      'a negative in the Auto campaign says nothing about the Broad one');
@@ -656,7 +660,8 @@ console.log('\nTHE NEGATIVES TABLE  \u2014 what each one blocks, and what that t
     ['text filter', { q: 'world map' }],
     ['phrase only', { type: 'Phrase' }],
     ['whole campaign only', { level: 'campaign' }],
-    ['every filter', { portfolioId: 'pf1', q: 'map', type: 'Exact', level: 'ad_group' }],
+    ['every filter', { portfolioId: 'pf1', q: 'map', type: 'Exact', level: 'ad_group', campaignType: 'Auto' }],
+    ['by graduated', { sort: 'graduated' }],
     ['by orders before', { sort: 'beforeOrders' }],
     ['by ROAS before', { sort: 'beforeRoas', dir: 'asc' }],
     ['paged', { limit: 50, offset: 400 }]
@@ -669,8 +674,14 @@ console.log('\nTHE NEGATIVES TABLE  \u2014 what each one blocks, and what that t
   checkStatement('negatives, products', TG.negativeQueries().facets);
 
   const q = TG.negativeQueries({ type: 'Phrase', level: 'campaign', limit: 50, offset: 100 });
-  ok(q.summary.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[5] === 50 && q.rows.params[6] === 100,
+  ok(q.summary.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[6] === 50 && q.rows.params[7] === 100,
      'the page and its total are filtered the same way, and the paging is passed, not interpolated');
+  ok(TG.negativeQueries({ campaignType: 'Auto' }).rows.params[5] === 'Auto' &&
+     /campaign_type = \$6/.test(q.rows.text),
+     'the campaign type filters as a parameter');
+  ok(/'type', match_label, 'since', created_at/.test(q.rows.text) &&
+     /k\.match_label IN \('Broad', 'Phrase', 'Exact'\)/.test(q.rows.text),
+     'Graduated lists every keyword match type the product holds for the term, each with its date');
   ok(TG.negativeQueries({ type: 'Broad', level: 'everywhere' }).rows.params.slice(3, 5).every(v => v === null),
      'a type or level outside the known ones is no filter at all');
   ok(!/DROP/.test(TG.negativeQueries({ sort: 'added; DROP TABLE sp_negatives --' }).rows.text),

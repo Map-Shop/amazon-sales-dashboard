@@ -2390,6 +2390,11 @@
 
     .st-cut.st-cut-target { max-width: 16rem; }
 
+    /* Negatives carry two more columns than Targets, so their long ones are
+       cut shorter. The campaign's type has a column of its own there. */
+    .st-cut.st-cut-negative { max-width: 12rem; }
+    .st-cut.st-cut-campaign { max-width: 9rem; }
+
     .st-asin-link,
     .st-asin-inline {
       color: var(--text-secondary);

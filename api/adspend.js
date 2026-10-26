@@ -5816,12 +5816,13 @@ async function handleSearchTermsGet(req, res) {
         q: String(req.query.q || '').trim(),
         type: pick(req.query.type, targets.NEGATIVE_TYPES),
         level: pick(req.query.level, targets.NEGATIVE_LEVELS),
+        campaignType: String(req.query.campaignType || '').trim() || null,
         sort: req.query.sort, dir: req.query.dir,
         limit: req.query.limit, offset: req.query.offset
       });
       return res.status(200).json({
         ...base, view, rows: page.rows, total: page.total, summary: page.summary,
-        filterProducts: page.products,
+        filterProducts: page.products, filterCampaignTypes: searchTerms.funnelSort(page.campaignTypes),
         names: await stNamesFor(page.rows.map(r => r.text))
       });
     }

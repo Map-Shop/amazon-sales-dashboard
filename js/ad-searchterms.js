@@ -62,6 +62,7 @@
     let stNgQuery = '';
     let stNgType = '';
     let stNgLevel = '';
+    let stNgCampaignType = '';
 
     // Every click fires a request and they can come back out of order; the
     // slowest query is the one inside a product. Each request takes a number,
@@ -125,6 +126,7 @@
           if (stNgProduct) qs.set('portfolio', stNgProduct);
           if (stNgType) qs.set('type', stNgType);
           if (stNgLevel) qs.set('level', stNgLevel);
+          if (stNgCampaignType) qs.set('campaignType', stNgCampaignType);
         } else {
           if (stQuery) qs.set('q', stQuery);
           if (stPortfolio) qs.set('portfolio', stPortfolio.id);
@@ -609,7 +611,8 @@
       { key: 'searchTerm', label: 'Search term', sortable: true },
       { key: 'type', label: 'Match type' },
       { key: 'matched', label: 'Matched by' },
-      { key: 'status', label: 'Status' },
+      { key: 'graduated', label: 'Graduated' },
+      { key: 'negated', label: 'Negated' },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
@@ -644,10 +647,10 @@
             term costs across the account and which other products are paying for the same search.
           </p>
           <p class="arf-blurb">
-            Status is what has already been done about a term, as of the morning's pull.
-            <strong>Exact</strong>: this product targets the term as an exact keyword of its own,
-            since that date. <strong>Negated</strong>: the campaign the row matched in blocks the
-            term, since that date. Blank is neither.
+            What has already been done about a term, as of the morning's pull.
+            <strong>Graduated</strong>: this product targets the term as a keyword of its own —
+            each match type with the day it was added. <strong>Negated</strong>: the campaign the
+            row matched in blocks the term, since that day.
           </p>
           <div class="arf-table-wrap">
             <table class="table-fill arf-table st-oneline">
@@ -673,7 +676,8 @@
             stTermLabel(r.searchTerm)}</button>${spread}` : ''}</td>
         <td>${stMatchCell(r.matchLabel, r.campaignType)}</td>
         <td>${stCut(stMatchedLabel(r.matched), r.matched, 'st-cut-matched')}</td>
-        <td class="st-status">${stStatusCell(r, first)}</td>
+        <td>${first ? stGraduatedList(r.graduated) : ''}</td>
+        <td>${stNegatedCell(r.negated)}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
@@ -683,24 +687,27 @@
       </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
     }
 
-    // What has already been done about a term, from the morning's snapshot of
-    // the keywords and negatives. Exact belongs to the term, so it sits on the
-    // term's first row; Negated belongs to the row, since each row matched in
-    // its own campaign and a campaign blocks a term for itself alone.
-    function stStatusCell(r, first) {
+    // Each keyword the product holds for a term, oldest first, each with its
+    // own date: "Broad Jun 2, Exact Sep 13" — a term moves down the funnel
+    // over months, never all at once.
+    function stGraduatedList(list) {
+      if (!Array.isArray(list) || !list.length) return '';
+      return list.map(g => `${escapeHtml(g.type || '')}${
+        g.since ? ` <span class="arf-muted">${stDateLabel(g.since)}</span>` : ''}${
+        g.state === 'PAUSED' ? ' <span class="arf-muted">paused</span>' : ''}`).join(', ');
+    }
+
+    // When the campaign this row matched in started blocking the term, and
+    // how, when it is not the plain way: a phrase inside the term, or a block
+    // on the whole campaign rather than its ad group. It belongs to the row,
+    // since a campaign blocks a term for itself alone; Graduated belongs to
+    // the term, so it sits on the term's first row only.
+    function stNegatedCell(n) {
+      if (!n) return '';
       const muted = (t) => ` <span class="arf-muted">${t}</span>`;
-      const parts = [];
-      if (first && r.exact) {
-        parts.push(`Exact${r.exact.since ? muted(stDateLabel(r.exact.since)) : ''}${
-          r.exact.state === 'PAUSED' ? muted('paused') : ''}`);
-      }
-      if (r.negated) {
-        const phrase = /PHRASE/i.test(r.negated.by || '')
-          ? muted(`phrase "${escapeHtml(r.negated.text || '')}"`) : '';
-        const whole = r.negated.level === 'campaign' ? muted('whole campaign') : '';
-        parts.push(`Negated${r.negated.since ? muted(stDateLabel(r.negated.since)) : ''}${phrase}${whole}`);
-      }
-      return parts.join(' · ');
+      const phrase = /PHRASE/i.test(n.by || '') ? muted(`phrase "${escapeHtml(n.text || '')}"`) : '';
+      const whole = n.level === 'campaign' ? muted('whole campaign') : '';
+      return `${n.since ? escapeHtml(stDateLabel(n.since)) : 'yes'}${phrase}${whole}`;
     }
 
     // The breakdown goes under the LAST match row of a term, so it does not
@@ -729,7 +736,7 @@
       const others = (stDetail.products || []).filter(p => p.portfolioId !== here);
       const line = (label, m, cls, full) => `<tr class="st-sub${cls ? ' ' + cls : ''}">
         <td class="st-sub-label">${stCut(label, full, 'st-cut-sub')}</td>
-        <td></td><td></td><td></td>
+        <td></td><td></td><td></td><td></td>
         ${stMetricCells(m)}
         <td class="arf-r">${stRoas(m.sales, m.cost)}</td>
         <td></td>
@@ -1127,8 +1134,9 @@
       { key: 'negative', label: 'Negative', text: true },
       { key: 'type', label: 'Type', text: true },
       { key: 'level', label: 'Level', text: true },
+      { key: 'campaignType', label: 'Campaign type', text: true },
       { key: 'added', label: 'Added' },
-      { key: 'exact', label: 'Exact keyword' },
+      { key: 'graduated', label: 'Graduated' },
       { key: 'beforeClicks', label: 'Clicks', group: 'before', right: true },
       { key: 'beforeCost', label: 'Spend', group: 'before', right: true },
       { key: 'beforeOrders', label: 'Orders', group: 'before', right: true },
@@ -1141,7 +1149,7 @@
       { key: 'campaign', label: 'Campaign', text: true }
     ];
 
-    const ST_NEGATIVE_TYPES = ['Exact', 'Phrase', 'Product'];
+    const ST_NEGATIVE_TYPES = { Exact: 'Negative exact', Phrase: 'Negative phrase', Product: 'Negative ASIN' };
     const ST_NEGATIVE_LEVELS = { ad_group: 'Ad group', campaign: 'Whole campaign' };
 
     function stNegativeFilters(data) {
@@ -1162,7 +1170,15 @@
         <label class="wk-field">
           <span>Type</span>
           <select data-st-ng="type">
-            ${opt('', 'any', stNgType)}${ST_NEGATIVE_TYPES.map(t => opt(t, t.toLowerCase(), stNgType)).join('')}
+            ${opt('', 'any', stNgType)}${Object.entries(ST_NEGATIVE_TYPES)
+              .map(([k, v]) => opt(k, v.replace(/^Negative/, 'negative'), stNgType)).join('')}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Campaign type</span>
+          <select data-st-ng="campaignType">
+            ${opt('', 'any', stNgCampaignType)}${(data.filterCampaignTypes || [])
+              .map(t => opt(t, t, stNgCampaignType)).join('')}
           </select>
         </label>
         <label class="wk-field">
@@ -1202,15 +1218,14 @@
             from every stored day of search terms. Before includes the day it was added, since it
             went in partway through; Since starts the day after, so anything there got through.
             Stored days begin ${escapeHtml(first)}, so a negative older than that has no before.
-            Exact keyword is the
-            same fact as a product's Status: the product targets the term as an exact keyword of
-            its own. Nothing in this dashboard adds negatives, so every recent one is Ad Badger's
-            or made by hand.
+            Graduated is the same fact as a product's Status: the product targets the term as a
+            keyword of its own — each match type with the day it was added, oldest first. Nothing
+            in this dashboard adds negatives, so every recent one is Ad Badger's or made by hand.
           </p>
           <p class="arf-muted st-shown">${formatCount(data.total || 0)} negatives · ${
             formatCount(sm.last7 || 0)} added in the last 7 days, ${formatCount(sm.last30 || 0)} in the last 30 · ${
             formatCount(sm.soldBefore || 0)} blocked a term that had orders there before, ${
-            formatCount(sm.soldBeforeExact || 0)} of them with an exact keyword in the product</p>
+            formatCount(sm.soldBeforeGraduated || 0)} of them graduated</p>
           ${rows.length ? `
           <div class="arf-table-wrap">
             <table class="table-fill arf-table st-oneline">
@@ -1224,16 +1239,13 @@
 
     function stNegativeRow(r) {
       const dash = (v, f) => (v === null || v === undefined ? '—' : f(v));
-      const exact = r.exact
-        ? `Exact${r.exact.since ? ` <span class="arf-muted">${stDateLabel(r.exact.since)}</span>` : ''}${
-            r.exact.state === 'PAUSED' ? ' <span class="arf-muted">paused</span>' : ''}`
-        : '';
       return `<tr>
-        <td class="arf-name">${stCut(stNegativeLabel(r), r.text, 'st-cut-target')}</td>
-        <td>${escapeHtml(r.type || '—')}</td>
+        <td class="arf-name">${stCut(stNegativeLabel(r), r.text, 'st-cut-negative')}</td>
+        <td>${escapeHtml(ST_NEGATIVE_TYPES[r.type] || r.type || '—')}</td>
         <td>${escapeHtml(ST_NEGATIVE_LEVELS[r.level] || r.level || '—')}</td>
+        <td>${escapeHtml(r.campaignType || '—')}</td>
         <td>${r.addedAt ? escapeHtml(stDateLabel(r.addedAt)) : '—'}</td>
-        <td>${exact}</td>
+        <td>${stGraduatedList(r.graduated)}</td>
         <td class="arf-r arf-em">${dash(r.beforeClicks, formatCount)}</td>
         <td class="arf-r">${dash(r.beforeCost, stMoney)}</td>
         <td class="arf-r arf-em">${dash(r.beforeOrders, formatCount)}</td>
@@ -1241,7 +1253,7 @@
         <td class="arf-r">${r.beforeCost === null || r.beforeCost === undefined ? '—' : stRoas(r.beforeSales, r.beforeCost)}</td>
         <td class="arf-r">${dash(r.sinceClicks, formatCount)}</td>
         <td class="arf-r">${dash(r.sinceCost, stMoney)}</td>
-        <td>${stCut(escapeHtml(r.campaign || '—'), [r.campaign, r.portfolio].filter(Boolean).join(' · '))}</td>
+        <td>${stCut(escapeHtml(r.campaign || '—'), [r.campaign, r.portfolio].filter(Boolean).join(' · '), 'st-cut-campaign')}</td>
       </tr>`;
     }
 
@@ -1561,6 +1573,7 @@
           if (which === 'product') stNgProduct = ng.value;
           if (which === 'type') stNgType = ng.value;
           if (which === 'level') stNgLevel = ng.value;
+          if (which === 'campaignType') stNgCampaignType = ng.value;
           stOffset = 0;
           return stFetch();
         }
