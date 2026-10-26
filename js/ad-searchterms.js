@@ -30,7 +30,7 @@
     let stQuery = '';
     let stMinClicks = 0;
     let stOffset = 0;
-    let stView = 'products';   // products | targets | terms | rows
+    let stView = 'products';   // products | targets | negatives | terms | rows
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
     let stMatch = '';          // inside a product: one match type, or all of them
@@ -57,6 +57,12 @@
     let stTgPosition = '';
     let stBidsBusy = false;
 
+    // The Negatives tab's filters, its own for the same reason.
+    let stNgProduct = '';
+    let stNgQuery = '';
+    let stNgType = '';
+    let stNgLevel = '';
+
     // Every click fires a request and they can come back out of order; the
     // slowest query is the one inside a product. Each request takes a number,
     // and only the latest may draw — otherwise a slow answer to an earlier
@@ -68,7 +74,8 @@
     // another tab may not exist here, and would quietly fall back to spend —
     // possibly ascending, with no arrow showing it.
     function stResetSort() {
-      stSort = 'cost';
+      // Negatives read newest first: what was blocked lately is the question.
+      stSort = stView === 'negatives' ? 'added' : 'cost';
       stDir = 'desc';
     }
     let stNames = {};          // ASIN -> { title, brand, found } for what is on screen
@@ -113,6 +120,11 @@
           if (stTgMatch) qs.set('match', stTgMatch);
           if (stTgState) qs.set('state', stTgState);
           if (stTgPosition) qs.set('position', stTgPosition);
+        } else if (stView === 'negatives') {
+          if (stNgQuery) qs.set('q', stNgQuery);
+          if (stNgProduct) qs.set('portfolio', stNgProduct);
+          if (stNgType) qs.set('type', stNgType);
+          if (stNgLevel) qs.set('level', stNgLevel);
         } else {
           if (stQuery) qs.set('q', stQuery);
           if (stPortfolio) qs.set('portfolio', stPortfolio.id);
@@ -500,6 +512,7 @@
       const body = data.view === 'products' ? stProductTable(data)
                  : data.view === 'product-terms' ? stProductTermTable(data)
                  : data.view === 'targets' ? stTargetTable(data)
+                 : data.view === 'negatives' ? stNegativeTable(data)
                  : stTable(data);
       container.innerHTML =
         stControls(data) + body + stStats(data) + stFooter(data);
@@ -518,7 +531,7 @@
         ? [...new Set((data.products || []).map(r => r.brand || '—'))].sort() : [];
       return `
         <div class="tabs">
-          ${tab('products', 'Products')}${tab('targets', 'Targets')}${tab('terms', 'Shared terms')}${tab('rows', 'Daily rows')}
+          ${tab('products', 'Products')}${tab('targets', 'Targets')}${tab('negatives', 'Negatives')}${tab('terms', 'Shared terms')}${tab('rows', 'Daily rows')}
         </div>
         ${stPortfolio && data.view === 'product-terms' ? `
         <div class="st-crumb">
@@ -526,13 +539,13 @@
           <strong>${escapeHtml(stPortfolio.name)}</strong>
         </div>` : ''}
         <div class="card card-flat wk-controls">
-          <label class="wk-field">
+          ${data.view === 'negatives' ? '' : `<label class="wk-field">
             <span>Stored month</span>
             <select data-st-month>
               ${months.map(m => `<option value="${escapeHtml(m)}"${
                 m === data.month ? ' selected' : ''}>${escapeHtml(stMonthLabel(m))}</option>`).join('')}
             </select>
-          </label>
+          </label>`}
           ${data.view === 'products' ? `
           <label class="wk-field">
             <span>Product contains</span>
@@ -554,6 +567,7 @@
             </select>
           </label>` : ''}
           ${data.view === 'targets' ? stTargetFilters(data) : ''}
+          ${data.view === 'negatives' ? stNegativeFilters(data) : ''}
           ${data.view === 'product-terms' ? `
           <label class="wk-field">
             <span>Match type</span>
@@ -1102,6 +1116,143 @@
       return typeof n === 'number' && isFinite(n) ? stMoney(n) : '—';
     }
 
+    // ── NEGATIVES ────────────────────────────────────────────────────────────
+    // One row per negative that is on: what it blocks, where, since when, and
+    // what the term it blocks did in that campaign before and since — every
+    // stored day, split at the day it was added.
+    //
+    // Nothing in this dashboard adds a negative, so every recent one was added
+    // by Ad Badger or by hand in the console.
+    const ST_NEGATIVE_COLS = [
+      { key: 'negative', label: 'Negative', text: true },
+      { key: 'type', label: 'Type', text: true },
+      { key: 'level', label: 'Level', text: true },
+      { key: 'added', label: 'Added' },
+      { key: 'exact', label: 'Exact keyword' },
+      { key: 'beforeClicks', label: 'Clicks', group: 'before', right: true },
+      { key: 'beforeCost', label: 'Spend', group: 'before', right: true },
+      { key: 'beforeOrders', label: 'Orders', group: 'before', right: true },
+      { key: 'beforeSales', label: 'Sales', group: 'before', right: true },
+      { key: 'beforeRoas', label: 'ROAS', group: 'before', right: true },
+      { key: 'sinceClicks', label: 'Clicks', group: 'since', right: true },
+      { key: 'sinceCost', label: 'Spend', group: 'since', right: true },
+      // Reference rather than data, so it sits after the numbers; the
+      // product's full name is on hover, as on Targets.
+      { key: 'campaign', label: 'Campaign', text: true }
+    ];
+
+    const ST_NEGATIVE_TYPES = ['Exact', 'Phrase', 'Product'];
+    const ST_NEGATIVE_LEVELS = { ad_group: 'Ad group', campaign: 'Whole campaign' };
+
+    function stNegativeFilters(data) {
+      const opt = (value, label, current) =>
+        `<option value="${escapeHtml(value)}"${current === value ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+      return `
+        <label class="wk-field">
+          <span>Negative contains</span>
+          <input type="search" data-st-nq value="${escapeHtml(stNgQuery)}" placeholder="any">
+        </label>
+        <label class="wk-field">
+          <span>Product</span>
+          <select data-st-ng="product">
+            ${opt('', 'All products', stNgProduct)}
+            ${(data.filterProducts || []).map(p => opt(p.id, p.name || p.id, stNgProduct)).join('')}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Type</span>
+          <select data-st-ng="type">
+            ${opt('', 'any', stNgType)}${ST_NEGATIVE_TYPES.map(t => opt(t, t.toLowerCase(), stNgType)).join('')}
+          </select>
+        </label>
+        <label class="wk-field">
+          <span>Level</span>
+          <select data-st-ng="level">
+            ${opt('', 'any', stNgLevel)}${Object.entries(ST_NEGATIVE_LEVELS)
+              .map(([k, v]) => opt(k, v.toLowerCase(), stNgLevel)).join('')}
+          </select>
+        </label>`;
+    }
+
+    function stNegativeTable(data) {
+      const rows = data.rows || [];
+      const sm = data.summary || {};
+      const sortBtn = (c) => {
+        const active = stSort === c.key;
+        return `<button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
+          c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button>`;
+      };
+      // Two header rows: the before and since figures under one heading each,
+      // so the same Clicks and Spend do not have to be told apart by name.
+      const top = ST_NEGATIVE_COLS.filter(c => !c.group || c.key === 'beforeClicks' || c.key === 'sinceClicks')
+        .map(c => {
+          if (c.key === 'beforeClicks') return '<th class="st-group-head" colspan="5">Before it was added</th>';
+          if (c.key === 'sinceClicks') return '<th class="st-group-head" colspan="2">Since</th>';
+          return `<th rowspan="2"${c.right ? ' class="arf-r"' : ''}>${sortBtn(c)}</th>`;
+        }).join('');
+      const second = ST_NEGATIVE_COLS.filter(c => c.group)
+        .map(c => `<th class="arf-r">${sortBtn(c)}</th>`).join('');
+      const first = sm.firstDay ? stDayLabel(sm.firstDay) : 'the first stored day';
+      return `
+        <div class="arf-section">
+          <h4>Negatives · every one that is on</h4>
+          <p class="arf-blurb">
+            What each negative blocks, where, and since when — and what the term it blocks did in
+            that campaign (and ad group, for an ad group negative) before it was added and since,
+            from every stored day of search terms. Before includes the day it was added, since it
+            went in partway through; Since starts the day after, so anything there got through.
+            Stored days begin ${escapeHtml(first)}, so a negative older than that has no before.
+            Exact keyword is the
+            same fact as a product's Status: the product targets the term as an exact keyword of
+            its own. Nothing in this dashboard adds negatives, so every recent one is Ad Badger's
+            or made by hand.
+          </p>
+          <p class="arf-muted st-shown">${formatCount(data.total || 0)} negatives · ${
+            formatCount(sm.last7 || 0)} added in the last 7 days, ${formatCount(sm.last30 || 0)} in the last 30 · ${
+            formatCount(sm.soldBefore || 0)} blocked a term that had orders there before, ${
+            formatCount(sm.soldBeforeExact || 0)} of them with an exact keyword in the product</p>
+          ${rows.length ? `
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table st-oneline">
+              <thead><tr>${top}</tr><tr>${second}</tr></thead>
+              <tbody>${rows.map(stNegativeRow).join('')}</tbody>
+            </table>
+          </div>
+          ${stPager(data)}` : '<p class="arf-none">No negatives match these filters.</p>'}
+        </div>`;
+    }
+
+    function stNegativeRow(r) {
+      const dash = (v, f) => (v === null || v === undefined ? '—' : f(v));
+      const exact = r.exact
+        ? `Exact${r.exact.since ? ` <span class="arf-muted">${stDateLabel(r.exact.since)}</span>` : ''}${
+            r.exact.state === 'PAUSED' ? ' <span class="arf-muted">paused</span>' : ''}`
+        : '';
+      return `<tr>
+        <td class="arf-name">${stCut(stNegativeLabel(r), r.text, 'st-cut-target')}</td>
+        <td>${escapeHtml(r.type || '—')}</td>
+        <td>${escapeHtml(ST_NEGATIVE_LEVELS[r.level] || r.level || '—')}</td>
+        <td>${r.addedAt ? escapeHtml(stDateLabel(r.addedAt)) : '—'}</td>
+        <td>${exact}</td>
+        <td class="arf-r arf-em">${dash(r.beforeClicks, formatCount)}</td>
+        <td class="arf-r">${dash(r.beforeCost, stMoney)}</td>
+        <td class="arf-r arf-em">${dash(r.beforeOrders, formatCount)}</td>
+        <td class="arf-r">${dash(r.beforeSales, stMoney)}</td>
+        <td class="arf-r">${r.beforeCost === null || r.beforeCost === undefined ? '—' : stRoas(r.beforeSales, r.beforeCost)}</td>
+        <td class="arf-r">${dash(r.sinceClicks, formatCount)}</td>
+        <td class="arf-r">${dash(r.sinceCost, stMoney)}</td>
+        <td>${stCut(escapeHtml(r.campaign || '—'), [r.campaign, r.portfolio].filter(Boolean).join(' · '))}</td>
+      </tr>`;
+    }
+
+    // A negative keyword as typed, a negative product target as the report
+    // writes it — and either, when it is an ASIN, with the product it is.
+    function stNegativeLabel(r) {
+      if (/^asin="/i.test(String(r.text || ''))) return stTargetLabel(r);
+      const text = String(r.text || '');
+      return ST_ASIN_RE.test(text) ? `${escapeHtml(text)} ${stProductCell(text, true)}` : escapeHtml(text || '—');
+    }
+
     const ST_COLS = [
       { key: 'searchTerm', label: 'Search term', sortable: true },
       { key: 'matched', label: 'Matched by' },
@@ -1382,7 +1533,8 @@
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;
-          const textCol = stView === 'targets' && (ST_TARGET_COLS.find(c => c.key === key) || {}).text;
+          const cols = stView === 'targets' ? ST_TARGET_COLS : stView === 'negatives' ? ST_NEGATIVE_COLS : [];
+          const textCol = (cols.find(c => c.key === key) || {}).text;
           if (stSort === key) stDir = stDir === 'asc' ? 'desc' : 'asc';
           else { stSort = key; stDir = textCol ? 'asc' : 'desc'; }
           stOffset = 0;
@@ -1403,6 +1555,15 @@
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
         if (dead) { stOnlyDead = dead.value === '1'; stOffset = 0; return stFetch(); }
+        const ng = e.target.closest('[data-st-ng]');
+        if (ng) {
+          const which = ng.dataset.stNg;
+          if (which === 'product') stNgProduct = ng.value;
+          if (which === 'type') stNgType = ng.value;
+          if (which === 'level') stNgLevel = ng.value;
+          stOffset = 0;
+          return stFetch();
+        }
         const match = e.target.closest('[data-st-match]');
         if (match) { stMatch = match.value; stOffset = 0; stDetail = null; return stFetch(); }
         const tg = e.target.closest('[data-st-tg]');
@@ -1436,6 +1597,8 @@
         if (q && e.key === 'Enter') { stQuery = q.value.trim(); stOffset = 0; stFetch(); }
         const tq = e.target.closest('[data-st-tq]');
         if (tq && e.key === 'Enter') { stTgQuery = tq.value.trim(); stOffset = 0; stFetch(); }
+        const nq = e.target.closest('[data-st-nq]');
+        if (nq && e.key === 'Enter') { stNgQuery = nq.value.trim(); stOffset = 0; stFetch(); }
       });
 
       stBound = true;

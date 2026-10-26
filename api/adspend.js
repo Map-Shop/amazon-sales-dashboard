@@ -5803,8 +5803,28 @@ async function handleSearchTermsGet(req, res) {
     // the raw daily rows underneath. A product is where a decision is made —
     // a cluster of terms with nothing to show for itself is one question about
     // that product, not fifty about terms.
-    const view = ['products', 'product-terms', 'targets', 'terms', 'rows', 'term', 'term-products']
+    const view = ['products', 'product-terms', 'targets', 'negatives', 'terms', 'rows', 'term', 'term-products']
       .includes(String(req.query.view)) ? String(req.query.view) : 'products';
+
+    // One row per negative that is on, with what the term it blocks did in
+    // that campaign before and since. Every stored day, not the month.
+    if (view === 'negatives') {
+      const pick = (v, allowed) => (allowed.includes(String(v)) ? String(v) : null);
+      const page = await targets.byNegative({
+        adProduct: ST_PRODUCT,
+        portfolioId: String(req.query.portfolio || '').trim() || null,
+        q: String(req.query.q || '').trim(),
+        type: pick(req.query.type, targets.NEGATIVE_TYPES),
+        level: pick(req.query.level, targets.NEGATIVE_LEVELS),
+        sort: req.query.sort, dir: req.query.dir,
+        limit: req.query.limit, offset: req.query.offset
+      });
+      return res.status(200).json({
+        ...base, view, rows: page.rows, total: page.total, summary: page.summary,
+        filterProducts: page.products,
+        names: await stNamesFor(page.rows.map(r => r.text))
+      });
+    }
 
     if (view === 'products') {
       return res.status(200).json({

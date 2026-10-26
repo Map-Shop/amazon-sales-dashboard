@@ -646,6 +646,58 @@ console.log('\nSUGGESTED BIDS  \u2014 reading Amazon\'s answer');
      'by then an answer has shown the request is sound, so a refusal is about the target');
 }
 
+console.log('\nTHE NEGATIVES TABLE  \u2014 what each one blocks, and what that term did before and since');
+
+{
+  const TG = await import('../lib/targets.js');
+  const NG_OPTIONS = [
+    ['default', {}],
+    ['one product', { portfolioId: 'pf1' }],
+    ['text filter', { q: 'world map' }],
+    ['phrase only', { type: 'Phrase' }],
+    ['whole campaign only', { level: 'campaign' }],
+    ['every filter', { portfolioId: 'pf1', q: 'map', type: 'Exact', level: 'ad_group' }],
+    ['by orders before', { sort: 'beforeOrders' }],
+    ['by ROAS before', { sort: 'beforeRoas', dir: 'asc' }],
+    ['paged', { limit: 50, offset: 400 }]
+  ];
+  for (const [label, opts] of NG_OPTIONS) {
+    const q = TG.negativeQueries(opts);
+    checkStatement(`negatives, rows, ${label}`, q.rows);
+    checkStatement(`negatives, summary, ${label}`, q.summary);
+  }
+  checkStatement('negatives, products', TG.negativeQueries().facets);
+
+  const q = TG.negativeQueries({ type: 'Phrase', level: 'campaign', limit: 50, offset: 100 });
+  ok(q.summary.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[5] === 50 && q.rows.params[6] === 100,
+     'the page and its total are filtered the same way, and the paging is passed, not interpolated');
+  ok(TG.negativeQueries({ type: 'Broad', level: 'everywhere' }).rows.params.slice(3, 5).every(v => v === null),
+     'a type or level outside the known ones is no filter at all');
+  ok(!/DROP/.test(TG.negativeQueries({ sort: 'added; DROP TABLE sp_negatives --' }).rows.text),
+     'a sort key outside the whitelist never reaches the statement');
+  const order = (sort) => { const t = TG.negativeQueries({ sort }).rows.text; return t.slice(t.lastIndexOf('ORDER BY')); };
+  ok(/amazon_created_at DESC/.test(order(undefined)), 'newest first by default: what was blocked lately is the question');
+  ok(/before_sales \/ NULLIF\(before_cost, 0\)/.test(order('beforeRoas')) &&
+     !/\/ (?!NULLIF)/.test(TG.negativeQueries({ sort: 'beforeRoas' }).rows.text),
+     'ROAS before divides only through NULLIF');
+
+  const t = q.rows.text;
+  ok(/terms\.term = neg\.match_key/.test(t) && /neg\.neg_type <> 'Phrase'/.test(t),
+     'exact and product negatives find their term by an equal key, which the database can join on',
+     'scanning each negative\'s whole campaign for it took thirteen seconds');
+  ok(/neg\.neg_type = 'Phrase'/.test(t) && /position\(' ' \|\| neg\.match_key \|\| ' ' IN ' ' \|\| terms\.term \|\| ' '\)/.test(t),
+     'a phrase negative matches a term containing it on whole words');
+  ok(/substring\(n\.neg_text FROM 'asin="\(\[\^"\]\+\)"'\)/.test(t),
+     'a negative product target is matched by the ASIN inside it');
+  ok(/neg\.level = 'campaign' OR terms\.ad_group_id = neg\.ad_group_id/.test(t),
+     'an ad group negative counts only its own ad group\'s terms');
+  ok(/CASE WHEN neg\.added_on >= fd\.d THEN coalesce\(hit\.before_clicks, 0\) END/.test(t),
+     'a negative older than the first stored day has no before, rather than a before of nothing');
+  ok(/date <= added_on/.test(t) && /date >  added_on/.test(t),
+     'the day it was added counts as before, and since starts the day after',
+     'a negative goes in partway through a day; the clicks that morning are not the term getting through');
+}
+
 console.log('\nCURRENT SUGGESTIONS  \u2014 a day from when they were fetched');
 
 {

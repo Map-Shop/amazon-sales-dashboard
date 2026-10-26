@@ -2356,6 +2356,13 @@
        long product name there is cut rather than widening the whole table. */
     .st-cut.st-cut-sub { max-width: 18rem; }
 
+    /* Negatives: the before and since figures each under one heading, so the
+       two Clicks and two Spend columns read as belonging to it. */
+    .arf-table th.st-group-head {
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+
     /* What the daily pull last did and will do next, beside Pull latest. */
     .st-daily-line {
       font-size: 0.75rem;
