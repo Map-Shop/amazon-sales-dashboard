@@ -1740,7 +1740,8 @@
         <div class="st-pick" data-st-pick="${which}">
           <button type="button" class="st-pick-btn" data-st-pick-toggle title="${escapeHtml(
             current ? ((stProductLabels.get(current) || {}).full || label) : label)}">
-            <span class="st-pick-current">${escapeHtml(label)}</span><span class="st-pick-caret">▾</span>
+            <span class="st-pick-current">${escapeHtml(label)}</span><svg class="st-pick-caret" viewBox="0 0 10 6"
+              aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg>
           </button>
           <div class="st-pick-menu">
             ${item('', 'All products')}

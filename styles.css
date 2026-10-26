@@ -2400,10 +2400,14 @@
        or on a tap, where there is no hover (.open). */
     .st-pick { position: relative; }
 
-    /* The other filters are <label>s, which carry the page's label margin;
-       the picker's field is a <div>, since a label would hand every click
-       inside the menu to its button. Same margin, so they line up. */
-    .wk-field.st-pick-field { margin-bottom: 0.5rem; }
+    /* The other filters are <label>s; the picker's field is a <div>, since
+       a label would hand every click inside the menu to its button. So it
+       takes from the page's label style what the others get from it: the
+       margin under the field and the weight of the caption. */
+    .wk-field.st-pick-field {
+      margin-bottom: 0.5rem;
+      font-weight: 600;
+    }
 
     .st-pick-btn {
       display: flex;
@@ -2433,7 +2437,17 @@
       text-overflow: ellipsis;
     }
 
-    .st-pick-caret { color: var(--text-secondary); font-size: 0.7rem; }
+    /* Drawn to match the chevron the native selects beside it show. */
+    .st-pick-caret {
+      flex: none;
+      width: 0.65rem;
+      height: 0.4rem;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
 
     .st-pick-menu,
     .st-pick-sub {
