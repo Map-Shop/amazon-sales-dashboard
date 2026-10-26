@@ -205,6 +205,9 @@ console.log('\nTHE QUERIES  — every parameter is referenced, and every referen
 // So every query the page runs is checked, not only the one that failed.
 const ST = await import('../lib/searchterms.js');
 
+// September, as a range of days: every view now reads a range rather than a month.
+const SEP = { start: '2026-09-01', end: '2026-09-30' };
+
 // $1, $2 … actually written in the statement.
 const refs = (text) => new Set([...text.matchAll(/\$(\d+)/g)].map(m => Number(m[1])));
 
@@ -221,20 +224,20 @@ function checkStatement(label, { text, params }) {
 }
 
 const OPTIONS = [
-  ['default', { month: '2026-09' }],
-  ['term filter', { month: '2026-09', q: 'laminated' }],
-  ['click floor', { month: '2026-09', minClicks: 15 }],
-  ['no orders yet', { month: '2026-09', onlyDead: true }],
-  ['shared terms', { month: '2026-09', minProducts: 2 }],
-  ['Auto only', { month: '2026-09', match: 'Auto' }],
-  ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
-  ['sorted by ROAS', { month: '2026-09', sort: 'roas', dir: 'desc' }],
-  ['paged', { month: '2026-09', limit: 50, offset: 400 }]
+  ['default', { range: SEP }],
+  ['term filter', { range: SEP, q: 'laminated' }],
+  ['click floor', { range: SEP, minClicks: 15 }],
+  ['no orders yet', { range: SEP, onlyDead: true }],
+  ['shared terms', { range: SEP, minProducts: 2 }],
+  ['Auto only', { range: SEP, match: 'Auto' }],
+  ['sorted ascending', { range: SEP, sort: 'clicks', dir: 'asc' }],
+  ['sorted by ROAS', { range: SEP, sort: 'roas', dir: 'desc' }],
+  ['paged', { range: SEP, limit: 50, offset: 400 }]
 ];
 
 // The paged queries: a rows statement and a count statement each.
 for (const [name, build] of [
-  ['daily rows', (o) => ST.monthQueries(o)],
+  ['daily rows', (o) => ST.rowQueries(o)],
   ['all terms', (o) => ST.termQueries(o)],
   ['one product', (o) => ST.productTermQueries({ portfolioId: 'pf1', ...o })]
 ]) {
@@ -246,16 +249,16 @@ for (const [name, build] of [
 }
 
 // The single statements.
-checkStatement('products', ST.productQuery({ month: '2026-09' }));
-checkStatement('one term by product', ST.termProductQuery({ month: '2026-09', searchTerm: 'world map' }));
-checkStatement('one term by campaign', ST.termDetailQuery({ month: '2026-09', searchTerm: 'world map' }));
+checkStatement('products', ST.productQuery({ range: SEP }));
+checkStatement('one term by product', ST.termProductQuery({ range: SEP, searchTerm: 'world map' }));
+checkStatement('one term by campaign', ST.termDetailQuery({ range: SEP, searchTerm: 'world map' }));
 
 {
-  const q = ST.monthQueries({ month: '2026-09', q: 'laminated', minClicks: 5, limit: 50, offset: 100 });
+  const q = ST.rowQueries({ range: SEP, q: 'laminated', minClicks: 5, limit: 50, offset: 100 });
   ok(q.count.params.every((v, i) => v === q.rows.params[i]),
      'a page and its total are filtered the same way');
   ok(q.rows.params[4] === 50 && q.rows.params[5] === 100, 'page size and offset are passed, not interpolated');
-  const bare = ST.monthQueries({ month: '2026-09' });
+  const bare = ST.rowQueries({ range: SEP });
   ok(bare.count.params[3] === null && /\$4::text IS NULL/.test(bare.count.text),
      'with no term filter the parameter is null and typed in the statement',
      'an untyped null is the other half of the same Postgres refusal');
@@ -266,9 +269,9 @@ checkStatement('one term by campaign', ST.termDetailQuery({ month: '2026-09', se
   // free text. Every table's sort goes through a whitelist.
   const evil = 'cost; DROP TABLE search_terms --';
   const texts = [
-    ST.monthQueries({ month: '2026-09', sort: evil }).rows.text,
-    ST.termQueries({ month: '2026-09', sort: evil }).rows.text,
-    ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', sort: evil }).rows.text
+    ST.rowQueries({ range: SEP, sort: evil }).rows.text,
+    ST.termQueries({ range: SEP, sort: evil }).rows.text,
+    ST.productTermQueries({ range: SEP, portfolioId: 'pf1', sort: evil }).rows.text
   ];
   ok(texts.every(t => !/DROP/.test(t)),
      'a sort key outside the whitelist never reaches the statement, on any table');
@@ -281,9 +284,9 @@ console.log('\nROAS  — sortable on every table, and safe on zero spend');
   // division by zero rather than leaving that one row blank. One term with no
   // spend would take the page down.
   const sorts = {
-    'daily rows': ST.monthQueries({ month: '2026-09', sort: 'roas' }).rows.text,
-    'all terms': ST.termQueries({ month: '2026-09', sort: 'roas' }).rows.text,
-    'one product': ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', sort: 'roas' }).rows.text
+    'daily rows': ST.rowQueries({ range: SEP, sort: 'roas' }).rows.text,
+    'all terms': ST.termQueries({ range: SEP, sort: 'roas' }).rows.text,
+    'one product': ST.productTermQueries({ range: SEP, portfolioId: 'pf1', sort: 'roas' }).rows.text
   };
   for (const [name, text] of Object.entries(sorts)) {
     const order = text.slice(text.lastIndexOf('ORDER BY'));
@@ -303,10 +306,10 @@ console.log('\nTHE CAMPAIGN LIST  — a campaign that leaves it keeps its histor
   // drop a campaign that has since left it from every total, while the stored
   // figures at the foot of the page still counted it.
   const views = {
-    products: ST.productQuery({ month: '2026-09' }).text,
-    'all terms': ST.termQueries({ month: '2026-09' }).rows.text,
-    'one term by product': ST.termProductQuery({ month: '2026-09', searchTerm: 'x' }).text,
-    'one term by campaign': ST.termDetailQuery({ month: '2026-09', searchTerm: 'x' }).text
+    products: ST.productQuery({ range: SEP }).text,
+    'all terms': ST.termQueries({ range: SEP }).rows.text,
+    'one term by product': ST.termProductQuery({ range: SEP, searchTerm: 'x' }).text,
+    'one term by campaign': ST.termDetailQuery({ range: SEP, searchTerm: 'x' }).text
   };
   const inner = Object.entries(views)
     .filter(([, t]) => /(^|[^T]\s)JOIN ad_campaigns/m.test(t.replace(/LEFT JOIN ad_campaigns/g, '')))
@@ -320,7 +323,7 @@ console.log('\nTHE CAMPAIGN LIST  — a campaign that leaves it keeps its histor
 console.log('\nHOW IT MATCHED  — from Amazon\'s match type, not the campaign\'s name');
 
 {
-  const t = ST.termQueries({ month: '2026-09' }).rows.text;
+  const t = ST.termQueries({ range: SEP }).rows.text;
   ok(/upper\(t\.match_type\) = 'EXACT'/.test(t) && !/campaign_type = 'Exact'/.test(t),
      'a term is marked exact from the match type Amazon reports',
      'the campaign name marked one September term exact that a broad keyword had caught');
@@ -341,7 +344,7 @@ console.log('\nHOW IT MATCHED  — from Amazon\'s match type, not the campaign\'
 console.log('\nONE PRODUCT  — paged by term, so a term is never split across pages');
 
 {
-  const q = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', limit: 50, offset: 100 });
+  const q = ST.productTermQueries({ range: SEP, portfolioId: 'pf1', limit: 50, offset: 100 });
   const pageCte = q.rows.text.slice(q.rows.text.indexOf('page AS ('));
   ok(/LIMIT \$8::int OFFSET \$9::int/.test(pageCte.slice(0, pageCte.indexOf(')\n'))),
      'the page size applies to terms, inside the step that picks them',
@@ -353,19 +356,19 @@ console.log('\nONE PRODUCT  — paged by term, so a term is never split across p
 console.log('\nONE PRODUCT, ONE MATCH TYPE  — what Auto spent, and what has been done about it');
 
 {
-  const q = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', match: 'Auto' });
+  const q = ST.productTermQueries({ range: SEP, portfolioId: 'pf1', match: 'Auto' });
   const inproduct = q.rows.text.slice(q.rows.text.indexOf('inproduct AS ('), q.rows.text.indexOf('term AS ('));
   ok(q.rows.params[6] === 'Auto' && /= \$7\)/.test(inproduct),
      'the match type narrows the rows before they are added up',
      'so a term\'s spend and orders are what Auto spent and earned, not the product\'s whole total');
-  ok(ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', match: 'Exact; DROP' }).rows.params[6] === null,
+  ok(ST.productTermQueries({ range: SEP, portfolioId: 'pf1', match: 'Exact; DROP' }).rows.params[6] === null,
      'a match type outside the funnel\'s list is no filter at all');
   ok(/t\.campaign_id, t\.ad_group_id/.test(inproduct),
      'each row keeps the campaign and ad group it matched in, to check its own negatives against');
 }
 
 {
-  const t = ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1' }).rows.text;
+  const t = ST.productTermQueries({ range: SEP, portfolioId: 'pf1' }).rows.text;
   ok(/k\.match_label IN \('Broad', 'Phrase', 'Exact'\)/.test(t) && /kc\.portfolio_id = \$3/.test(t),
      'Graduated is a keyword of this product\'s own, broad, phrase or exact, in any of its campaigns',
      'exact is not the only thing a term graduates into');
@@ -383,7 +386,7 @@ console.log('\nONE PRODUCT, ONE MATCH TYPE  — what Auto spent, and what has be
 console.log('\nTHE BREAKDOWN  — one term, by product');
 
 {
-  const d = ST.termDetailQuery({ month: '2026-09', searchTerm: 'new world map' });
+  const d = ST.termDetailQuery({ range: SEP, searchTerm: 'new world map' });
   ok(d.params[2] === 'new world map', 'the term is a parameter, not interpolated');
   ok(!/portfolio_id = \$/.test(d.text),
      'it is never narrowed to one product',
@@ -398,13 +401,13 @@ console.log('\nTHE BREAKDOWN  — one term, by product');
 console.log('\nSHARED TERMS  \u2014 the terms two or more products pay for');
 
 {
-  const q = ST.termQueries({ month: '2026-09', minProducts: 2 });
+  const q = ST.termQueries({ range: SEP, minProducts: 2 });
   ok(q.rows.params[6] === 2 && q.count.params[6] === 2,
      'the product floor is a parameter of both the page and its total');
   ok(/spread\.products, 0\) >= \$7::int/.test(q.count.text) && /JOIN spread/.test(q.count.text),
      'and the total counts only shared terms',
      'counted without the spread, the pager would promise five thousand terms and show seven hundred');
-  ok(ST.termQueries({ month: '2026-09' }).rows.params[6] === 0,
+  ok(ST.termQueries({ range: SEP }).rows.params[6] === 0,
      'with no floor every term qualifies');
 }
 
@@ -725,16 +728,16 @@ console.log('\nTHE TARGETS TABLE  \u2014 every parameter lines up, every sort is
 {
   const TG = await import('../lib/targets.js');
   const TG_OPTIONS = [
-    ['default', { month: '2026-09' }],
-    ['one product', { month: '2026-09', portfolioId: 'pf1' }],
-    ['target filter', { month: '2026-09', q: 'world map' }],
-    ['match type', { month: '2026-09', match: 'Exact' }],
-    ['paused only', { month: '2026-09', state: 'PAUSED' }],
-    ['below the range', { month: '2026-09', position: 'below' }],
-    ['every filter', { month: '2026-09', portfolioId: 'pf1', q: 'map', match: 'Auto', state: 'ENABLED', position: 'within' }],
-    ['by CPC', { month: '2026-09', sort: 'cpc', dir: 'asc' }],
-    ['by ROAS', { month: '2026-09', sort: 'roas' }],
-    ['paged', { month: '2026-09', limit: 50, offset: 400 }]
+    ['default', { range: SEP }],
+    ['one product', { range: SEP, portfolioId: 'pf1' }],
+    ['target filter', { range: SEP, q: 'world map' }],
+    ['match type', { range: SEP, match: 'Exact' }],
+    ['paused only', { range: SEP, state: 'PAUSED' }],
+    ['below the range', { range: SEP, position: 'below' }],
+    ['every filter', { range: SEP, portfolioId: 'pf1', q: 'map', match: 'Auto', state: 'ENABLED', position: 'within' }],
+    ['by CPC', { range: SEP, sort: 'cpc', dir: 'asc' }],
+    ['by ROAS', { range: SEP, sort: 'roas' }],
+    ['paged', { range: SEP, limit: 50, offset: 400 }]
   ];
   for (const [label, opts] of TG_OPTIONS) {
     const q = TG.targetQueries(opts);
@@ -744,19 +747,19 @@ console.log('\nTHE TARGETS TABLE  \u2014 every parameter lines up, every sort is
     checkStatement(`targets, facets, ${label}`, q.facets);
   }
 
-  const q = TG.targetQueries({ month: '2026-09', position: 'below', limit: 50, offset: 100 });
+  const q = TG.targetQueries({ range: SEP, position: 'below', limit: 50, offset: 100 });
   ok(q.count.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[7] === 50 && q.rows.params[8] === 100,
      'a page and its total are filtered the same way, and the paging is passed, not interpolated');
   ok(!/position = \$/.test(q.positions.text) && q.positions.params.length === 6,
      'the tally by position ignores the position filter',
      'so each choice says what picking it would show');
-  ok(TG.targetQueries({ month: '2026-09', position: 'sideways' }).rows.params[6] === null,
+  ok(TG.targetQueries({ range: SEP, position: 'sideways' }).rows.params[6] === null,
      'a position outside the four is no filter at all');
 
   const evil = 'cost; DROP TABLE sp_targets --';
-  ok(!/DROP/.test(TG.targetQueries({ month: '2026-09', sort: evil }).rows.text),
+  ok(!/DROP/.test(TG.targetQueries({ range: SEP, sort: evil }).rows.text),
      'a sort key outside the whitelist never reaches the statement');
-  const order = (sort) => { const t = TG.targetQueries({ month: '2026-09', sort }).rows.text; return t.slice(t.lastIndexOf('ORDER BY')); };
+  const order = (sort) => { const t = TG.targetQueries({ range: SEP, sort }).rows.text; return t.slice(t.lastIndexOf('ORDER BY')); };
   ok(/cost \/ NULLIF\(clicks, 0\)/.test(order('cpc')) && /sales \/ NULLIF\(cost, 0\)/.test(order('roas')),
      'CPC and ROAS sort by their own ratios, guarded against nothing to divide by',
      'a paused target with no clicks would otherwise stop the whole statement');
@@ -769,6 +772,106 @@ console.log('\nTHE TARGETS TABLE  \u2014 every parameter lines up, every sort is
      'a default bid is only credited to a target in the ad group it belongs to');
   ok(TG.TG_COLUMNS.map(([, c]) => c).includes('target_text') && !TG.TG_COLUMNS.some(([, c]) => c === 'text'),
      'the text column is not named after a Postgres type');
+}
+
+console.log('\nDATE RANGES  \u2014 what each choice on the page reads');
+
+{
+  const span = { first: '2026-08-19', last: '2026-10-25' };
+  const today = '2026-10-27';   // settled through Oct 19
+  const R = (o) => M.stResolveRange(o, span, today);
+  let r = R({ preset: 'last30' });
+  ok(r.start === '2026-09-26' && r.end === '2026-10-25',
+     'the last 30 days end at the last day held, not at a today with no data yet', `${r.start}..${r.end}`);
+  ok(r.unsettledDays === 6 && r.settledThrough === '2026-10-19',
+     'and say how many of them are still collecting sales', `${r.unsettledDays} days after ${r.settledThrough}`);
+  r = R({ preset: 'last30', settled: true });
+  ok(r.start === '2026-09-20' && r.end === '2026-10-19' && r.unsettledDays === 0,
+     'settled days only moves the whole window back to the last settled day', `${r.start}..${r.end}`);
+  ok(R({ preset: 'last7' }).start === '2026-10-19' && R({ preset: 'last90' }).start === '2026-08-19',
+     'a window reaching past the first day held starts at it');
+  r = R({ preset: 'thismonth' });
+  ok(r.start === '2026-10-01' && r.end === '2026-10-25', 'this month runs to the last day held');
+  r = R({ preset: 'lastmonth' });
+  ok(r.start === '2026-09-01' && r.end === '2026-09-30', 'last month is the whole calendar month before');
+  ok(R({ preset: 'all' }).start === '2026-08-19', 'all of it starts at the first day held');
+  r = R({ preset: 'custom', start: '2026-10-10', end: '2026-09-15' });
+  ok(r.start === '2026-09-15' && r.end === '2026-10-10', 'a custom range given backwards is turned round');
+  r = R({ preset: 'custom', start: '2026-01-01', end: '2026-12-31', settled: true });
+  ok(r.start === '2026-08-19' && r.end === '2026-10-19', 'and kept inside what is held, and settled when asked');
+  ok(R({ preset: 'nonsense' }).preset === 'last30', 'an unknown choice reads as the last 30 days');
+  ok(M.ST_RANGE_PRESETS.length === 8, 'eight choices on the page');
+}
+
+{
+  ok(ST.rangeParam({ start: '2026-09-01', end: '2026-09-30' }) === '[2026-09-01,2026-09-30]',
+     'a range goes to Postgres as one daterange with both ends included');
+  const texts = {
+    'daily rows': ST.rowQueries({ range: SEP }).rows.text,
+    products: ST.productQuery({ range: SEP }).text,
+    'shared terms': ST.termQueries({ range: SEP }).rows.text,
+    'one product': ST.productTermQueries({ range: SEP, portfolioId: 'pf1' }).rows.text,
+    'one term by product': ST.termProductQuery({ range: SEP, searchTerm: 'x' }).text,
+    'one term by campaign': ST.termDetailQuery({ range: SEP, searchTerm: 'x' }).text
+  };
+  const monthly = Object.entries(texts).filter(([, t]) => /month = \$/.test(t) || !/date <@ \$2::daterange/.test(t)).map(([k]) => k);
+  ok(monthly.length === 0, 'every view reads a range of days, not a stored month', monthly.join(', '));
+}
+
+console.log('\nTARGETS FROM THEIR OWN REPORT  \u2014 every impression, and the top of search');
+
+{
+  const TG = await import('../lib/targets.js');
+  const t = TG.targetQueries({ range: SEP }).rows.text;
+  ok(/FROM sp_target_days/.test(t) && !/FROM search_terms/.test(t),
+     'a target\'s figures come from the targeting report, not the search term report',
+     'the search term report carries only the searches that got a click: a tenth of the impressions');
+  ok(/sum\(top_of_search_is \* impressions\)/.test(t) && /NULLIF\(sum\(impressions\)/.test(t),
+     'top-of-search share across days is weighted by each day\'s impressions');
+  ok(/\$1::text = 'SP' AND date <@ \$2::daterange/.test(t), 'and read over the range');
+  const order = (sort) => { const x = TG.targetQueries({ range: SEP, sort }).rows.text; return x.slice(x.lastIndexOf('ORDER BY')); };
+  ok(/clicks \/ NULLIF\(impressions, 0\)/.test(order('ctr')) && /top_share/.test(order('top')) && /impressions/.test(order('impressions')),
+     'impressions, CTR and top-of-search share each sort, CTR guarded against no impressions');
+}
+
+console.log('\nTHE CHANGE LOG  \u2014 what changed, day by day');
+
+{
+  const TG = await import('../lib/targets.js');
+  const CH_OPTIONS = [
+    ['default', { range: SEP }],
+    ['one product', { range: SEP, portfolioId: 'pf1' }],
+    ['text filter', { range: SEP, q: 'world map' }],
+    ['bids lowered', { range: SEP, kind: 'bid_down' }],
+    ['everything', { range: SEP, portfolioId: 'pf1', q: 'map', kind: 'negative', sort: 'product', dir: 'asc' }],
+    ['paged', { range: SEP, limit: 50, offset: 100 }]
+  ];
+  for (const [label, opts] of CH_OPTIONS) {
+    const q = TG.changeQueries(opts);
+    checkStatement(`changes, rows, ${label}`, q.rows);
+    checkStatement(`changes, count, ${label}`, q.count);
+    checkStatement(`changes, by kind, ${label}`, q.kinds);
+  }
+  const q = TG.changeQueries({ range: SEP, kind: 'paused', limit: 50, offset: 100 });
+  ok(q.count.params.every((v, i) => v === q.rows.params[i]) && q.rows.params[4] === 50 && q.rows.params[5] === 100,
+     'the page and its total are filtered the same way, paging passed not interpolated');
+  ok(!/kind = \$/.test(q.kinds.text) && q.kinds.params.length === 3,
+     'the tally by kind ignores the kind filter, so each choice says what it would show');
+  ok(TG.changeQueries({ range: SEP, kind: 'deleted everything' }).rows.params[3] === null,
+     'a kind outside the known ones is no filter at all');
+  ok(!/DROP/.test(TG.changeQueries({ range: SEP, sort: 'date; DROP TABLE sp_targets --' }).rows.text),
+     'a sort key outside the whitelist never reaches the statement');
+  const t = q.rows.text;
+  ok(/FROM sp_targets g WHERE g\.amazon_created_at IS NOT NULL/.test(t) && /FROM sp_negatives n/.test(t),
+     'keywords, targets and negatives are dated by Amazon\'s own creation dates',
+     'so graduations and negatives are listed back as far as the account goes');
+  ok(/FROM sp_target_changes x WHERE x\.field <> 'added'/.test(t),
+     'bid and status changes come from the morning snapshots, and an appearance is not listed twice');
+  ok(/x\.from_value ~ '\^\[0-9\.\]\+\$' AND x\.to_value ~ '\^\[0-9\.\]\+\$' THEN\s+CASE WHEN x\.to_value::numeric/.test(t),
+     'a bid is compared as a number only once both sides are numbers',
+     'a move onto or off the ad group default reads "default", which a cast would choke on');
+  ok(['keyword', 'negative', 'bid_up', 'bid_down', 'paused', 'enabled', 'removed'].every(k => TG.CHANGE_KINDS.includes(k)),
+     'every kind of change has a name the page can filter on');
 }
 
 console.log('\nCOVERAGE  \u2014 what a pull actually brought back');

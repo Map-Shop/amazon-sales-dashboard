@@ -2363,6 +2363,30 @@
       border-bottom: 1px solid var(--border);
     }
 
+    /* The date inputs for a custom range, dressed like the selects beside
+       them; the page's input style covers text boxes only. */
+    .wk-field input[type="date"] {
+      padding: 0.75rem 1rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-family: 'Work Sans', sans-serif;
+      font-size: 0.875rem;
+      color-scheme: dark;
+    }
+
+    .wk-field input[type="date"]:focus {
+      outline: none;
+      border-color: var(--accent-orange);
+    }
+
+    /* The days in a range still collecting sales, said under the filters. */
+    .st-unsettled {
+      margin: -0.5rem 0 1rem;
+      font-size: 0.75rem;
+    }
+
     /* What the daily pull last did and will do next, beside Pull latest. */
     .st-daily-line {
       font-size: 0.75rem;
@@ -2376,8 +2400,8 @@
     .arf-table.st-targets th,
     .arf-table.st-targets td {
       white-space: nowrap;
-      padding-left: 0.45rem;
-      padding-right: 0.45rem;
+      padding-left: 0.35rem;
+      padding-right: 0.35rem;
     }
 
     .st-cut {
@@ -2389,6 +2413,11 @@
     }
 
     .st-cut.st-cut-target { max-width: 16rem; }
+
+    /* Targets carries sixteen columns, so its keyword and campaign are cut
+       shorter than elsewhere. */
+    .st-cut.st-cut-target-narrow { max-width: 12.5rem; }
+    .st-cut.st-cut-campaign { max-width: 9rem; }
 
     /* Negatives carry two more columns than Targets, so their long ones are
        cut shorter. The campaign's type has a column of its own there. */

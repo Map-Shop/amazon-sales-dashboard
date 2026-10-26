@@ -5230,11 +5230,6 @@ const TD_OPTIONAL_COLUMNS = ['keywordType', 'adKeywordStatus', 'keywordBid', 'to
 
 const DAILY_REPORT_KEYS = [ST_REPORT_KEY, TD_REPORT_KEY];
 
-// Months are still how the page is read, so the range check stays: "2026-13"
-// would otherwise pass, and the date arithmetic turns it into an invalid date
-// that throws several calls later.
-const ST_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-
 // The days one daily pull asks for — see the top of this section.
 //   today       the Pacific date of the run
 //   lastStored  the last day already held, or null when nothing is
@@ -5706,16 +5701,16 @@ async function handleSearchTermsNames(req, res) {
   try {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
-    if (!ST_MONTH_RE.test(String(req.query.month || ''))) {
-      return res.status(400).json({ error: 'month parameter required (YYYY-MM)' });
-    }
-    const month = String(req.query.month);
+    const span = await searchTerms.storeSpan(ST_PRODUCT);
+    if (!span.last) return res.status(400).json({ error: 'No search terms are stored yet.' });
+    const range = searchTerms.rangeParam(
+      stResolveRange(stRangeFromQuery(req.query), span, _ptDate(new Date())));
 
     const fromCatalog = await asinNames.fillFromCatalog();
     let looked = 0;
     let failure = null;
     for (let i = 0; i < ST_NAME_BATCHES; i++) {
-      const batch = await asinNames.unresolved(month, { adProduct: ST_PRODUCT, limit: ST_NAME_BATCH });
+      const batch = await asinNames.unresolved(range, { adProduct: ST_PRODUCT, limit: ST_NAME_BATCH });
       if (!batch.length) break;
       try {
         if (i) await sleep(600);   // the catalog search allows about two a second
@@ -5730,9 +5725,9 @@ async function handleSearchTermsNames(req, res) {
       }
     }
 
-    const counts = await asinNames.counts(month, { adProduct: ST_PRODUCT });
+    const counts = await asinNames.counts(range, { adProduct: ST_PRODUCT });
     return res.status(200).json({
-      success: true, month, fromCatalog, looked, counts,
+      success: true, range, fromCatalog, looked, counts,
       remaining: counts.asins - counts.named,
       error: failure
     });
@@ -5754,6 +5749,54 @@ async function stNamesFor(values) {
     if (m) asins.push(m[1]);
   }
   return asins.length ? asinNames.lookup(asins) : {};
+}
+
+// ─── RANGES ──────────────────────────────────────────────────────────────────
+// The days a view reads. Every view but Negatives reads a range, chosen on the
+// page as a preset or two dates.
+//
+// Presets are anchored at the last day held, not at today: "last 30 days"
+// means the 30 most recent days there is data for. With `settled` the anchor
+// moves back to the last day whose sales have all landed — Amazon credits a
+// sale to the day of the click for 7 days, so the newest days read low until
+// then — and a range is never let past it.
+const ST_RANGE_PRESETS = ['last7', 'last30', 'last60', 'last90', 'thismonth', 'lastmonth', 'all', 'custom'];
+
+function stResolveRange({ preset, start, end, settled } = {}, span, today) {
+  const settledThrough = _addDays(today, -ST_SETTLE_DAYS);
+  let anchor = span.last;
+  if (settled && settledThrough < anchor) anchor = settledThrough;
+  const p = ST_RANGE_PRESETS.includes(preset) ? preset : 'last30';
+  let s;
+  let e = anchor;
+  if (/^last\d+$/.test(p)) {
+    s = _addDays(anchor, -(Number(p.slice(4)) - 1));
+  } else if (p === 'thismonth') {
+    s = `${anchor.slice(0, 7)}-01`;
+  } else if (p === 'lastmonth') {
+    const b = moMonthBounds(moShiftMonth(anchor.slice(0, 7), -1));
+    s = b.start;
+    e = b.end;
+  } else if (p === 'all') {
+    s = span.first;
+  } else {
+    s = DATE_RE.test(String(start || '')) ? String(start) : _addDays(anchor, -29);
+    e = DATE_RE.test(String(end || '')) ? String(end) : anchor;
+    if (s > e) [s, e] = [e, s];
+  }
+  // Inside what is held, and never past the anchor when settled.
+  if (s < span.first) s = span.first;
+  if (e > anchor) e = anchor;
+  if (s > e) s = e;
+  const unsettledFrom = _addDays(settledThrough, 1);
+  return {
+    preset: p, start: s, end: e, settled: !!settled, settledThrough,
+    unsettledDays: e >= unsettledFrom ? daySpan(s > unsettledFrom ? s : unsettledFrom, e) : 0
+  };
+}
+
+function stRangeFromQuery(q) {
+  return { preset: q.range, start: q.start, end: q.end, settled: String(q.settled) === '1' };
 }
 
 // The daily pull as the page shows it: how the last one went, and what the
@@ -5783,32 +5826,51 @@ async function handleSearchTermsGet(req, res) {
     const auth = await verifyGoogleToken(req);
     if (!auth.ok) return res.status(401).json({ error: auth.error });
 
-    const pulls = await searchTerms.listPulls();
+    const span = await searchTerms.storeSpan(ST_PRODUCT);
     const daily = await dailyState();
-    if (!pulls.length) {
+    if (!span.last) {
       return res.status(200).json({ success: true, empty: true, daily });
     }
 
-    const month = ST_MONTH_RE.test(String(req.query.month || ''))
-      ? String(req.query.month) : pulls[0].month;
-    const pull = pulls.find(p => p.month === month) || null;
-    const size = await searchTerms.tableBytes();
+    const range = stResolveRange(stRangeFromQuery(req.query), span, _ptDate(new Date()));
+    const [pulls, size, stats, asins, bids, portfolios, targetDays] = await Promise.all([
+      searchTerms.listPulls(), searchTerms.tableBytes(),
+      searchTerms.rangeStats(ST_PRODUCT, range),
+      asinNames.counts(searchTerms.rangeParam(range), { adProduct: ST_PRODUCT }),
+      targets.status(), searchTerms.portfolioNames(), targets.daySpan()
+    ]);
     const base = {
-      success: true, month, pulls, daily, size, pull,
-      asins: await asinNames.counts(month, { adProduct: ST_PRODUCT }),
-      bids: await targets.status(),
-      portfolios: await searchTerms.portfolioNames()
+      success: true, range, daily, size, stats, asins, bids, portfolios,
+      store: { first: span.first, last: span.last, rows: span.rows,
+               targetsFirst: targetDays.first, targetsLast: targetDays.last },
+      pulledAt: pulls.reduce((a, p) => (!a || (p.collectedAt && p.collectedAt > a) ? p.collectedAt : a), null)
     };
 
-    // Three depths of the same month: the products, the terms inside one, and
-    // the raw daily rows underneath. A product is where a decision is made —
-    // a cluster of terms with nothing to show for itself is one question about
+    // Depths of the same range: the products, the terms inside one, and the
+    // raw daily rows underneath. A product is where a decision is made — a
+    // cluster of terms with nothing to show for itself is one question about
     // that product, not fifty about terms.
-    const view = ['products', 'product-terms', 'targets', 'negatives', 'terms', 'rows', 'term', 'term-products']
+    const view = ['products', 'product-terms', 'targets', 'negatives', 'changes', 'terms', 'rows', 'term', 'term-products']
       .includes(String(req.query.view)) ? String(req.query.view) : 'products';
 
+    // What changed in the account, day by day, in the range.
+    if (view === 'changes') {
+      const page = await targets.byChange({
+        range, portfolioId: String(req.query.portfolio || '').trim() || null,
+        q: String(req.query.q || '').trim(),
+        kind: String(req.query.kind || '').trim() || null,
+        sort: req.query.sort, dir: req.query.dir,
+        limit: req.query.limit, offset: req.query.offset
+      });
+      return res.status(200).json({
+        ...base, view, rows: page.rows, total: page.total, kinds: page.kinds,
+        snapshotsSince: page.snapshotsSince,
+        names: await stNamesFor(page.rows.map(r => r.item))
+      });
+    }
+
     // One row per negative that is on, with what the term it blocks did in
-    // that campaign before and since. Every stored day, not the month.
+    // that campaign before and since. Every stored day, not the range.
     if (view === 'negatives') {
       const pick = (v, allowed) => (allowed.includes(String(v)) ? String(v) : null);
       const page = await targets.byNegative({
@@ -5830,7 +5892,7 @@ async function handleSearchTermsGet(req, res) {
 
     if (view === 'products') {
       return res.status(200).json({
-        ...base, view, products: await searchTerms.byProduct({ adProduct: ST_PRODUCT, month })
+        ...base, view, products: await searchTerms.byProduct({ adProduct: ST_PRODUCT, range })
       });
     }
 
@@ -5840,7 +5902,7 @@ async function handleSearchTermsGet(req, res) {
       const portfolio = String(req.query.portfolio || '').trim();
       if (!portfolio) return res.status(400).json({ error: 'portfolio parameter required' });
       const page = await searchTerms.byProductTerm({
-        adProduct: ST_PRODUCT, month, portfolioId: portfolio,
+        adProduct: ST_PRODUCT, range, portfolioId: portfolio,
         sort: req.query.sort, dir: req.query.dir,
         limit: req.query.limit, offset: req.query.offset,
         q: String(req.query.q || '').trim(), minClicks: req.query.minClicks,
@@ -5857,7 +5919,7 @@ async function handleSearchTermsGet(req, res) {
     if (view === 'term-products') {
       const term = String(req.query.term || '');
       if (!term) return res.status(400).json({ error: 'term parameter required' });
-      const spread = await searchTerms.termByProduct({ adProduct: ST_PRODUCT, month, searchTerm: term });
+      const spread = await searchTerms.termByProduct({ adProduct: ST_PRODUCT, range, searchTerm: term });
       return res.status(200).json({ ...base, view, term, ...spread });
     }
 
@@ -5867,7 +5929,7 @@ async function handleSearchTermsGet(req, res) {
     if (view === 'term') {
       const term = String(req.query.term || '');
       if (!term) return res.status(400).json({ error: 'term parameter required' });
-      const detail = await searchTerms.termDetail({ adProduct: ST_PRODUCT, month, searchTerm: term });
+      const detail = await searchTerms.termDetail({ adProduct: ST_PRODUCT, range, searchTerm: term });
       return res.status(200).json({
         ...base, view, term, detail,
         names: await stNamesFor([term, ...detail.map(d => d.matched)])
@@ -5875,11 +5937,11 @@ async function handleSearchTermsGet(req, res) {
     }
 
     // One row per keyword or target: the bid as of the last pull beside what
-    // the target did in this month.
+    // the target did in the range.
     if (view === 'targets') {
       const pick = (v, allowed) => (allowed.includes(String(v)) ? String(v) : null);
       const page = await targets.byTarget({
-        adProduct: ST_PRODUCT, month,
+        adProduct: ST_PRODUCT, range,
         portfolioId: String(req.query.portfolio || '').trim() || null,
         q: String(req.query.q || '').trim(),
         match: String(req.query.match || '').trim() || null,
@@ -5896,7 +5958,7 @@ async function handleSearchTermsGet(req, res) {
     }
 
     const common = {
-      adProduct: ST_PRODUCT, month,
+      adProduct: ST_PRODUCT, range,
       sort: req.query.sort, dir: req.query.dir,
       limit: req.query.limit, offset: req.query.offset,
       q: String(req.query.q || '').trim(), minClicks: req.query.minClicks
@@ -5908,7 +5970,7 @@ async function handleSearchTermsGet(req, res) {
     // spend. A term only one product pays for reads better inside that product.
     const page = view === 'terms'
       ? await searchTerms.byTerm({ ...common, onlyDead: String(req.query.onlyDead) === '1', minProducts: 2 })
-      : await searchTerms.getMonth(common);
+      : await searchTerms.getRows(common);
 
     return res.status(200).json({
       ...base, view, rows: page.rows, total: page.total,
@@ -6411,6 +6473,7 @@ export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          ST_REPORT_COLUMNS, ST_REPORT_KEY, ST_SETTLE_DAYS,
          TD_REPORT_COLUMNS, TD_REPORT_KEY, TD_OPTIONAL_COLUMNS,
          negNormalize, productAdNormalize, tgDate, NEG_LISTS, dailyRequestOne, dailyPlans,
+         stResolveRange, ST_RANGE_PRESETS,
          tgNormalizeKeyword, tgNormalizeTarget, tgParseRecommendations, tgRange,
          tgMatchRecommendations, tgVersionRefused, tgShortError, tgSuggestionWork,
          TG_REC_VERSIONS, TG_REC_BATCH, tgBusy };

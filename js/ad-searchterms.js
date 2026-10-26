@@ -1,6 +1,7 @@
     // ─── SEARCH TERMS ────────────────────────────────────────────────────────
-    // What shoppers actually typed, stored day by day and read a month at a
-    // time, beside every keyword and target with its bid.
+    // What shoppers actually typed, stored day by day and read over any range
+    // of days, beside every keyword and target with its bid, and a log of what
+    // changed in the account.
     //
     // A reader: no lists, no recommendations, nothing written to Amazon. The
     // negative and graduation lists come later and will be built from the
@@ -24,7 +25,11 @@
     let stBusy = false;
     let stBound = false;
     let stData = null;
-    let stMonth = '';          // the stored month on screen
+    // The days every view but Negatives reads: one of the presets, or two
+    // dates. The server works out the dates from the preset, anchored at the
+    // last day held; `start` and `end` keep what it resolved to, so choosing
+    // Custom starts from the dates already on screen.
+    let stRange = { preset: 'last30', start: '', end: '', settled: false };
     let stSort = 'cost';
     let stDir = 'desc';
     let stQuery = '';
@@ -64,6 +69,11 @@
     let stNgLevel = '';
     let stNgCampaignType = '';
 
+    // The Changes tab's filters.
+    let stChProduct = '';
+    let stChQuery = '';
+    let stChKind = '';
+
     // Every click fires a request and they can come back out of order; the
     // slowest query is the one inside a product. Each request takes a number,
     // and only the latest may draw — otherwise a slow answer to an earlier
@@ -75,8 +85,9 @@
     // another tab may not exist here, and would quietly fall back to spend —
     // possibly ascending, with no arrow showing it.
     function stResetSort() {
-      // Negatives read newest first: what was blocked lately is the question.
-      stSort = stView === 'negatives' ? 'added' : 'cost';
+      // Negatives and changes read newest first: what happened lately is the
+      // question there.
+      stSort = stView === 'negatives' ? 'added' : stView === 'changes' ? 'date' : 'cost';
       stDir = 'desc';
     }
     let stNames = {};          // ASIN -> { title, brand, found } for what is on screen
@@ -114,13 +125,17 @@
           limit: String(ST_PAGE_SIZE), offset: String(stOffset),
           minClicks: String(stMinClicks)
         });
-        if (stMonth) qs.set('month', stMonth);
+        stRangeQuery(qs);
         if (stView === 'targets') {
           if (stTgQuery) qs.set('q', stTgQuery);
           if (stTgProduct) qs.set('portfolio', stTgProduct);
           if (stTgMatch) qs.set('match', stTgMatch);
           if (stTgState) qs.set('state', stTgState);
           if (stTgPosition) qs.set('position', stTgPosition);
+        } else if (stView === 'changes') {
+          if (stChQuery) qs.set('q', stChQuery);
+          if (stChProduct) qs.set('portfolio', stChProduct);
+          if (stChKind) qs.set('kind', stChKind);
         } else if (stView === 'negatives') {
           if (stNgQuery) qs.set('q', stNgQuery);
           if (stNgProduct) qs.set('portfolio', stNgProduct);
@@ -144,7 +159,7 @@
         if (data.empty) {
           stRenderIdle(data);
         } else {
-          stMonth = data.month;
+          if (data.range) stRange = { ...stRange, start: data.range.start, end: data.range.end };
           stRender(data);
         }
         if (after) stSetStatus(after);
@@ -331,11 +346,11 @@
     }
 
     async function stNameAsins() {
-      if (stNaming || !accessToken || !stMonth) return;
+      if (stNaming || !accessToken) return;
       stNaming = true;
       stSetStatus('Naming ASINs — your catalog first, then Amazon\'s…');
       try {
-        const res = await fetch(`/api/adspend?action=searchterms-names&month=${encodeURIComponent(stMonth)}`, {
+        const res = await fetch(`/api/adspend?action=searchterms-names&${stRangeQuery(new URLSearchParams())}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
@@ -508,14 +523,15 @@
     function stRender(data) {
       const container = document.getElementById('adsearchterms-content');
       if (!container) return;
-      const pull = data.pull || {};
-      stSetBlurb(`${stMonthLabel(data.month)} · ${formatCount(pull.rows || 0)} rows · pulled ${
-        pull.collectedAt ? _svTimeAgo(pull.collectedAt) : 'just now'}`);
+      const r = data.range || {};
+      stSetBlurb(`${stRangeLabel(r.start, r.end)} · ${formatCount((data.stats || {}).rows || 0)} rows · pulled ${
+        data.pulledAt ? _svTimeAgo(data.pulledAt) : 'just now'}`);
       stProductLabels = stBuildProductLabels(data.portfolios || []);
       const body = data.view === 'products' ? stProductTable(data)
                  : data.view === 'product-terms' ? stProductTermTable(data)
                  : data.view === 'targets' ? stTargetTable(data)
                  : data.view === 'negatives' ? stNegativeTable(data)
+                 : data.view === 'changes' ? stChangeTable(data)
                  : stTable(data);
       container.innerHTML =
         stControls(data) + body + stStats(data) + stFooter(data);
@@ -525,7 +541,6 @@
     }
 
     function stControls(data) {
-      const months = (data.pulls || []).map(p => p.month);
       const tab = (key, label) =>
         `<button class="tab${stView === key ? ' active' : ''}" data-st-view="${key}">${label}</button>`;
       // The term tables filter on the server; the product rollup filters here.
@@ -534,7 +549,7 @@
         ? [...new Set((data.products || []).map(r => r.brand || '—'))].sort() : [];
       return `
         <div class="tabs">
-          ${tab('products', 'Products')}${tab('targets', 'Targets')}${tab('negatives', 'Negatives')}${tab('terms', 'Shared terms')}${tab('rows', 'Daily rows')}
+          ${tab('products', 'Products')}${tab('targets', 'Targets')}${tab('negatives', 'Negatives')}${tab('changes', 'Changes')}${tab('terms', 'Shared terms')}${tab('rows', 'Daily rows')}
         </div>
         ${stPortfolio && data.view === 'product-terms' ? `
         <div class="st-crumb">
@@ -543,13 +558,7 @@
             escapeHtml(stProductLabel(stPortfolio.id, stPortfolio.name))}</strong>
         </div>` : ''}
         <div class="card card-flat wk-controls">
-          ${data.view === 'negatives' ? '' : `<label class="wk-field">
-            <span>Stored month</span>
-            <select data-st-month>
-              ${months.map(m => `<option value="${escapeHtml(m)}"${
-                m === data.month ? ' selected' : ''}>${escapeHtml(stMonthLabel(m))}</option>`).join('')}
-            </select>
-          </label>`}
+          ${data.view === 'negatives' ? '' : stRangeControls(data)}
           ${data.view === 'products' ? `
           <label class="wk-field">
             <span>Product contains</span>
@@ -572,6 +581,7 @@
           </label>` : ''}
           ${data.view === 'targets' ? stTargetFilters(data) : ''}
           ${data.view === 'negatives' ? stNegativeFilters(data) : ''}
+          ${data.view === 'changes' ? stChangeFilters(data) : ''}
           ${data.view === 'product-terms' ? `
           <label class="wk-field">
             <span>Match type</span>
@@ -602,7 +612,69 @@
           </label>` : ''}
           <span class="wk-spacer"></span>
           ${stNameButton(data)}
-        </div>`;
+        </div>
+        ${stUnsettledNote(data)}`;
+    }
+
+    // ── DATES ────────────────────────────────────────────────────────────────
+    const ST_RANGE_PRESETS = [
+      ['last7', 'Last 7 days'], ['last30', 'Last 30 days'], ['last60', 'Last 60 days'],
+      ['last90', 'Last 90 days'], ['thismonth', 'This month'], ['lastmonth', 'Last month'],
+      ['all', 'Every stored day'], ['custom', 'Custom…']
+    ];
+
+    // The range on the query string, as every request carries it.
+    function stRangeQuery(qs) {
+      qs.set('range', stRange.preset);
+      if (stRange.preset === 'custom') {
+        if (stRange.start) qs.set('start', stRange.start);
+        if (stRange.end) qs.set('end', stRange.end);
+      }
+      if (stRange.settled) qs.set('settled', '1');
+      return qs;
+    }
+
+    function stRangeControls(data) {
+      const store = data.store || {};
+      const r = data.range || {};
+      const opt = (value, label, current) =>
+        `<option value="${value}"${current === value ? ' selected' : ''}>${label}</option>`;
+      return `
+        <label class="wk-field">
+          <span>Dates</span>
+          <select data-st-range>
+            ${ST_RANGE_PRESETS.map(([k, label]) => opt(k, label, stRange.preset)).join('')}
+          </select>
+        </label>
+        ${stRange.preset === 'custom' ? `
+        <label class="wk-field">
+          <span>From</span>
+          <input type="date" data-st-from value="${escapeHtml(r.start || '')}"
+                 min="${escapeHtml(store.first || '')}" max="${escapeHtml(store.last || '')}">
+        </label>
+        <label class="wk-field">
+          <span>To</span>
+          <input type="date" data-st-to value="${escapeHtml(r.end || '')}"
+                 min="${escapeHtml(store.first || '')}" max="${escapeHtml(store.last || '')}">
+        </label>` : ''}
+        ${data.view === 'changes' ? '' : `
+        <label class="wk-field">
+          <span>Days</span>
+          <select data-st-settled>
+            ${opt('0', 'All', stRange.settled ? '1' : '0')}${opt('1', 'Settled only', stRange.settled ? '1' : '0')}
+          </select>
+        </label>`}`;
+    }
+
+    // Amazon credits a sale to the day of the click for 7 days, so the newest
+    // days in a range read low until then. Said wherever it is so.
+    function stUnsettledNote(data) {
+      const r = data.range || {};
+      if (!r.unsettledDays || data.view === 'negatives' || data.view === 'changes') return '';
+      return `<p class="arf-muted st-unsettled">The last ${formatCount(r.unsettledDays)} ${
+        r.unsettledDays === 1 ? 'day' : 'days'} here, after ${escapeHtml(stDayLabel(r.settledThrough))}, are still
+        collecting sales — Amazon credits a sale to the click for 7 days — so their orders and sales
+        will rise. "Settled only" leaves them out.</p>`;
     }
 
     // ── ONE PRODUCT'S TERMS ──────────────────────────────────────────────────
@@ -816,7 +888,7 @@
     // search box keeps its cursor while the list narrows under it.
     function stProductTableBody(data) {
       const all = data.products || [];
-      if (!all.length) return '<p class="arf-none">No products in this month.</p>';
+      if (!all.length) return '<p class="arf-none">No products in these dates.</p>';
       const rows = stProductRowsShown(all);
       const head = ST_PRODUCT_COLS.map(c => {
         const active = stProdSort === c.key;
@@ -828,9 +900,9 @@
       return `
         <h4>By product</h4>
         <p class="arf-blurb">
-          Every search term this month, grouped by the product that paid for it. A term matched
-          by three campaigns counts once. "No orders" counts the terms with no orders this
-          month, and what they cost.
+          Every search term in these dates, grouped by the product that paid for it. A term
+          matched by three campaigns counts once. "No orders" counts the terms with no orders in
+          these dates, and what they cost.
         </p>
         <p class="arf-muted st-shown">${rows.length === all.length
           ? `${formatCount(all.length)} products`
@@ -913,53 +985,57 @@
     }
 
     // The measurement the first pull exists to produce.
+    // The range's search term totals, then what the store holds. Search terms
+    // reach back further than the targeting report, which started on the
+    // first daily pull, so the two are given their own first days.
     function stStats(data) {
-      const s = data.pull;
+      const s = data.stats;
       if (!s) return '';
+      const store = data.store || {};
       const size = data.size || {};
       const cell = (label, value, hint) =>
         `<div class="wk-stat"><span class="wk-stat-label">${label}</span>
            <span class="wk-stat-value">${value}</span>${
              hint ? `<span class="arf-muted" style="font-size: 0.7rem;">${hint}</span>` : ''}</div>`;
-      const covers = s.coveredStart && s.coveredEnd
-        ? `${s.coveredStart} to ${s.coveredEnd}` : '—';
       return `
-        <h4 class="st-storage-head">Stored data</h4>
-        ${s.partial ? `<div class="bw-newer" style="margin-bottom: 1.25rem;">
-          <div><strong>This month is short.</strong>
-            <span class="arf-muted">Amazon had it only from ${escapeHtml(s.coveredStart)}.
-            Its search term history reaches back about 65 days, and the earlier days of
-            ${escapeHtml(stMonthLabel(s.month))} were already gone when it was pulled.</span></div>
-        </div>` : ''}
+        <h4 class="st-storage-head">In these dates, and stored</h4>
         <div class="card card-flat wk-stats">
-          ${cell('Covers', covers, s.partial ? 'missing its first days'
-            : s.coveredEnd && s.coveredEnd < stMonthEnd(s.month) ? 'so far — filling in daily' : 'the whole month')}
+          ${cell('Dates', escapeHtml(stRangeLabel(s.first, s.last) || '—'), 'days with search terms')}
           ${cell('Rows', formatCount(s.rows || 0))}
           ${cell('Distinct terms', formatCount(s.terms || 0))}
-          ${cell('Never clicked', stPct(s.zeroClick, s.rows), `${formatCount(s.zeroClick || 0)} rows`)}
           ${cell('Clicks', formatCount(s.clicks || 0))}
           ${cell('Spend', stMoney(s.cost))}
-          ${cell('This month on disk', stBytes(s.dataBytes))}
+          ${cell('Sales', stMoney(s.sales), `ROAS ${stRoas(s.sales, s.cost)}`)}
+          ${cell('Search terms stored', escapeHtml(stRangeLabel(store.first, store.last) || '—'),
+                 `${formatCount(store.rows || 0)} rows`)}
+          ${cell('Target figures stored', escapeHtml(stRangeLabel(store.targetsFirst, store.targetsLast) || '—'),
+                 'each keyword and target, daily')}
           ${cell('Table total', stBytes(size.total), `${stBytes(size.indexes)} of it indexes`)}
         </div>`;
     }
 
     // ── TARGETS ──────────────────────────────────────────────────────────────
     // One row per keyword or target: its bid, Amazon's suggested range, and
-    // what it did in the stored month. A bid belongs to a target, not to a
+    // what it did in the dates on screen. A bid belongs to a target, not to a
     // search term — one target matches many terms and one term is matched by
     // many targets — so this is the table bids live in.
     //
+    // The figures are the targeting report's: every impression the target
+    // won, not only those of searches that got a click, and its share of the
+    // top of search — the column that says whether a bid is in the auction.
+    //
     // Two times on one row: the bid and the range are as of the last Pull
-    // bids, the figures are the month on screen. The heading says both.
+    // bids, the figures are the dates on screen. The heading says both.
     const ST_TARGET_COLS = [
       { key: 'target', label: 'Target', sortable: true, text: true },
       { key: 'match', label: 'Match type', sortable: true, text: true },
       { key: 'state', label: 'Status', sortable: true, text: true },
       { key: 'bid', label: 'Bid', sortable: true, right: true },
-      { key: 'low', label: 'Low', sortable: true, right: true },
       { key: 'mid', label: 'Suggested', sortable: true, right: true },
-      { key: 'high', label: 'High', sortable: true, right: true },
+      { key: 'low', label: 'Amazon range', sortable: true, right: true },
+      { key: 'impressions', label: 'Impr.', sortable: true, right: true },
+      { key: 'ctr', label: 'CTR', sortable: true, right: true },
+      { key: 'top', label: 'Top %', title: 'Share of the top-of-search impressions it was eligible for', sortable: true, right: true },
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'cpc', label: 'CPC', sortable: true, right: true },
@@ -1028,7 +1104,7 @@
       const rows = data.rows || [];
       const head = ST_TARGET_COLS.map(c => {
         const names = [c.right && 'arf-r', c.cls].filter(Boolean).join(' ');
-        const cls = names ? ` class="${names}"` : '';
+        const cls = `${names ? ` class="${names}"` : ''}${c.title ? ` title="${escapeHtml(c.title)}"` : ''}`;
         if (!c.sortable) return `<th${cls}>${c.label}</th>`;
         const active = stSort === c.key;
         return `<th${cls}><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
@@ -1038,11 +1114,14 @@
         <div class="arf-section">
           <h4>Targets · every keyword and target</h4>
           <p class="arf-blurb">
-            Each keyword and target with the bid it carries, Amazon's suggested range for it, and
-            what it did in ${escapeHtml(stMonthLabel(data.month))}. The bid and the range are as of the
-            last pull, ${escapeHtml(_svTimeAgo(bids.pulledAt))}; the clicks and spend are the month's.
-            Low, Suggested and High are Amazon's. "default" marks a target bidding its ad group's
-            default rather than a bid of its own.
+            Each keyword and target with the bid it carries, Amazon's suggested bid and range for
+            it, and what it did ${escapeHtml(stRangeLabel((data.range || {}).start, (data.range || {}).end))}.
+            The bid and the range are as of the last pull, ${escapeHtml(_svTimeAgo(bids.pulledAt))}; the
+            figures are the dates'. Impressions are every one the target won, and Top of search is
+            its share of the top-of-search impressions it was eligible for. "default" marks a
+            target bidding its ad group's default rather than a bid of its own.${
+              (data.store || {}).targetsFirst && (data.range || {}).start < data.store.targetsFirst
+                ? ` Target figures start ${escapeHtml(stDayLabel(data.store.targetsFirst))}, so days before it are empty here.` : ''}
           </p>
           ${stSuggestLine(bids)}
           ${rows.length ? `
@@ -1073,14 +1152,17 @@
       const campaignOff = r.campaignState && r.campaignState !== 'ENABLED';
       const note = r.note ? ` title="${escapeHtml(r.note)}"` : '';
       return `<tr>
-        <td class="arf-name">${stCut(stTargetLabel(r), stTargetTitle(r), 'st-cut-target')}</td>
+        <td class="arf-name">${stCut(stTargetLabel(r), stTargetTitle(r), 'st-cut-target-narrow')}</td>
         <td>${escapeHtml(r.matchLabel || '—')}</td>
         <td>${paused ? 'Paused' : r.state === 'ENABLED' ? 'Enabled' : escapeHtml(r.state || '—')}${
           campaignOff ? ` <span class="arf-muted">campaign ${escapeHtml(String(r.campaignState).toLowerCase())}</span>` : ''}</td>
         <td class="arf-r arf-em">${stBidCell(r)}</td>
-        <td class="arf-r"${note}>${stMoneyOrDash(r.low)}</td>
         <td class="arf-r"${note}>${stMoneyOrDash(r.mid)}</td>
-        <td class="arf-r"${note}>${stMoneyOrDash(r.high)}</td>
+        <td class="arf-r"${note}>${r.low !== null && r.low !== undefined && r.high !== null && r.high !== undefined
+          ? `${stMoney(r.low)}–${stMoney(r.high)}` : '—'}</td>
+        <td class="arf-r">${formatCount(r.impressions || 0)}</td>
+        <td class="arf-r">${r.impressions > 0 ? stPctOf(r.clicks || 0, r.impressions) : '—'}</td>
+        <td class="arf-r">${r.topShare === null || r.topShare === undefined ? '—' : stShare(r.topShare)}</td>
         <td class="arf-r arf-em">${formatCount(r.clicks || 0)}</td>
         <td class="arf-r">${stMoney(r.cost || 0)}</td>
         <td class="arf-r">${r.clicks > 0 ? stMoney(r.cost / r.clicks) : '—'}</td>
@@ -1088,7 +1170,7 @@
         <td class="arf-r">${stMoney(r.sales || 0)}</td>
         <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
         <td>${stCut(escapeHtml(r.campaign || '—'),
-                    [r.campaign, r.portfolio].filter(Boolean).join(' · '))}</td>
+                    [r.campaign, r.portfolio].filter(Boolean).join(' · '), 'st-cut-campaign')}</td>
       </tr>`;
     }
 
@@ -1126,6 +1208,115 @@
 
     function stMoneyOrDash(n) {
       return typeof n === 'number' && isFinite(n) ? stMoney(n) : '—';
+    }
+
+    // ── CHANGES ──────────────────────────────────────────────────────────────
+    // What changed in the account, day by day: keywords and targets added,
+    // negatives added — dated by Amazon, so back as far as the account goes —
+    // and bids raised or lowered, targets paused, enabled or archived, as the
+    // morning snapshots found them. Nothing in this dashboard changes the
+    // account yet, so all of it is Ad Badger's or made by hand.
+    const ST_CHANGE_KINDS = {
+      keyword: 'Keyword added', target: 'Target added', negative: 'Negative added',
+      bid_up: 'Bid raised', bid_down: 'Bid lowered', bid: 'Bid changed',
+      paused: 'Paused', enabled: 'Enabled', removed: 'Archived'
+    };
+
+    const ST_CHANGE_COLS = [
+      { key: 'date', label: 'Date' },
+      { key: 'kind', label: 'Change', text: true },
+      { key: 'item', label: 'What', text: true },
+      { key: 'detail', label: 'Detail', sortable: false },
+      { key: 'campaignType', label: 'Campaign type', text: true },
+      { key: 'product', label: 'Product', text: true }
+    ];
+
+    function stChangeFilters(data) {
+      const kinds = data.kinds || {};
+      const opt = (value, label, current) =>
+        `<option value="${escapeHtml(value)}"${current === value ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+      return `
+        <label class="wk-field">
+          <span>Contains</span>
+          <input type="search" data-st-cq value="${escapeHtml(stChQuery)}" placeholder="any">
+        </label>
+        <div class="wk-field st-pick-field">
+          <span>Product</span>
+          ${stProductPicker('ch', data.portfolios || [], stChProduct)}
+        </div>
+        <label class="wk-field">
+          <span>Change</span>
+          <select data-st-ch>
+            ${opt('', 'any', stChKind)}
+            ${Object.entries(ST_CHANGE_KINDS).map(([k, label]) =>
+              opt(k, `${label.toLowerCase()} (${formatCount(kinds[k] || 0)})`, stChKind)).join('')}
+          </select>
+        </label>`;
+    }
+
+    function stChangeTable(data) {
+      const rows = data.rows || [];
+      const kinds = data.kinds || {};
+      const head = ST_CHANGE_COLS.map(c => {
+        if (c.sortable === false) return `<th>${c.label}</th>`;
+        const active = stSort === c.key;
+        return `<th><button class="arf-btn${active ? ' arf-btn-go' : ''}" data-st-sort="${c.key}">${
+          c.label}${active ? (stDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
+      }).join('');
+      const tally = Object.entries(ST_CHANGE_KINDS).filter(([k]) => kinds[k])
+        .map(([k, label]) => `${formatCount(kinds[k])} ${label.toLowerCase()}`).join(' · ');
+      const since = data.snapshotsSince ? stDayLabel(stPtDay(data.snapshotsSince)) : null;
+      return `
+        <div class="arf-section">
+          <h4>Changes · what changed in the account</h4>
+          <p class="arf-blurb">
+            Keywords, targets and negatives added are dated by Amazon, so they reach back as far as
+            the account does. Bids raised or lowered and targets paused, enabled or archived come from
+            the morning snapshots — Amazon keeps no history of them — so they begin ${
+              since ? `with the snapshot of ${escapeHtml(since)}` : 'with the first snapshot'}, and each is
+            dated the morning it was found, having happened since the snapshot before. Nothing in
+            this dashboard changes the account yet, so all of it is Ad Badger's or made by hand.
+          </p>
+          <p class="arf-muted st-shown">${tally || 'Nothing changed in these dates.'}</p>
+          ${rows.length ? `
+          <div class="arf-table-wrap">
+            <table class="table-fill arf-table st-oneline">
+              <thead><tr>${head}</tr></thead>
+              <tbody>${rows.map(stChangeRow).join('')}</tbody>
+            </table>
+          </div>
+          ${stPager(data)}` : '<p class="arf-none">No changes match these filters.</p>'}
+        </div>`;
+    }
+
+    function stChangeRow(r) {
+      const muted = (t) => ` <span class="arf-muted">${t}</span>`;
+      // A snapshot dates a change the morning it was found; when it actually
+      // happened is somewhere since the snapshot before, which is on hover.
+      const when = r.source === 'snapshot' && r.previousAt
+        ? ` title="Found the morning of ${escapeHtml(stDayLabel(r.day))}, changed some time after ${
+            escapeHtml(new Date(r.previousAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))} Pacific"`
+        : (r.at ? ` title="${escapeHtml(new Date(r.at).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }))} Pacific"` : '');
+      let detail = escapeHtml(r.detail || '');
+      if (/^bid/.test(r.kind)) {
+        const money = (v) => (/^[0-9.]+$/.test(String(v || '')) ? stMoney(Number(v)) : escapeHtml(v || '—'));
+        const change = /^[0-9.]+$/.test(String(r.from || '')) && /^[0-9.]+$/.test(String(r.to || '')) && Number(r.from) > 0
+          ? muted(`${Number(r.to) > Number(r.from) ? '+' : '−'}${Math.round(Math.abs(Number(r.to) / Number(r.from) - 1) * 100)}%`) : '';
+        detail = `${money(r.from)} → ${money(r.to)}${change}${r.detail ? muted(escapeHtml(r.detail)) : ''}`;
+      } else if (r.kind === 'paused' || r.kind === 'enabled' || r.kind === 'removed') {
+        detail = `${escapeHtml(r.detail || '')}${r.from ? muted(`was ${escapeHtml(String(r.from).toLowerCase())}`) : ''}`;
+      }
+      const label = ST_CHANGE_KINDS[r.kind] || r.kind;
+      const item = r.kind === 'negative' || r.kind === 'keyword' ? stNegativeLabel({ text: r.item }) : stTargetLabel({ text: r.item });
+      return `<tr>
+        <td${when}>${escapeHtml(stDayLabel(r.day))}${r.source === 'snapshot' ? muted('found') : ''}</td>
+        <td>${escapeHtml(label)}</td>
+        <td class="arf-name">${stCut(item, r.item, 'st-cut-target')}</td>
+        <td>${detail}</td>
+        <td>${escapeHtml(r.campaignType || '—')}</td>
+        <td>${stCut(escapeHtml(stProductLabel(r.portfolioId, r.portfolio)),
+                    [r.portfolio, r.campaign].filter(Boolean).join(' · '), 'st-cut-product')}</td>
+      </tr>`;
     }
 
     // ── NEGATIVES ────────────────────────────────────────────────────────────
@@ -1314,7 +1505,7 @@
         <div class="arf-section">
           <h4>Shared terms · bid on by two or more products</h4>
           <p class="arf-blurb">
-            The searches more than one of your products paid for this month, one row per term
+            The searches more than one of your products paid for in these dates, one row per term
             across the whole account. "N products" is how many. Open a term to see each product,
             campaign and target that matched it. A term only one product pays for is in that
             product, on the Products tab.
@@ -1400,9 +1591,9 @@
         // Inside a product the question is "what does this cost everywhere";
         // across the account it is "which campaigns matched it".
         const inProduct = stWhich() === 'product-terms';
-        const qs = new URLSearchParams({
-          view: inProduct ? 'term-products' : 'term', term, month: stMonth
-        });
+        const qs = stRangeQuery(new URLSearchParams({
+          view: inProduct ? 'term-products' : 'term', term
+        }));
         const res = await fetch(`/api/adspend?action=searchterms-get&${qs}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -1482,19 +1673,15 @@
         </div>`;
     }
 
-    function stFooter(data) {
-      const pulls = data.pulls || [];
+    function stFooter() {
       return `
         <div class="card card-flat arf-footer">
           <div class="arf-muted">Sponsored Products only, pulled every morning. Rows are kept per
             day, because Amazon credits a sale to the day of the click for 7 days afterwards — so
             each pull re-fetches the last 8 days to collect the conversions that have landed since,
             and carries on from the last day stored if a morning was missed. A pull rewrites only
-            the days it brings back, so one that Amazon answers short never trims what is held.</div>
-          ${pulls.length > 1
-            ? `<div class="arf-muted">Stored: ${pulls.map(p =>
-                `${escapeHtml(stMonthLabel(p.month))} (${formatCount(p.rows)})`).join(' · ')}</div>`
-            : ''}
+            the days it brings back, so one that Amazon answers short never trims what is held.
+            Amazon keeps about 65 days of search terms; what is stored here is kept.</div>
         </div>`;
     }
 
@@ -1552,6 +1739,7 @@
           const id = pickValue.dataset.stPickValue;
           if (which === 'tg') stTgProduct = id;
           if (which === 'ng') stNgProduct = id;
+          if (which === 'ch') stChProduct = id;
           stOffset = 0;
           return stFetch();
         }
@@ -1577,7 +1765,8 @@
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;
-          const cols = stView === 'targets' ? ST_TARGET_COLS : stView === 'negatives' ? ST_NEGATIVE_COLS : [];
+          const cols = stView === 'targets' ? ST_TARGET_COLS : stView === 'negatives' ? ST_NEGATIVE_COLS
+                     : stView === 'changes' ? ST_CHANGE_COLS : [];
           const textCol = (cols.find(c => c.key === key) || {}).text;
           if (stSort === key) stDir = stDir === 'asc' ? 'desc' : 'asc';
           else { stSort = key; stDir = textCol ? 'asc' : 'desc'; }
@@ -1593,8 +1782,22 @@
       });
 
       el.addEventListener('change', e => {
-        const month = e.target.closest('[data-st-month]');
-        if (month) { stMonth = month.value; stOffset = 0; return stFetch(); }
+        // The dates. A preset is resolved by the server; Custom starts from
+        // the dates already on screen, and either date input moves to Custom.
+        const range = e.target.closest('[data-st-range]');
+        if (range) { stRange = { ...stRange, preset: range.value }; stOffset = 0; stDetail = null; return stFetch(); }
+        const from = e.target.closest('[data-st-from]');
+        const to = e.target.closest('[data-st-to]');
+        if (from || to) {
+          stRange = { ...stRange, preset: 'custom',
+                      start: from ? from.value : stRange.start, end: to ? to.value : stRange.end };
+          stOffset = 0; stDetail = null;
+          return stFetch();
+        }
+        const settled = e.target.closest('[data-st-settled]');
+        if (settled) { stRange = { ...stRange, settled: settled.value === '1' }; stOffset = 0; stDetail = null; return stFetch(); }
+        const ch = e.target.closest('[data-st-ch]');
+        if (ch) { stChKind = ch.value; stOffset = 0; return stFetch(); }
         const clicks = e.target.closest('[data-st-clicks]');
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
@@ -1650,6 +1853,8 @@
         if (tq && e.key === 'Enter') { stTgQuery = tq.value.trim(); stOffset = 0; stFetch(); }
         const nq = e.target.closest('[data-st-nq]');
         if (nq && e.key === 'Enter') { stNgQuery = nq.value.trim(); stOffset = 0; stFetch(); }
+        const cq = e.target.closest('[data-st-cq]');
+        if (cq && e.key === 'Enter') { stChQuery = cq.value.trim(); stOffset = 0; stFetch(); }
       });
 
       stBound = true;
@@ -1794,18 +1999,23 @@
       return `${names[m - 1]} ${d}`;
     }
 
-    function stMonthEnd(ym) {
-      const [y, m] = String(ym || '').split('-').map(Number);
-      if (!y || !m) return '';
-      return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    // A count as a share of another, to two places when it is small: CTR on
+    // this account sits under one percent.
+    function stPctOf(part, whole) {
+      if (!whole) return '—';
+      const pct = (100 * part) / whole;
+      return `${pct < 10 ? pct.toFixed(2) : pct.toFixed(1)}%`;
     }
 
-    function stMonthLabel(ym) {
-      if (!ym) return '—';
-      const [y, m] = String(ym).split('-').map(Number);
-      const names = ['January', 'February', 'March', 'April', 'May', 'June',
-                     'July', 'August', 'September', 'October', 'November', 'December'];
-      return `${names[(m || 1) - 1]} ${y}`;
+    // Amazon's top-of-search share, already a percentage.
+    function stShare(n) {
+      return `${n < 10 ? Number(n).toFixed(1) : Math.round(n)}%`;
+    }
+
+    // The Pacific calendar day of a moment.
+    function stPtDay(iso) {
+      const d = new Date(iso);
+      return isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
     }
 
     // Spend as a share of the sales it was credited with. Blank, not infinite,
