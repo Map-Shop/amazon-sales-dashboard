@@ -385,23 +385,25 @@
     // A row per way this product matched a term. Rows for one term sit
     // together, ordered by what that term costs this product, then down the
     // funnel — Auto found it, Broad widened it, Exact targets it.
+    const ST_PRODUCT_TERM_COLS = [
+      { key: 'searchTerm', label: 'Search term', sortable: true },
+      { key: 'type', label: 'Match type' },
+      { key: 'matched', label: 'Matched by' },
+      { key: 'clicks', label: 'Clicks', sortable: true, right: true },
+      { key: 'cost', label: 'Spend', sortable: true, right: true },
+      { key: 'orders', label: 'Orders', sortable: true, right: true },
+      { key: 'sales', label: 'Sales', sortable: true, right: true },
+      { key: 'roas', label: 'ROAS', right: true },
+      // Reference rather than data, so it sits after the numbers.
+      { key: 'product', label: 'Product' }
+    ];
+
     function stProductTermTable(data) {
       const rows = data.rows || [];
       if (!rows.length) {
         return '<div class="arf-section"><p class="arf-none">No terms match these filters.</p></div>';
       }
-      const cols = [
-        { key: 'searchTerm', label: 'Search term', sortable: true },
-        { key: 'type', label: 'Match type' },
-        { key: 'matched', label: 'Matched by' },
-        { key: 'clicks', label: 'Clicks', sortable: true, right: true },
-        { key: 'cost', label: 'Spend', sortable: true, right: true },
-        { key: 'orders', label: 'Orders', sortable: true, right: true },
-        { key: 'sales', label: 'Sales', sortable: true, right: true },
-        // Reference rather than data, so it sits after the numbers.
-        { key: 'product', label: 'Product' }
-      ];
-      const head = cols.map(c => {
+      const head = ST_PRODUCT_TERM_COLS.map(c => {
         const cls = c.right ? ' class="arf-r"' : '';
         if (!c.sortable) return `<th${cls}>${c.label}</th>`;
         const active = stSort === c.key;
@@ -445,6 +447,7 @@
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
+        <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
         <td>${first ? stProductCell(r.searchTerm) : ''}</td>
       </tr>${open && stIsLastOfTerm(r) ? stSpreadRow() : ''}`;
     }
@@ -459,44 +462,44 @@
 
     // What the opened term costs everywhere: its own total first, then every
     // other product paying for the same search.
+    //
+    // These are rows of the table above, not a table inside it, so every
+    // number lands in the same column as the figure it is compared with. The
+    // label goes where the search term goes; the two descriptive columns
+    // between have nothing to say about a product total and stay blank.
     function stSpreadRow() {
-      if (stDetail.loading) {
-        return '<tr class="st-detail"><td colspan="8"><span class="loading"></span></td></tr>';
-      }
+      const cols = ST_PRODUCT_TERM_COLS.length;
+      if (stDetail.loading) return stSubNote(cols, '<span class="loading"></span>');
       if (stDetail.error) {
-        return `<tr class="st-detail"><td colspan="8"><span class="arf-warn">${
-          escapeHtml(stDetail.error)}</span></td></tr>`;
+        return stSubNote(cols, `<span class="arf-warn">${escapeHtml(stDetail.error)}</span>`);
       }
       const total = stDetail.total || {};
       const here = stPortfolio ? stPortfolio.id : null;
       const others = (stDetail.products || []).filter(p => p.portfolioId !== here);
-      return `<tr class="st-detail"><td colspan="8">
-        <table class="table-fill arf-table st-detail-table">
-          <thead><tr>
-            <th>Across the account</th>
-            <th class="arf-r">Clicks</th><th class="arf-r">Spend</th>
-            <th class="arf-r">Orders</th><th class="arf-r">Sales</th>
-          </tr></thead>
-          <tbody>
-            <tr class="st-total">
-              <td class="arf-name">The whole search term</td>
-              <td class="arf-r arf-em">${formatCount(total.clicks || 0)}</td>
-              <td class="arf-r arf-em">${stMoney(total.cost)}</td>
-              <td class="arf-r arf-em">${formatCount(total.orders || 0)}</td>
-              <td class="arf-r arf-em">${stMoney(total.sales)}</td>
-            </tr>
-            ${others.length ? others.map(p => `
-            <tr class="st-elsewhere">
-              <td class="arf-name">${escapeHtml(p.portfolio || '—')}</td>
-              <td class="arf-r">${formatCount(p.clicks || 0)}</td>
-              <td class="arf-r">${stMoney(p.cost)}</td>
-              <td class="arf-r">${formatCount(p.orders || 0)}</td>
-              <td class="arf-r">${stMoney(p.sales)}</td>
-            </tr>`).join('')
-            : '<tr><td colspan="5"><span class="arf-muted">No other product bids on this search.</span></td></tr>'}
-          </tbody>
-        </table>
-      </td></tr>`;
+      const line = (label, m, cls) => `<tr class="st-sub${cls ? ' ' + cls : ''}">
+        <td class="arf-name st-sub-label">${label}</td>
+        <td></td><td></td>
+        ${stMetricCells(m)}
+        <td class="arf-r">${stRoas(m.sales, m.cost)}</td>
+        <td></td>
+      </tr>`;
+      return line('All products &middot; the whole search term', total, 'st-total') +
+        (others.length
+          ? others.map(p => line(`&#8627; ${escapeHtml(p.portfolio || '—')}`, p)).join('')
+          : stSubNote(cols, '<span class="arf-muted">No other product bids on this search.</span>'));
+    }
+
+    // The four counted figures, in the order every table on this page uses.
+    function stMetricCells(m) {
+      return `<td class="arf-r">${formatCount(m.clicks || 0)}</td>
+        <td class="arf-r">${stMoney(m.cost)}</td>
+        <td class="arf-r">${formatCount(m.orders || 0)}</td>
+        <td class="arf-r">${stMoney(m.sales)}</td>`;
+    }
+
+    // A loading, error or empty line inside an opened term, across the table.
+    function stSubNote(cols, html) {
+      return `<tr class="st-sub"><td colspan="${cols}" class="st-sub-label">${html}</td></tr>`;
     }
 
     // ── PRODUCTS ─────────────────────────────────────────────────────────────
@@ -524,7 +527,7 @@
                 <th class="arf-r">Terms</th><th class="arf-r">Clicks</th>
                 <th class="arf-r">Spend</th><th class="arf-r">Orders</th>
                 <th class="arf-r">Sales</th><th class="arf-r">ACoS</th>
-                <th class="arf-r">No orders</th>
+                <th class="arf-r">ROAS</th><th class="arf-r">No orders</th>
               </tr></thead>
               <tbody>${rows.map(stProductRow).join('')}</tbody>
             </table>
@@ -545,7 +548,8 @@
         <td class="arf-r arf-em">${stMoney(r.cost)}</td>
         <td class="arf-r">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
-        <td class="arf-r">${r.acos === null ? '—' : Math.round(r.acos * 100) + '%'}</td>
+        <td class="arf-r">${stAcos(r.cost, r.sales)}</td>
+        <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
         <td class="arf-r">${formatCount(r.deadTerms || 0)} <span class="arf-muted">${stMoney(r.deadCost)}</span></td>
       </tr>`;
     }
@@ -636,7 +640,8 @@
       { key: 'clicks', label: 'Clicks', sortable: true, right: true },
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
-      { key: 'sales', label: 'Sales', sortable: true, right: true }
+      { key: 'sales', label: 'Sales', sortable: true, right: true },
+      { key: 'roas', label: 'ROAS', right: true }
     ];
 
     const ST_TERM_COLS = [
@@ -647,6 +652,7 @@
       { key: 'orders', label: 'Orders', sortable: true, right: true },
       { key: 'sales', label: 'Sales', sortable: true, right: true },
       { key: 'acos', label: 'ACoS', right: true },
+      { key: 'roas', label: 'ROAS', right: true },
       // Reference rather than data, so it sits after the numbers.
       { key: 'product', label: 'Product' }
     ];
@@ -701,7 +707,8 @@
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r arf-em">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
-        <td class="arf-r">${r.acos === null || r.acos === undefined ? '—' : Math.round(r.acos * 100) + '%'}</td>
+        <td class="arf-r">${stAcos(r.cost, r.sales)}</td>
+        <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
         <td>${stProductCell(r.searchTerm)}</td>
       </tr>${open ? stTermDetailRow() : ''}`;
     }
@@ -709,43 +716,30 @@
     // One line per campaign and target: an exact keyword earning its place and
     // an auto close-match that is not are two different facts, and the term row
     // adds them together.
+    //
+    // Rows of the table above, so each figure sits under the one it adds up
+    // to. A line has four things to say and the term row has two columns to
+    // say them in, so each holds two: the product with its campaign under the
+    // search term, and the match type with what it matched on under the match
+    // types.
     function stTermDetailRow() {
       const cols = ST_TERM_COLS.length;
-      if (stDetail.loading) {
-        return `<tr class="st-detail"><td colspan="${cols}"><span class="loading"></span></td></tr>`;
-      }
+      if (stDetail.loading) return stSubNote(cols, '<span class="loading"></span>');
       if (stDetail.error) {
-        return `<tr class="st-detail"><td colspan="${cols}"><span class="arf-warn">${
-          escapeHtml(stDetail.error)}</span></td></tr>`;
+        return stSubNote(cols, `<span class="arf-warn">${escapeHtml(stDetail.error)}</span>`);
       }
       const rows = stDetail.rows || [];
-      if (!rows.length) {
-        return `<tr class="st-detail"><td colspan="${cols}"><span class="arf-muted">Nothing matched.</span></td></tr>`;
-      }
-      const here = stPortfolio ? stPortfolio.id : null;
-      return `<tr class="st-detail"><td colspan="${cols}">
-        <table class="table-fill arf-table st-detail-table">
-          <thead><tr>
-            <th>Product</th><th>Campaign</th><th>Match type</th><th>Matched by</th>
-            <th class="arf-r">Clicks</th><th class="arf-r">Spend</th>
-            <th class="arf-r">Orders</th><th class="arf-r">Sales</th>
-          </tr></thead>
-          <tbody>${rows.map(d => {
-            const elsewhere = here && d.portfolioId !== here;
-            return `<tr${elsewhere ? ' class="st-elsewhere"' : ''}>
-              <td class="arf-name">${escapeHtml(d.portfolio || '—')}${
-                elsewhere ? ' <span class="arf-muted">· another product</span>' : ''}</td>
-              <td>${escapeHtml(d.campaign || '—')}</td>
-              <td>${stMatchCell(d.matchLabel, d.campaignType)}</td>
-              <td>${stMatchedLabel(d.matched)}</td>
-              <td class="arf-r">${formatCount(d.clicks || 0)}</td>
-              <td class="arf-r">${stMoney(d.cost)}</td>
-              <td class="arf-r arf-em">${formatCount(d.orders || 0)}</td>
-              <td class="arf-r">${stMoney(d.sales)}</td>
-            </tr>`;
-          }).join('')}</tbody>
-        </table>
-      </td></tr>`;
+      if (!rows.length) return stSubNote(cols, '<span class="arf-muted">Nothing matched.</span>');
+      return rows.map(d => `<tr class="st-sub">
+        <td class="arf-name st-sub-label">&#8627; ${escapeHtml(d.portfolio || '—')}
+          <span class="st-sub-line">${escapeHtml(d.campaign || '—')}</span></td>
+        <td>${stMatchCell(d.matchLabel, d.campaignType)}
+          <span class="st-sub-line">${stMatchedLabel(d.matched)}</span></td>
+        ${stMetricCells(d)}
+        <td class="arf-r">${stAcos(d.cost, d.sales)}</td>
+        <td class="arf-r">${stRoas(d.sales, d.cost)}</td>
+        <td></td>
+      </tr>`).join('');
     }
 
     // Opens one term at a time. The list itself is not re-fetched — only the
@@ -831,6 +825,7 @@
         <td class="arf-r">${stMoney(r.cost)}</td>
         <td class="arf-r">${formatCount(r.orders || 0)}</td>
         <td class="arf-r">${stMoney(r.sales)}</td>
+        <td class="arf-r">${stRoas(r.sales, r.cost)}</td>
       </tr>`;
     }
 
@@ -969,6 +964,18 @@
       const names = ['January', 'February', 'March', 'April', 'May', 'June',
                      'July', 'August', 'September', 'October', 'November', 'December'];
       return `${names[(m || 1) - 1]} ${y}`;
+    }
+
+    // Spend as a share of the sales it was credited with. Blank, not infinite,
+    // when nothing sold.
+    function stAcos(cost, sales) {
+      return sales > 0 ? Math.round((cost / sales) * 100) + '%' : '—';
+    }
+
+    // Sales for each dollar spent, the inverse of ACoS. Blank, not zero, when
+    // nothing was spent — the same two decimals Weekly Trends uses.
+    function stRoas(sales, cost) {
+      return cost > 0 ? ((sales || 0) / cost).toFixed(2) : '—';
     }
 
     function stMoney(n) {

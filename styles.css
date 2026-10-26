@@ -2268,9 +2268,10 @@
       margin-bottom: 0.75rem;
     }
 
-    /* A search term opened to its breakdown: one line per campaign and
-       target, with the lines belonging to another product kept visible but
-       set back, since they are context rather than the thing being judged. */
+    /* A search term opened to its breakdown. The lines are rows of the same
+       table, so every figure sits in the column of the figure above it; they
+       are set apart by a tint and a smaller size rather than by a table of
+       their own, which is what used to knock them out of alignment. */
     .st-expand {
       font-family: inherit !important;
       text-align: left;
@@ -2280,19 +2281,22 @@
 
     .arf-table tr.st-open > td { border-bottom: none; }
 
-    .st-detail > td {
-      padding: 0 0 0.75rem 1.5rem !important;
-      background: var(--bg-primary);
+    .arf-table tr.st-sub > td {
+      background: var(--bg-secondary);
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      border-bottom: none;
     }
 
-    .st-detail-table { margin: 0; font-size: 0.75rem; }
+    .arf-table tr.st-sub > td.st-sub-label { padding-left: 1.75rem; }
 
-    .st-detail-table th {
-      font-size: 0.65rem;
-      background: transparent;
+    /* A line has more to say than the term row has columns, so a cell can
+       carry a second, smaller line beneath its first. */
+    .st-sub-line {
+      display: block;
+      font-size: 0.7rem;
+      opacity: 0.75;
     }
-
-    .st-elsewhere > td { opacity: 0.6; }
 
     .st-contested {
       color: var(--accent-yellow);
@@ -2310,7 +2314,7 @@
 
     .arf-table tr.st-group > td { border-top: 1px solid var(--border); }
 
-    .st-detail-table tr.st-total > td {
+    .arf-table tr.st-sub.st-total > td {
       color: var(--text-primary);
       border-bottom: 1px solid var(--border);
     }
