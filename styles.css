@@ -2288,13 +2288,20 @@
       border-bottom: none;
     }
 
-    .arf-table tr.st-sub > td.st-sub-label { padding-left: 1.75rem; }
+    /* Set exactly like the row it opens from. The search term above is the
+       text of a button — the page's face at 0.7rem, regular weight — so the
+       label beneath it is too, rather than the bold product-name style. */
+    .arf-table tr.st-sub > td.st-sub-label {
+      padding-left: 1.75rem;
+      font-family: inherit;
+      font-size: 0.7rem;
+      font-weight: 400;
+    }
 
     /* A line has more to say than the term row has columns, so a cell can
-       carry a second, smaller line beneath its first. */
+       carry a second line beneath its first — in the same type, only dimmer. */
     .st-sub-line {
       display: block;
-      font-size: 0.7rem;
       opacity: 0.75;
     }
 

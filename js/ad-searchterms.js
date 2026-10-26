@@ -31,6 +31,17 @@
     let stView = 'products';   // products | terms | rows
     let stPortfolio = null;    // { id, name } when drilled into one product
     let stOnlyDead = false;
+
+    // The product list arrives whole — one row per product, a few dozen of
+    // them — so it is sorted and filtered here rather than asked for again.
+    // Its state is its own: a sort or filter set on Products survives opening
+    // a product and coming back, and never leaks into the term tables, whose
+    // keys mean something else.
+    let stProdSort = 'name';
+    let stProdDir = 'asc';
+    let stProdQuery = '';
+    let stProdBrand = 'all';
+    let stProdOrders = 'any';
     let stDetail = null;       // { term, rows, loading, error } for the open term
 
     // Every click fires a request and they can come back out of order; the
@@ -338,8 +349,10 @@
       const months = (data.pulls || []).map(p => p.month);
       const tab = (key, label) =>
         `<button class="tab${stView === key ? ' active' : ''}" data-st-view="${key}">${label}</button>`;
-      // Filters belong to the two term tables; the product rollup has none.
+      // The term tables filter on the server; the product rollup filters here.
       const filtering = data.view === 'terms' || data.view === 'product-terms';
+      const brands = data.view === 'products'
+        ? [...new Set((data.products || []).map(r => r.brand || '—'))].sort() : [];
       return `
         <div class="tabs">
           ${tab('products', 'Products')}${tab('terms', 'Terms')}${tab('rows', 'Daily rows')}
@@ -357,6 +370,26 @@
                 m === data.month ? ' selected' : ''}>${escapeHtml(stMonthLabel(m))}</option>`).join('')}
             </select>
           </label>
+          ${data.view === 'products' ? `
+          <label class="wk-field">
+            <span>Product contains</span>
+            <input type="search" data-st-pq value="${escapeHtml(stProdQuery)}" placeholder="any">
+          </label>
+          <label class="wk-field">
+            <span>Brand</span>
+            <select data-st-pbrand>
+              <option value="all"${stProdBrand === 'all' ? ' selected' : ''}>All brands</option>
+              ${brands.map(b => `<option value="${escapeHtml(b)}"${
+                stProdBrand === b ? ' selected' : ''}>${escapeHtml(b)}</option>`).join('')}
+            </select>
+          </label>
+          <label class="wk-field">
+            <span>Orders</span>
+            <select data-st-porders>
+              <option value="any"${stProdOrders === 'any' ? ' selected' : ''}>any</option>
+              <option value="none"${stProdOrders === 'none' ? ' selected' : ''}>none yet</option>
+            </select>
+          </label>` : ''}
           ${filtering ? `
           <label class="wk-field">
             <span>Search term contains</span>
@@ -393,7 +426,7 @@
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
       { key: 'sales', label: 'Sales', sortable: true, right: true },
-      { key: 'roas', label: 'ROAS', right: true },
+      { key: 'roas', label: 'ROAS', sortable: true, right: true },
       // Reference rather than data, so it sits after the numbers.
       { key: 'product', label: 'Product' }
     ];
@@ -477,7 +510,7 @@
       const here = stPortfolio ? stPortfolio.id : null;
       const others = (stDetail.products || []).filter(p => p.portfolioId !== here);
       const line = (label, m, cls) => `<tr class="st-sub${cls ? ' ' + cls : ''}">
-        <td class="arf-name st-sub-label">${label}</td>
+        <td class="st-sub-label">${label}</td>
         <td></td><td></td>
         ${stMetricCells(m)}
         <td class="arf-r">${stRoas(m.sales, m.cost)}</td>
@@ -491,9 +524,9 @@
 
     // The four counted figures, in the order every table on this page uses.
     function stMetricCells(m) {
-      return `<td class="arf-r">${formatCount(m.clicks || 0)}</td>
+      return `<td class="arf-r arf-em">${formatCount(m.clicks || 0)}</td>
         <td class="arf-r">${stMoney(m.cost)}</td>
-        <td class="arf-r">${formatCount(m.orders || 0)}</td>
+        <td class="arf-r arf-em">${formatCount(m.orders || 0)}</td>
         <td class="arf-r">${stMoney(m.sales)}</td>`;
     }
 
@@ -507,32 +540,81 @@
     // Counts and money only: which terms returned nothing is a fact, whether
     // that makes one worth negating is a judgement, and this page does not
     // make judgements.
+    // Every column sorts. Text sorts A to Z on the first press, numbers largest
+    // first. A ratio that cannot be worked out — no spend, no sales — always
+    // sorts last, whichever way the column is turned.
+    const ST_PRODUCT_COLS = [
+      { key: 'name', label: 'Product', text: true, of: r => r.portfolio || '' },
+      { key: 'brand', label: 'Brand', text: true, of: r => r.brand || '' },
+      { key: 'terms', label: 'Terms', of: r => r.terms },
+      { key: 'clicks', label: 'Clicks', of: r => r.clicks },
+      { key: 'cost', label: 'Spend', of: r => r.cost },
+      { key: 'orders', label: 'Orders', of: r => r.orders },
+      { key: 'sales', label: 'Sales', of: r => r.sales },
+      { key: 'acos', label: 'ACoS', of: r => (r.sales > 0 ? r.cost / r.sales : null) },
+      { key: 'roas', label: 'ROAS', of: r => (r.cost > 0 ? (r.sales || 0) / r.cost : null) },
+      { key: 'dead', label: 'No orders', of: r => r.deadTerms }
+    ];
+
+    function stProductRowsShown(rows) {
+      const q = stProdQuery.trim().toLowerCase();
+      const col = ST_PRODUCT_COLS.find(c => c.key === stProdSort) || ST_PRODUCT_COLS[0];
+      const dir = stProdDir === 'asc' ? 1 : -1;
+      return rows
+        .filter(r => !q || String(r.portfolio || '').toLowerCase().includes(q))
+        .filter(r => stProdBrand === 'all' || (r.brand || '—') === stProdBrand)
+        .filter(r => stProdOrders === 'any' || !(r.orders > 0))
+        .slice()
+        .sort((a, b) => {
+          const x = col.of(a), y = col.of(b);
+          const xNone = x === null || x === undefined, yNone = y === null || y === undefined;
+          if (xNone || yNone) return xNone === yNone ? 0 : xNone ? 1 : -1;
+          const cmp = col.text
+            ? String(x).localeCompare(String(y), 'en', { sensitivity: 'base', numeric: true })
+            : x - y;
+          return cmp * dir || String(a.portfolio || '').localeCompare(String(b.portfolio || ''));
+        });
+    }
+
     function stProductTable(data) {
-      const rows = data.products || [];
-      if (!rows.length) {
-        return '<div class="arf-section"><p class="arf-none">No products in this month.</p></div>';
-      }
+      return `<div class="arf-section" id="st-products">${stProductTableBody(data)}</div>`;
+    }
+
+    // The part a filter or a sort redraws. The controls sit outside it, so the
+    // search box keeps its cursor while the list narrows under it.
+    function stProductTableBody(data) {
+      const all = data.products || [];
+      if (!all.length) return '<p class="arf-none">No products in this month.</p>';
+      const rows = stProductRowsShown(all);
+      const head = ST_PRODUCT_COLS.map(c => {
+        const active = stProdSort === c.key;
+        return `<th${c.text ? '' : ' class="arf-r"'}><button class="arf-btn${
+          active ? ' arf-btn-go' : ''}" data-st-psort="${c.key}">${c.label}${
+          active ? (stProdDir === 'asc' ? ' ▲' : ' ▼') : ''}</button></th>`;
+      }).join('');
       return `
-        <div class="arf-section">
-          <h4>By product</h4>
-          <p class="arf-blurb">
-            Every search term this month, grouped by the product that paid for it. A term matched
-            by three campaigns counts once. "No orders" counts the terms with no orders this
-            month, and what they cost.
-          </p>
-          <div class="arf-table-wrap">
-            <table class="table-fill arf-table">
-              <thead><tr>
-                <th>Product</th><th>Brand</th>
-                <th class="arf-r">Terms</th><th class="arf-r">Clicks</th>
-                <th class="arf-r">Spend</th><th class="arf-r">Orders</th>
-                <th class="arf-r">Sales</th><th class="arf-r">ACoS</th>
-                <th class="arf-r">ROAS</th><th class="arf-r">No orders</th>
-              </tr></thead>
-              <tbody>${rows.map(stProductRow).join('')}</tbody>
-            </table>
-          </div>
+        <h4>By product</h4>
+        <p class="arf-blurb">
+          Every search term this month, grouped by the product that paid for it. A term matched
+          by three campaigns counts once. "No orders" counts the terms with no orders this
+          month, and what they cost.
+        </p>
+        <p class="arf-muted st-shown">${rows.length === all.length
+          ? `${formatCount(all.length)} products`
+          : `${formatCount(rows.length)} of ${formatCount(all.length)} products`}</p>
+        <div class="arf-table-wrap">
+          <table class="table-fill arf-table">
+            <thead><tr>${head}</tr></thead>
+            <tbody>${rows.length
+              ? rows.map(stProductRow).join('')
+              : `<tr><td colspan="${ST_PRODUCT_COLS.length}"><span class="arf-muted">No products match these filters.</span></td></tr>`}</tbody>
+          </table>
         </div>`;
+    }
+
+    function stRedrawProducts() {
+      const el = document.getElementById('st-products');
+      if (el && stData && stData.view === 'products') el.innerHTML = stProductTableBody(stData);
     }
 
     function stProductRow(r) {
@@ -641,7 +723,7 @@
       { key: 'cost', label: 'Spend', sortable: true, right: true },
       { key: 'orders', label: 'Orders', sortable: true, right: true },
       { key: 'sales', label: 'Sales', sortable: true, right: true },
-      { key: 'roas', label: 'ROAS', right: true }
+      { key: 'roas', label: 'ROAS', sortable: true, right: true }
     ];
 
     const ST_TERM_COLS = [
@@ -652,7 +734,7 @@
       { key: 'orders', label: 'Orders', sortable: true, right: true },
       { key: 'sales', label: 'Sales', sortable: true, right: true },
       { key: 'acos', label: 'ACoS', right: true },
-      { key: 'roas', label: 'ROAS', right: true },
+      { key: 'roas', label: 'ROAS', sortable: true, right: true },
       // Reference rather than data, so it sits after the numbers.
       { key: 'product', label: 'Product' }
     ];
@@ -731,7 +813,7 @@
       const rows = stDetail.rows || [];
       if (!rows.length) return stSubNote(cols, '<span class="arf-muted">Nothing matched.</span>');
       return rows.map(d => `<tr class="st-sub">
-        <td class="arf-name st-sub-label">&#8627; ${escapeHtml(d.portfolio || '—')}
+        <td class="st-sub-label">&#8627; ${escapeHtml(d.portfolio || '—')}
           <span class="st-sub-line">${escapeHtml(d.campaign || '—')}</span></td>
         <td>${stMatchCell(d.matchLabel, d.campaignType)}
           <span class="st-sub-line">${stMatchedLabel(d.matched)}</span></td>
@@ -898,6 +980,14 @@
         if (e.target.closest('[data-st-name]')) return stNameAsins();
         const expand = e.target.closest('[data-st-expand]');
         if (expand) return stExpand(expand.dataset.stExpand);
+        const psort = e.target.closest('[data-st-psort]');
+        if (psort) {
+          const key = psort.dataset.stPsort;
+          const col = ST_PRODUCT_COLS.find(c => c.key === key);
+          if (stProdSort === key) stProdDir = stProdDir === 'asc' ? 'desc' : 'asc';
+          else { stProdSort = key; stProdDir = col && col.text ? 'asc' : 'desc'; }
+          return stRedrawProducts();
+        }
         const sort = e.target.closest('[data-st-sort]');
         if (sort) {
           const key = sort.dataset.stSort;
@@ -923,6 +1013,17 @@
         if (clicks) { stMinClicks = Number(clicks.value) || 0; stOffset = 0; return stFetch(); }
         const dead = e.target.closest('[data-st-dead]');
         if (dead) { stOnlyDead = dead.value === '1'; stOffset = 0; return stFetch(); }
+        const pbrand = e.target.closest('[data-st-pbrand]');
+        if (pbrand) { stProdBrand = pbrand.value; return stRedrawProducts(); }
+        const porders = e.target.closest('[data-st-porders]');
+        if (porders) { stProdOrders = porders.value; return stRedrawProducts(); }
+      });
+
+      // The product list is already here, so it narrows as you type; the term
+      // search below waits for Enter because each of those is a query.
+      el.addEventListener('input', e => {
+        const pq = e.target.closest('[data-st-pq]');
+        if (pq) { stProdQuery = pq.value; stRedrawProducts(); }
       });
 
       // Typing filters on Enter rather than per keystroke: each one is a query

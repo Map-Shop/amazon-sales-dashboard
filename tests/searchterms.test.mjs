@@ -244,6 +244,7 @@ const OPTIONS = [
   ['click floor', { month: '2026-09', minClicks: 15 }],
   ['no orders yet', { month: '2026-09', onlyDead: true }],
   ['sorted ascending', { month: '2026-09', sort: 'clicks', dir: 'asc' }],
+  ['sorted by ROAS', { month: '2026-09', sort: 'roas', dir: 'desc' }],
   ['paged', { month: '2026-09', limit: 50, offset: 400 }]
 ];
 
@@ -287,6 +288,28 @@ checkStatement('one term by campaign', ST.termDetailQuery({ month: '2026-09', se
   ];
   ok(texts.every(t => !/DROP/.test(t)),
      'a sort key outside the whitelist never reaches the statement, on any table');
+}
+
+console.log('\nROAS  — sortable on every table, and safe on zero spend');
+
+{
+  // ROAS divides by spend, and Postgres stops the whole statement on a
+  // division by zero rather than leaving that one row blank. One term with no
+  // spend would take the page down.
+  const sorts = {
+    'daily rows': ST.monthQueries({ month: '2026-09', sort: 'roas' }).rows.text,
+    'all terms': ST.termQueries({ month: '2026-09', sort: 'roas' }).rows.text,
+    'one product': ST.productTermQueries({ month: '2026-09', portfolioId: 'pf1', sort: 'roas' }).rows.text
+  };
+  for (const [name, text] of Object.entries(sorts)) {
+    const order = text.slice(text.lastIndexOf('ORDER BY'));
+    ok(/roas|sales7d \/ NULLIF|sales \/ NULLIF/.test(order) && !/ORDER BY cost DESC/.test(order),
+       `${name}: ROAS is a sort of its own, not the fallback to spend`);
+  }
+  const unguarded = Object.entries(sorts)
+    .filter(([, t]) => /\/ (?!NULLIF)/.test(t.replace(/--.*$/gm, '')))
+    .map(([k]) => k);
+  ok(unguarded.length === 0, 'every ROAS division guards against zero spend', unguarded.join(', '));
 }
 
 console.log('\nTHE CAMPAIGN LIST  — a campaign that leaves it keeps its history');
