@@ -595,6 +595,9 @@ console.log('\nSUGGESTED BIDS  \u2014 reading Amazon\'s answer');
   ok(!M.tgVersionRefused(e(400, '{"message":"targetingExpressions[0].value is invalid"}')) &&
      !M.tgVersionRefused(e(422, '')) && !M.tgVersionRefused(e(429, '')),
      'a refusal of the request itself does not, nor does throttling');
+  ok(M.tgBusy(e(429, '')) && M.tgBusy(e(503, '')) && !M.tgBusy(e(400, '')) && !M.tgBusy(e(422, '')) && !M.tgBusy(new Error('x')),
+     'throttling and Amazon\'s own failures pause a round; a refusal of the request does not',
+     'a pause ends the round with what it has, and the page carries on after a wait');
   ok(M.TG_REC_VERSIONS[0] === 'v4' && !M.TG_REC_VERSIONS.includes('v3'),
      'v4 is asked first and the retired v3 not at all');
   ok(M.tgShortError(e(422, '{"code":"UNSUPPORTED","message":"PAT_ASIN is not supported"}')) === '422 PAT_ASIN is not supported',
@@ -614,6 +617,17 @@ console.log('\nSUGGESTED BIDS  \u2014 reading Amazon\'s answer');
      work.slice(0, -1).every(w => w.targets.every(t => !/^PAT_/.test(t.rec.type))),
      'product targets are asked about last, after keywords and Auto groups in every ad group',
      'by then an answer has shown the request is sound, so a refusal is about the target');
+}
+
+console.log('\nCURRENT SUGGESTIONS  \u2014 a day from when they were fetched');
+
+{
+  const TG = await import('../lib/targets.js');
+  for (const [name, text] of [['status', TG.STATUS_SQL], ['still to ask', TG.NEED_SQL]]) {
+    ok(/fetched_at >= now\(\) - interval '24 hours'/.test(text) && !/pulled_at\s*[<>]=?|[<>]=?\s*g\.pulled_at/.test(text),
+       `${name}: a suggestion is current for a day, not until the next bid pull`,
+       'tying it to the bid pull made every press of Pull bids start the list over');
+  }
 }
 
 console.log('\nTHE TARGETS TABLE  \u2014 every parameter lines up, every sort is whitelisted');

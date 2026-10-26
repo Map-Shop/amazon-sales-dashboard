@@ -339,8 +339,18 @@
     // ── BIDS ─────────────────────────────────────────────────────────────────
     // Pull bids is two steps behind one button. The keyword and target lists
     // come back in a few calls; Amazon's suggested ranges take a call per ad
-    // group, so they are asked for in rounds until none are left. A round that
-    // stops — a closed tab, a refusal — picks up from the Targets tab.
+    // group, so they are asked for in rounds until none are left.
+    //
+    // A suggestion stays current for a day, so a second press carries on from
+    // where the first stopped — a closed tab, a refusal — rather than starting
+    // the list over. So does the button on the Targets tab.
+
+    // A throttled round waits this long before the next. Amazon's limit on
+    // suggestions is per second, so half a minute is ample.
+    const ST_THROTTLE_WAIT_MS = 30000;
+    // Rounds in a row that get nothing done before the page stops trying. Six
+    // is three minutes of Amazon refusing to answer.
+    const ST_MAX_IDLE_ROUNDS = 6;
 
     async function stPullBids() {
       if (stBidsBusy || !accessToken) return;
@@ -353,9 +363,16 @@
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || `Pulling bids failed (${res.status})`);
-        stSetStatus(`Stored ${formatCount(data.stored)} keywords and targets. ` +
-                    'Asking Amazon for its suggested bids…');
-        await stSuggestRounds();
+        // What the snapshot did besides the bids: what changed since the last
+        // pull, and any list Amazon refused. Carried to the end of the rounds,
+        // so it is not lost under their progress.
+        const changed = typeof data.changes === 'number'
+          ? ` ${formatCount(data.changes)} changed since the last pull.` : '';
+        const missed = (data.failures || []).map(f => `${f.what}: ${f.error}`).join('; ');
+        const note = `Stored ${formatCount(data.stored)} keywords and targets.${changed}${
+          missed ? ` Not stored — ${missed}.` : ''}`;
+        stSetStatus(`${note} Asking Amazon for its suggested bids…`);
+        await stSuggestRounds(note);
       } catch (err) {
         console.error('[ST] bids failed:', err);
         stSetStatus('', err.message);
@@ -370,7 +387,7 @@
       stBidsBusy = true;
       stSetBidsBusy(true);
       try {
-        await stSuggestRounds();
+        await stSuggestRounds('');
       } catch (err) {
         console.error('[ST] suggestions failed:', err);
         stSetStatus('', err.message);
@@ -380,31 +397,57 @@
       }
     }
 
-    // Rounds until Amazon has been asked about every ad group, it refuses, or
-    // a round gets nothing done — the last so a stuck round cannot loop.
-    async function stSuggestRounds() {
+    // Rounds until every ad group has been asked, Amazon refuses outright, or
+    // several rounds in a row get nothing done. A round Amazon throttles, or
+    // one the server ran out of time on, is a pause rather than an end: what
+    // it stored is kept, and the next round carries on after a wait.
+    async function stSuggestRounds(note) {
+      const lead = note ? `${note} ` : '';
+      let idle = 0;
       for (;;) {
         const res = await fetch('/api/adspend?action=searchterms-suggest', {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || `Suggested bids failed (${res.status})`);
+        // A gateway timeout is the function's minute running out mid-round.
+        // The suggestions stored before it are kept.
+        const timedOut = res.status === 504;
+        if (!res.ok && !timedOut) throw new Error(data.error || `Suggested bids failed (${res.status})`);
+
         const s = data.status || {};
-        const progress = `Amazon's suggested bids: ${formatCount(s.suggested || 0)} of ${
-          formatCount(s.askable || 0)} targets it can suggest for`;
+        const progress = s.askable
+          ? `Amazon's suggested bids: asked about ${formatCount(s.asked || 0)} of ${
+              formatCount(s.askable)} targets, a range for ${formatCount(s.suggested || 0)}`
+          : 'Amazon\'s suggested bids';
         if (data.error) {
           stBidsBusy = false;
           await stFetch();
-          stSetStatus('', `${progress}. Amazon stopped answering: ${data.error}`);
+          stSetStatus('', `${lead}${progress}. Amazon stopped answering: ${data.error}`);
           return;
         }
-        if (!data.remaining || !data.asked) {
+
+        const did = (data.got || 0) + (data.missed || 0) + (data.refused || 0);
+        idle = did ? 0 : idle + 1;
+        // Nothing left, or a round that found nothing to ask about.
+        if (!timedOut && (!data.remaining || (!data.asked && !data.throttled))) {
           stBidsBusy = false;
-          await stFetch(`${progress}.${data.remaining
-            ? ` ${formatCount(data.remaining)} ad groups are still to ask — use the button on the Targets tab.` : ''}`);
+          await stFetch(`${lead}${progress}.`);
           return;
         }
-        stSetStatus(`${progress} · ${formatCount(data.remaining)} ad groups to go…`);
+        if (idle >= ST_MAX_IDLE_ROUNDS) {
+          stBidsBusy = false;
+          await stFetch();
+          stSetStatus('', `${lead}${progress}. Amazon has answered nothing for ${ST_MAX_IDLE_ROUNDS} ` +
+                          'rounds in a row, so the page stopped asking. Press Pull bids later to carry on.');
+          return;
+        }
+        if (data.throttled || timedOut) {
+          stSetStatus(`${lead}${progress} · ${data.throttled ? 'Amazon asked us to slow down'
+            : 'that round ran out of time'} — carrying on in ${ST_THROTTLE_WAIT_MS / 1000} seconds…`);
+          await new Promise(r => setTimeout(r, ST_THROTTLE_WAIT_MS));
+          continue;
+        }
+        stSetStatus(`${lead}${progress} · ${formatCount(data.remaining)} ad groups to go…`);
       }
     }
 

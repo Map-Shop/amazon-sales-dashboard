@@ -5944,8 +5944,18 @@ const TG_MAX_PAGES = 50;
 
 // Amazon takes up to 100 targets in one suggestion request.
 const TG_REC_BATCH = 100;
-// Left of the function's 60 seconds once the slowest request is allowed for.
-const TG_SUGGEST_BUDGET_MS = 40000;
+// A round stops starting requests after this, which leaves the function's 60
+// seconds room for one slow request and its retries to finish.
+const TG_SUGGEST_BUDGET_MS = 35000;
+// Between requests. Amazon throttles this endpoint harder than the lists.
+const TG_SUGGEST_PACE_MS = 500;
+
+// Throttled, or Amazon's side failing — both pass, and neither says anything
+// about the targets asked about.
+function tgBusy(err) {
+  const status = (err && err.status) || 0;
+  return status === 429 || status >= 500;
+}
 const TG_REC_URL = `${TG_ADS_HOST}/sp/targets/bid/recommendations`;
 // v3 of this request was retired in 2025. v4 first, then v5; whichever Amazon
 // accepts is remembered for the rest of the process.
@@ -6305,12 +6315,13 @@ async function handleSearchTermsSuggest(req, res) {
     let trusted = await targets.anySuggestion();
     let asked = 0, got = 0, refused = 0, missed = 0;
     let error = null;
+    let throttled = false;
 
     for (const item of work) {
       if (Date.now() > deadline) break;
       const out = [];
       try {
-        if (asked) await sleep(250);
+        if (asked) await sleep(TG_SUGGEST_PACE_MS);
         asked++;
         const r = await tgAskSuggestions(accessToken, item.campaignId, item.adGroupId,
                                          item.targets.map(t => t.rec));
@@ -6327,18 +6338,25 @@ async function handleSearchTermsSuggest(req, res) {
           refused += item.targets.length;
           const note = `Amazon gave no suggestion: ${tgShortError(err)}`;
           for (const t of item.targets) out.push({ targetId: t.targetId, note, version: tgRecVersion });
+        } else if (tgBusy(err)) {
+          // Amazon asking us to slow down, still, after the retries. Not a
+          // failure: the round ends here with what it has, and the page waits
+          // before the next one. Nothing is recorded for these targets, so
+          // the next round asks for them again.
+          throttled = true;
+          console.warn('[SEARCHTERMS SUGGEST] throttled:', err.message);
         } else {
           error = tgShortError(err);
           console.error('[SEARCHTERMS SUGGEST] stopped:', err.message);
         }
       }
       await targets.recordSuggestions(out);
-      if (error) break;
+      if (error || throttled) break;
     }
 
     const status = await targets.status();
     return res.status(200).json({
-      success: true, asked, got, missed, refused, version: tgRecVersion,
+      success: true, asked, got, missed, refused, throttled, version: tgRecVersion,
       remaining: status ? status.groupsLeft : 0, status, error
     });
   } catch (error) {
@@ -6372,4 +6390,4 @@ export { evaluateWeek, rfBuildInputs, rfDecideAll, rfSaveRun, rfLoadRun,
          negNormalize, productAdNormalize, tgDate, NEG_LISTS, dailyRequestOne, dailyPlans,
          tgNormalizeKeyword, tgNormalizeTarget, tgParseRecommendations, tgRange,
          tgMatchRecommendations, tgVersionRefused, tgShortError, tgSuggestionWork,
-         TG_REC_VERSIONS, TG_REC_BATCH };
+         TG_REC_VERSIONS, TG_REC_BATCH, tgBusy };
